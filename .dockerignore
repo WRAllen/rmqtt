@@ -1,0 +1,17 @@
+.git/
+
+# Ignore Cargo build artifacts while keeping the release binaries used by
+# Dockerfile.amd64 and Dockerfile.aarch64.
+target/*
+
+!target/x86_64-unknown-linux-musl/
+target/x86_64-unknown-linux-musl/*
+!target/x86_64-unknown-linux-musl/release/
+target/x86_64-unknown-linux-musl/release/*
+!target/x86_64-unknown-linux-musl/release/rmqttd
+
+!target/aarch64-unknown-linux-musl/
+target/aarch64-unknown-linux-musl/*
+!target/aarch64-unknown-linux-musl/release/
+target/aarch64-unknown-linux-musl/release/*
+!target/aarch64-unknown-linux-musl/release/rmqttd

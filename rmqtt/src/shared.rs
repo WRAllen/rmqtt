@@ -340,8 +340,15 @@ impl Entry for LockEntry {
 
         if let Some(peer_tx) = self.tx().and_then(|tx| if tx.is_closed() { None } else { Some(tx) }) {
             let (tx, rx) = oneshot::channel();
-            if let Ok(()) = peer_tx.unbounded_send(Message::Kick(tx, self.id.clone(), clean_start, is_admin))
+            if let Err(e) = peer_tx.unbounded_send(Message::Kick(tx, self.id.clone(), clean_start, is_admin))
             {
+                // A concurrently closed session can safely be snapshotted
+                // below.  Any other send failure must not silently turn a
+                // live session into a successful takeover.
+                if !peer_tx.is_closed() {
+                    return Err(anyhow!(format!("send kick request failed: {:?}", e)));
+                }
+            } else {
                 match tokio::time::timeout(Duration::from_secs(5), rx).await {
                     Ok(Ok(())) => {
                         log::debug!("{:?} kicked, from {:?}", self.id, self.session().map(|s| s.id.clone()));
@@ -361,23 +368,58 @@ impl Entry for LockEntry {
                             self.id,
                             self.session().map(|s| s.id.clone())
                         );
+                        // The receiver being timed out is not proof that the
+                        // session is gone.  Refuse the new connection and let
+                        // it retry; removing the old entry here could destroy
+                        // an outbound QoS window that is still active.
+                        return Err(anyhow!("kick acknowledgement timed out"));
                     }
                 }
             }
         }
 
-        if let Some((s, _)) = self._remove(clear_subscriptions).await {
-            if clean_start {
+        if clean_start {
+            if self._remove(clear_subscriptions).await.is_some() {
                 Ok(OfflineSession::Exist(None))
             } else {
-                match s.to_offline_info().await {
-                    Ok(offline_info) => Ok(OfflineSession::Exist(Some(offline_info))),
-                    Err(e) => {
-                        log::error!("get offline info error, {e:?}");
-                        Ok(OfflineSession::Exist(None))
+                Ok(OfflineSession::NotExist)
+            }
+        } else if let Some(s) = self.session() {
+            // Snapshot the complete offline state before detaching the entry
+            // from the shared session map.  Once the session has acknowledged
+            // Kick it no longer mutates these queues.  If snapshotting fails,
+            // keeping the entry makes a later reconnect retryable instead of
+            // silently discarding subscriptions or unacknowledged messages.
+            let offline_info =
+                s.to_offline_info().await.map_err(|e| anyhow!(format!("get offline info error: {:?}", e)))?;
+
+            // A cross-node takeover must remove routes that still reference
+            // the previous node, but subscriptions are part of the state
+            // snapshot and therefore cannot be cleared before extraction.
+            if clear_subscriptions {
+                for (topic_filter, _) in offline_info.subscriptions.iter() {
+                    if let Err(e) =
+                        self.shared.context().extends.router().await.remove(topic_filter, s.id.clone()).await
+                    {
+                        log::warn!(
+                            "{:?} kick remove previous route, topic_filter: {}, {:?}",
+                            self.id,
+                            topic_filter,
+                            e
+                        );
                     }
                 }
             }
+
+            // Use the exact session id observed above so a concurrent stale
+            // cleanup cannot remove a newer session for the same client id.
+            if self._remove_with(false, &s.id).await.is_none() {
+                log::warn!(
+                    "{:?} kick snapshotted session state but the exact source entry was already detached",
+                    self.id
+                );
+            }
+            Ok(OfflineSession::Exist(Some(offline_info)))
         } else {
             Ok(OfflineSession::NotExist)
         }

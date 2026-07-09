@@ -1,0 +1,72 @@
+apiVersion: rmqtt.io/v1alpha1
+kind: RmqttCluster
+metadata:
+  name: ams-rmqtt
+  namespace: studio-ams-system
+spec:
+  # yc-dev currently runs five static Raft peers. Preserve that topology
+  # during the first Operator-managed bootstrap.
+  replicas: 5
+  image: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt:0.19.0-dynamic-peers-202608061642
+  imagePullPolicy: IfNotPresent
+  imageUpdate:
+    autoRollout: true
+    stabilizationSeconds: 60
+  service:
+    mqttPort: 1883
+    mqttsPort: 8883
+    wsPort: 8080
+    wssPort: 8083
+    httpApiPort: 6060
+    grpcPort: 5363
+    raftPort: 6003
+  config:
+    # The takeover script copies the Helm-owned base configuration here.
+    baseConfigMapName: ams-rmqtt-operator-config
+  resources:
+    requests:
+      cpu: "8"
+      memory: 8Gi
+    limits:
+      cpu: "48"
+      memory: 48Gi
+  pod:
+    annotations:
+      ams.studio.sensecore.cn/scheduler: volcano
+    serviceAccountName: ams-rmqtt
+    imagePullSecrets:
+      - name: image-pull-secret-stack
+      - name: image-pull-secret-public
+    schedulerName: default-scheduler
+    enableServiceLinks: false
+    terminationGracePeriodSeconds: 30
+    affinity:
+      nodeAffinity:
+        requiredDuringSchedulingIgnoredDuringExecution:
+          nodeSelectorTerms:
+            - matchExpressions:
+                - key: ams.studio.sensecore.cn/workload-type
+                  operator: In
+                  values:
+                    - inference
+    tolerations:
+      - key: ams.studio.sensecore.cn/scheduling
+        operator: Equal
+        value: dedicated
+        effect: NoSchedule
+  monitoring:
+    serviceMonitor:
+      enabled: true
+      labels:
+        release: kube-prometheus-stack
+      path: /api/v1/metrics/prometheus/sum
+      interval: 60s
+      scrapeTimeout: 10s
+  raft:
+    minReplicas: 3
+    drainTimeoutSeconds: 300
+    endpointRemovalStableSeconds: 5
+    scaleInStabilizationSeconds: 60
+    handoffRollbackThresholdPercent: 80
+    drainTimeoutAction: ForceContinue
+    allowLeaderScaleIn: false

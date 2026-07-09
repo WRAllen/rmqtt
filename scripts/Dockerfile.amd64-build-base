@@ -1,0 +1,12 @@
+FROM rust:1.89-alpine
+
+RUN apk add --no-cache \
+        build-base \
+        cmake \
+        openssl-dev \
+        openssl-libs-static \
+        perl \
+        pkgconf \
+        protobuf-dev \
+        zlib-static \
+    && rustup target add x86_64-unknown-linux-musl

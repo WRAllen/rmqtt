@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -26,10 +27,22 @@ use rmqtt_raft::{Error, Mailbox, Result as RaftResult, Store};
 use tokio::task::{block_in_place, spawn_blocking};
 
 use super::config::Compression;
-use super::message::{Message, MessageReply};
+use super::message::{ClusterNode, Message, MessageReply};
+use super::nodes::ClusterNodeManager;
 
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 type DashMap<K, V> = dashmap::DashMap<K, V, ahash::RandomState>;
+
+fn is_orphaned_node_route(
+    node_id: NodeId,
+    route_id: &Id,
+    current_owner: Option<&Id>,
+    live_session_ids: &HashSet<Id>,
+) -> bool {
+    route_id.node_id == node_id
+        && !live_session_ids.contains(route_id)
+        && !current_owner.is_some_and(|owner| owner == route_id)
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct ClientStatus {
@@ -57,6 +70,7 @@ pub(crate) struct ClusterRouter {
     add_exec: TaskExecQueue,
     remove_exec: TaskExecQueue,
     backoff_strategy: ExponentialBackoff,
+    nodes: ClusterNodeManager,
     raft_mailbox: Arc<RwLock<Option<Mailbox>>>,
     client_states: Arc<DashMap<ClientId, ClientStatus>>,
     pub try_lock_timeout: Duration,
@@ -68,6 +82,7 @@ impl ClusterRouter {
     pub(crate) fn new(
         scx: ServerContext,
         backoff_strategy: ExponentialBackoff,
+        nodes: ClusterNodeManager,
         try_lock_timeout: Duration,
         compression: Option<Compression>,
     ) -> Self {
@@ -78,6 +93,7 @@ impl ClusterRouter {
             add_exec,
             remove_exec,
             backoff_strategy,
+            nodes,
             raft_mailbox: Arc::new(RwLock::new(None)),
             client_states: Arc::new(DashMap::default()),
             try_lock_timeout,
@@ -120,6 +136,62 @@ impl ClusterRouter {
     }
 
     #[inline]
+    pub(crate) fn node_states_count(&self, node_id: NodeId) -> usize {
+        self.client_states.iter().filter(|entry| entry.value().id.node_id == node_id).count()
+    }
+
+    #[inline]
+    pub(crate) fn node_state_ids(&self, node_id: NodeId) -> Vec<Id> {
+        self.client_states
+            .iter()
+            .filter_map(|entry| {
+                let status = entry.value();
+                (status.id.node_id == node_id).then(|| status.id.clone())
+            })
+            .collect()
+    }
+
+    #[inline]
+    pub(crate) fn node_routes_count(&self, node_id: NodeId) -> usize {
+        self.inner
+            .relations
+            .iter()
+            .map(|entry| entry.value().values().filter(|(id, _)| id.node_id == node_id).count())
+            .sum()
+    }
+
+    pub(crate) fn node_routes(&self, node_id: NodeId) -> Vec<(String, Id)> {
+        self.inner
+            .relations
+            .iter()
+            .flat_map(|entry| {
+                let topic_filter = entry.key().to_string();
+                entry
+                    .value()
+                    .values()
+                    .filter_map(|(route_id, _)| {
+                        (route_id.node_id == node_id).then(|| (topic_filter.clone(), route_id.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    pub(crate) fn orphaned_node_routes(
+        &self,
+        node_id: NodeId,
+        live_session_ids: &HashSet<Id>,
+    ) -> Vec<(String, Id)> {
+        self.node_routes(node_id)
+            .into_iter()
+            .filter(|(_, route_id)| {
+                let current_owner = self.id(&route_id.client_id);
+                is_orphaned_node_route(node_id, route_id, current_owner.as_ref(), live_session_ids)
+            })
+            .collect()
+    }
+
+    #[inline]
     pub(crate) fn status(&self, client_id: &str) -> Option<ClientStatus> {
         self.client_states.get(client_id).map(|entry| entry.value().clone())
     }
@@ -132,6 +204,86 @@ impl ClusterRouter {
     #[inline]
     pub(crate) fn get_target_node_id(&self, target_clientid: &str) -> Option<NodeId> {
         self.client_states.get(target_clientid).map(|entry| entry.id.node_id)
+    }
+
+    #[inline]
+    pub(crate) fn get_ready_target_node_id(&self, target_clientid: &str) -> Option<NodeId> {
+        self.client_states.get(target_clientid).and_then(|entry| {
+            let status = entry.value();
+            if status.online && !status.handshaking {
+                Some(status.id.node_id)
+            } else {
+                None
+            }
+        })
+    }
+
+    async fn remove_node_state(&self, node_id: NodeId) {
+        let client_ids =
+            self.client_states
+                .iter()
+                .filter_map(|entry| {
+                    if entry.value().id.node_id == node_id {
+                        Some(entry.key().clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>();
+        for client_id in client_ids {
+            self.client_states.remove(&client_id);
+        }
+
+        let removals = self
+            .inner
+            .relations
+            .iter()
+            .flat_map(|entry| {
+                let topic_filter = entry.key().clone();
+                entry
+                    .value()
+                    .iter()
+                    .filter_map(move |(_, (id, _))| {
+                        if id.node_id == node_id {
+                            Some((topic_filter.clone(), id.clone()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        for (topic_filter, id) in removals {
+            if let Err(e) = self.inner.remove(&topic_filter, id).await {
+                log::warn!("remove node route failed, node_id: {node_id}, topic_filter: {topic_filter}, {e}");
+            }
+        }
+    }
+
+    async fn remove_client_routes(&self, id: &Id) {
+        let removals = self
+            .inner
+            .relations
+            .iter()
+            .flat_map(|entry| {
+                let topic_filter = entry.key().clone();
+                entry
+                    .value()
+                    .iter()
+                    .filter(move |(_, (route_id, _))| route_id == id)
+                    .map(move |(_, (route_id, _))| (topic_filter.clone(), route_id.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        for (topic_filter, route_id) in removals {
+            if let Err(e) = self.inner.remove(&topic_filter, route_id).await {
+                log::warn!(
+                    "remove terminated client route failed, id: {id:?}, topic_filter: {topic_filter}, {e}"
+                );
+            }
+        }
     }
 }
 
@@ -340,14 +492,44 @@ impl Store for ClusterRouter {
                         true
                     }
                 });
+                // Route removals normally arrive before SessionTerminated, but
+                // a transient proposal failure must not leave a route pointing
+                // at a session which no longer exists. The exact connection Id
+                // check keeps a newer connection with the same client id intact.
+                self.remove_client_routes(&id).await;
             }
             Message::Add { topic_filter, id, opts } => {
                 log::debug!("[Router.add] topic_filter: {topic_filter:?}, id: {id:?}, opts: {opts:?}");
-                self.inner.add(topic_filter, id, opts).await?;
+                // A subscription proposal can arrive after a newer client
+                // connection has already taken ownership. Never let that
+                // stale proposal replace the newer route for the same client
+                // id; this is especially important while an offline session
+                // snapshot is being relocated during drain.
+                let current_owner = self.client_states.get(&id.client_id).map(|status| status.id.clone());
+                if current_owner.as_ref() == Some(&id) {
+                    self.inner.add(topic_filter, id, opts).await?;
+                } else {
+                    log::debug!(
+                        "[Router.add] ignored stale owner, input id: {id:?}, current owner: {current_owner:?}, topic_filter: {topic_filter:?}"
+                    );
+                }
             }
             Message::Remove { topic_filter, id } => {
                 log::debug!("[Router.remove] topic_filter: {topic_filter:?}, id: {id:?}",);
                 self.inner.remove(topic_filter, id).await?;
+            }
+            Message::NodeUp { node } => {
+                log::info!("[Router.NodeUp] node: {node:?}");
+                self.nodes.upsert(node).await.map_err(|e| Error::Anyhow(e.into()))?;
+            }
+            Message::NodeDown { id } => {
+                log::info!("[Router.NodeDown] id: {id}");
+                self.nodes.remove(id);
+            }
+            Message::NodeRemove { id } => {
+                log::info!("[Router.NodeRemove] id: {id}");
+                self.nodes.remove(id);
+                self.remove_node_state(id).await;
             }
             Message::GetClientNodeId { client_id } => {
                 let node_id = self._client_node_id(client_id);
@@ -415,6 +597,7 @@ impl Store for ClusterRouter {
         let client_states = self.client_states.clone();
         let topics_count = self.inner.topics_count.clone();
         let relations_count = self.inner.relations_count.clone();
+        let cluster_nodes = self.nodes.snapshot_nodes();
         let snapshot: Vec<u8> = spawn_blocking(move || {
             let relations = relations
                 .iter()
@@ -436,12 +619,14 @@ impl Store for ClusterRouter {
             let client_states_bin = client_states_bin??;
             let topics_count_bin = bincode::serialize(&topics_count.as_ref())?;
             let relations_count_bin = bincode::serialize(&relations_count.as_ref())?;
+            let cluster_nodes_bin = bincode::serialize(&cluster_nodes)?;
 
             let mut snapshot = Vec::new();
             encode_with_length_prefix(&relations_bin, &mut snapshot);
             encode_with_length_prefix(&client_states_bin, &mut snapshot);
             encode_with_length_prefix(&topics_count_bin, &mut snapshot);
             encode_with_length_prefix(&relations_count_bin, &mut snapshot);
+            encode_with_length_prefix(&cluster_nodes_bin, &mut snapshot);
 
             Ok(snapshot)
         })
@@ -517,6 +702,7 @@ impl Store for ClusterRouter {
 
             let relations_count_len = read_len(snapshot, topics_count_start + topics_count_len)?;
             let relations_count_start = size_of::<usize>() + topics_count_start + topics_count_len;
+            let cluster_nodes_start_pos = relations_count_start + relations_count_len;
 
             let (relations, client_states) = rayon::join(
                 || decode_with_length_prefix(snapshot, relations_start, relations_len, true, compression),
@@ -536,16 +722,24 @@ impl Store for ClusterRouter {
                 decode_with_length_prefix(snapshot, topics_count_start, topics_count_len, false, None)?;
             let relations_count: Counter =
                 decode_with_length_prefix(snapshot, relations_count_start, relations_count_len, false, None)?;
+            let cluster_nodes: Vec<ClusterNode> = if cluster_nodes_start_pos < snapshot.len() {
+                let cluster_nodes_len = read_len(snapshot, cluster_nodes_start_pos)?;
+                let cluster_nodes_start = size_of::<usize>() + cluster_nodes_start_pos;
+                decode_with_length_prefix(snapshot, cluster_nodes_start, cluster_nodes_len, false, None)?
+            } else {
+                Vec::new()
+            };
 
             log::info!("relations: {:?}", relations.len());
             log::info!("client_states: {:?}", client_states.len());
             log::info!("topics_count: {topics_count:?}",);
             log::info!("relations_count: {relations_count:?}");
+            log::info!("cluster_nodes: {:?}", cluster_nodes.len());
 
-            Ok((relations, client_states, topics_count, relations_count))
+            Ok((relations, client_states, topics_count, relations_count, cluster_nodes))
         });
 
-        let (relations, client_states, topics_count, relations_count) = res?;
+        let (relations, client_states, topics_count, relations_count, cluster_nodes) = res?;
 
         self.inner.topics_count.set(&topics_count);
         let mut topics = self.inner.topics.write().await;
@@ -561,6 +755,9 @@ impl Store for ClusterRouter {
         for (client_id, content) in client_states {
             self.client_states.insert(client_id, content);
         }
+        if !cluster_nodes.is_empty() {
+            self.nodes.restore_nodes(cluster_nodes).await.map_err(|e| Error::Anyhow(e.into()))?;
+        }
 
         log::info!(
             "restore, topics_count: {topics_count:?}, relations_count: {relations_count:?}, cost time: {:?}",
@@ -568,5 +765,47 @@ impl Store for ClusterRouter {
         );
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(node_id: NodeId, client_id: &'static str) -> Id {
+        Id::new(node_id, 0, None, None, ClientId::from_static(client_id), None)
+    }
+
+    #[test]
+    fn orphaned_route_requires_missing_exact_owner_and_session() {
+        let route_id = id(1, "client-a");
+        let mut live_session_ids = HashSet::new();
+
+        assert!(!is_orphaned_node_route(2, &route_id, None, &live_session_ids));
+        assert!(!is_orphaned_node_route(1, &route_id, Some(&route_id), &live_session_ids));
+
+        live_session_ids.insert(route_id.clone());
+        assert!(!is_orphaned_node_route(1, &route_id, None, &live_session_ids));
+
+        live_session_ids.clear();
+        assert!(is_orphaned_node_route(1, &route_id, None, &live_session_ids));
+    }
+
+    #[test]
+    fn stale_route_is_orphaned_after_new_connection_takes_ownership() {
+        let old_route_id = id(1, "client-a");
+        let new_owner_id = old_route_id.relocated_to(2);
+        let live_session_ids = HashSet::new();
+
+        assert!(is_orphaned_node_route(1, &old_route_id, Some(&new_owner_id), &live_session_ids,));
+    }
+
+    #[test]
+    fn old_route_is_preserved_while_its_session_is_still_live() {
+        let old_route_id = id(1, "client-a");
+        let new_owner_id = old_route_id.relocated_to(2);
+        let live_session_ids = HashSet::from([old_route_id.clone()]);
+
+        assert!(!is_orphaned_node_route(1, &old_route_id, Some(&new_owner_id), &live_session_ids,));
     }
 }

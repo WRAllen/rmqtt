@@ -16,7 +16,10 @@ use rmqtt_raft::Mailbox;
 
 use super::config::PluginConfig;
 use super::message::{Message, RaftGrpcMessage, RaftGrpcMessageReply};
-use super::{hook_message_dropped, shared::ClusterShared};
+use super::{
+    hook_message_dropped,
+    shared::{effective_source_session_policy, ClusterShared},
+};
 
 pub(crate) struct HookHandler {
     scx: ServerContext,
@@ -132,16 +135,82 @@ impl Handler for HookHandler {
                         if let Err(droppeds) =
                             self.shared.forwards_to(from.clone(), publish, sub_rels.clone()).await
                         {
+                            let reason = droppeds
+                                .first()
+                                .map(|(_, _, _, reason)| reason.to_string())
+                                .unwrap_or_else(|| "local delivery failed".to_string());
                             hook_message_dropped(&self.scx, droppeds).await;
+                            return (
+                                false,
+                                Some(HookResult::GrpcMessageReply(Ok(MessageReply::Error(reason)))),
+                            );
                         }
-                        return (false, acc);
+                        return (false, Some(HookResult::GrpcMessageReply(Ok(MessageReply::Success))));
                     }
                     GrpcMessage::Kick(id, clean_start, clear_subscriptions, is_admin) => {
                         let mut entry = self.shared.inner().entry(id.clone());
-                        let new_acc = match entry.kick(*clean_start, *clear_subscriptions, *is_admin).await {
-                            Ok(o) => HookResult::GrpcMessageReply(Ok(MessageReply::Kick(o))),
-                            Err(e) => HookResult::GrpcMessageReply(Err(e)),
-                        };
+                        let source_draining = self.shared.is_draining();
+                        let source_session_id = entry.session().map(|session| session.id.clone());
+                        let preserve_relocated = source_session_id
+                            .as_ref()
+                            .is_some_and(|source_id| self.shared.preserve_session_on_takeover(source_id));
+
+                        // The first response may be lost after the source has
+                        // already extracted and detached the session.  During
+                        // a planned drain, replay the cached snapshot for a
+                        // retry instead of reporting NotExist and allowing a
+                        // Clean-Start reconnect to discard the old state.
+                        if source_draining && !*is_admin && !entry.exist() {
+                            if let Some(cached) = self.shared.cached_drain_session_handoff(&id.client_id) {
+                                log::warn!(
+                                    "{id:?} replaying cached session handoff after the source entry was detached"
+                                );
+                                self.shared.complete_pull_session_handoff(&id.client_id);
+                                return (
+                                    false,
+                                    Some(HookResult::GrpcMessageReply(Ok(MessageReply::Kick(cached)))),
+                                );
+                            }
+                        }
+
+                        // A client such as LM Gateway reconnects with Clean
+                        // Start after the broker intentionally disconnects it.
+                        // On a draining source node, return the complete
+                        // session state instead of silently discarding it. The
+                        // destination recognizes state returned across Clean
+                        // Start as a planned handoff and restores subscriptions
+                        // before the client performs its normal resubscribe.
+                        let (source_clean_start, source_clear_subscriptions) =
+                            effective_source_session_policy(
+                                *clean_start,
+                                *clear_subscriptions,
+                                source_draining || preserve_relocated,
+                                *is_admin,
+                            );
+                        if (*clean_start != source_clean_start
+                            || *clear_subscriptions != source_clear_subscriptions)
+                            && !*is_admin
+                        {
+                            log::debug!(
+                                "{id:?} preserving pending session state and routes for planned drain"
+                            );
+                        }
+                        let new_acc =
+                            match entry.kick(source_clean_start, source_clear_subscriptions, *is_admin).await
+                            {
+                                Ok(o) => {
+                                    if source_draining && !*is_admin {
+                                        self.shared.cache_drain_session_handoff(id.client_id.clone(), &o);
+                                    }
+                                    if preserve_relocated && !*is_admin {
+                                        if let Some(source_id) = source_session_id.as_ref() {
+                                            self.shared.complete_relocated_takeover(source_id);
+                                        }
+                                    }
+                                    HookResult::GrpcMessageReply(Ok(MessageReply::Kick(o)))
+                                }
+                                Err(e) => HookResult::GrpcMessageReply(Err(e)),
+                            };
                         return (false, Some(new_acc));
                     }
                     GrpcMessage::GetRetains(topic_filter) => {
@@ -173,6 +242,32 @@ impl Handler for HookHandler {
                                             ))),
                                         }
                                     }
+                                    Err(e) => {
+                                        HookResult::GrpcMessageReply(Ok(MessageReply::Error(e.to_string())))
+                                    }
+                                }
+                            }
+                            Ok(RaftGrpcMessage::ReliableForwardBatch(forwards)) => {
+                                let statuses = self.shared.accept_reliable_forward_batch(forwards).await;
+                                match RaftGrpcMessageReply::ReliableForwardBatch(statuses).encode() {
+                                    Ok(response) => {
+                                        HookResult::GrpcMessageReply(Ok(MessageReply::Data(response)))
+                                    }
+                                    Err(e) => {
+                                        HookResult::GrpcMessageReply(Ok(MessageReply::Error(e.to_string())))
+                                    }
+                                }
+                            }
+                            Ok(RaftGrpcMessage::SessionHandoff(handoff)) => {
+                                match self.shared.accept_session_handoff(handoff).await {
+                                    Ok(reply) => match RaftGrpcMessageReply::SessionHandoff(reply).encode() {
+                                        Ok(response) => {
+                                            HookResult::GrpcMessageReply(Ok(MessageReply::Data(response)))
+                                        }
+                                        Err(e) => HookResult::GrpcMessageReply(Ok(MessageReply::Error(
+                                            e.to_string(),
+                                        ))),
+                                    },
                                     Err(e) => {
                                         HookResult::GrpcMessageReply(Ok(MessageReply::Error(e.to_string())))
                                     }

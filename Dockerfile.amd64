@@ -1,9 +1,13 @@
 FROM alpine:3.18.3
 LABEL maintainer="rmqtt <rmqttd@126.com>"
+ARG RMQTT_BUILD_ID
+LABEL org.opencontainers.image.version="${RMQTT_BUILD_ID}"
 
 RUN mkdir -p /app/rmqtt/rmqtt-bin
 RUN mkdir -p /app/rmqtt/rmqtt-plugins
 COPY target/x86_64-unknown-linux-musl/release/rmqttd /app/rmqtt/rmqtt-bin/
+RUN test -n "${RMQTT_BUILD_ID}" \
+    && printf '%s\n' "${RMQTT_BUILD_ID}" > /app/rmqtt/rmqtt-bin/BUILD_ID
 COPY rmqtt.toml /app/rmqtt/
 COPY rmqtt-plugins/*.toml /app/rmqtt/rmqtt-plugins/
 COPY rmqtt-bin/rmqtt.pem  /app/rmqtt/rmqtt-bin/
@@ -23,4 +27,3 @@ VOLUME ["/var/log/rmqtt"]
 EXPOSE 1883 8883 11883 6060 6003 5363
 
 ENTRYPOINT ["sh", "-c", "/app/rmqtt/rmqtt-bin/rmqttd \"$@\"", "--"]
-

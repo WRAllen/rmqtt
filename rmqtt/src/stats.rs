@@ -67,7 +67,13 @@ pub struct Stats {
     pub subscriptions: Counter,
     pub subscriptions_shared: Counter,
     pub message_queues: Counter,
+    /// Messages that were still present when their in-memory queue was
+    /// destroyed. This is monotonic and must not be treated as a live gauge.
+    pub message_queue_drops: Counter,
     pub out_inflights: Counter,
+    /// Outbound QoS messages that were still unacknowledged when their
+    /// in-flight container was destroyed.
+    pub out_inflight_drops: Counter,
     pub in_inflights: Counter,
     pub forwards: Counter,
     pub message_storages: Counter,
@@ -109,7 +115,9 @@ impl Stats {
             subscriptions: Counter::new(),
             subscriptions_shared: Counter::new(),
             message_queues: Counter::new(),
+            message_queue_drops: Counter::new(),
             out_inflights: Counter::new(),
+            out_inflight_drops: Counter::new(),
             in_inflights: Counter::new(),
             forwards: Counter::new(),
             message_storages: Counter::new(),
@@ -230,7 +238,9 @@ impl Stats {
             subscriptions: self.subscriptions.clone(),
             subscriptions_shared: self.subscriptions_shared.clone(),
             message_queues: self.message_queues.clone(),
+            message_queue_drops: self.message_queue_drops.clone(),
             out_inflights: self.out_inflights.clone(),
+            out_inflight_drops: self.out_inflight_drops.clone(),
             in_inflights: self.in_inflights.clone(),
             forwards: self.forwards.clone(),
             message_storages: self.message_storages.clone(),
@@ -271,7 +281,9 @@ impl Stats {
         self.subscriptions.add(&other.subscriptions);
         self.subscriptions_shared.add(&other.subscriptions_shared);
         self.message_queues.add(&other.message_queues);
+        self.message_queue_drops.add(&other.message_queue_drops);
         self.out_inflights.add(&other.out_inflights);
+        self.out_inflight_drops.add(&other.out_inflight_drops);
         self.in_inflights.add(&other.in_inflights);
         self.forwards.add(&other.forwards);
         self.message_storages.add(&other.message_storages);
@@ -328,8 +340,10 @@ impl Stats {
 
             "message_queues.count": self.message_queues.count(),
             "message_queues.max": self.message_queues.max(),
+            "message_queue_drops.count": self.message_queue_drops.count(),
             "out_inflights.count": self.out_inflights.count(),
             "out_inflights.max": self.out_inflights.max(),
+            "out_inflight_drops.count": self.out_inflight_drops.count(),
             "in_inflights.count": self.in_inflights.count(),
             "in_inflights.max": self.in_inflights.max(),
             "forwards.count": self.forwards.count(),

@@ -31,6 +31,16 @@ raft_peer_addrs = ["1@127.0.0.1:6003", "2@127.0.0.1:6004", "3@127.0.0.1:6005"]
 #will be designated as the Leader. Default value: 0
 leader_id = 0
 
+#Explicitly control whether this node may create a brand-new raft cluster.
+#Leave unset to preserve the legacy automatic behavior. Kubernetes operators
+#should set this to true only for the first bootstrap pod and false afterwards.
+#bootstrap = false
+
+#Join an existing cluster as a non-voting learner. Keep false for legacy
+#standalone deployments; the RMQTT Operator renders this as true and promotes
+#the node only after snapshot restoration and log catch-up are confirmed.
+join_as_learner = false
+
 #Handshake lock timeout
 try_lock_timeout = "10s"
 task_exec_queue_workers = 500
@@ -51,6 +61,25 @@ health.max_continuous_unavailable_count = 2
 #Cluster node unavailability check interval.
 #Default value: 2 seconds
 health.unavailable_check_interval = "2s"
+
+#Reliable delivery handoff is activated only for operator-coordinated drain
+#targets. Normal cross-node forwarding keeps the existing fast path.
+handoff.enabled = true
+#Both limits are per broker and consume memory during handoff. Keep them below
+#the Pod memory budget; the operator should roll back before either reaches 100%.
+handoff.max_pending_messages = 100_000
+handoff.max_pending_bytes = 536_870_912
+handoff.retry_timeout = "120s"
+handoff.retry_interval = "20ms"
+handoff.retry_max_interval = "1s"
+#Messages for one MQTT client stay ordered, while one gRPC round trip can
+#transfer a bounded batch to avoid stop-and-wait throughput collapse.
+handoff.batch_max_messages = 64
+handoff.batch_max_bytes = 2097152
+#Disconnect established MQTT sessions gradually to avoid a reconnect storm.
+handoff.disconnect_batch_size = 64
+handoff.disconnect_batch_interval = "100ms"
+handoff.dedup_ttl = "600s"
 
 raft.grpc_timeout = "6s"
 raft.grpc_concurrency_limit = 200

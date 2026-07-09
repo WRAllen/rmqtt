@@ -1,0 +1,218 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: rmqttclusters.rmqtt.io
+spec:
+  group: rmqtt.io
+  scope: Namespaced
+  names:
+    plural: rmqttclusters
+    singular: rmqttcluster
+    kind: RmqttCluster
+    shortNames:
+      - rmq
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              properties:
+                replicas:
+                  type: integer
+                  minimum: 1
+                  default: 3
+                image:
+                  type: string
+                  default: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt:latest
+                imagePullPolicy:
+                  type: string
+                  enum: [Always, IfNotPresent, Never]
+                  default: IfNotPresent
+                imageUpdate:
+                  type: object
+                  properties:
+                    autoRollout:
+                      type: boolean
+                      default: false
+                    stabilizationSeconds:
+                      type: integer
+                      minimum: 10
+                      default: 60
+                service:
+                  type: object
+                  properties:
+                    mqttPort:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                      default: 1883
+                    mqttsPort:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                      default: 8883
+                    wsPort:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                      default: 8080
+                    wssPort:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                      default: 8083
+                    httpApiPort:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                      default: 6060
+                    grpcPort:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                      default: 5363
+                    raftPort:
+                      type: integer
+                      minimum: 1
+                      maximum: 65535
+                      default: 6003
+                config:
+                  type: object
+                  properties:
+                    baseConfigMapName:
+                      type: string
+                      minLength: 1
+                resources:
+                  type: object
+                  properties:
+                    requests:
+                      type: object
+                      properties:
+                        cpu:
+                          type: string
+                        memory:
+                          type: string
+                    limits:
+                      type: object
+                      properties:
+                        cpu:
+                          type: string
+                        memory:
+                          type: string
+                pod:
+                  type: object
+                  properties:
+                    annotations:
+                      type: object
+                      additionalProperties:
+                        type: string
+                    serviceAccountName:
+                      type: string
+                      minLength: 1
+                    imagePullSecrets:
+                      type: array
+                      items:
+                        type: object
+                        required: [name]
+                        properties:
+                          name:
+                            type: string
+                            minLength: 1
+                    schedulerName:
+                      type: string
+                    affinity:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    tolerations:
+                      type: array
+                      items:
+                        type: object
+                        x-kubernetes-preserve-unknown-fields: true
+                    enableServiceLinks:
+                      type: boolean
+                      default: false
+                    terminationGracePeriodSeconds:
+                      type: integer
+                      minimum: 0
+                      default: 30
+                monitoring:
+                  type: object
+                  properties:
+                    serviceMonitor:
+                      type: object
+                      properties:
+                        enabled:
+                          type: boolean
+                          default: false
+                        labels:
+                          type: object
+                          additionalProperties:
+                            type: string
+                        path:
+                          type: string
+                          default: /api/v1/metrics/prometheus/sum
+                        interval:
+                          type: string
+                          default: 60s
+                        scrapeTimeout:
+                          type: string
+                          default: 10s
+                raft:
+                  type: object
+                  properties:
+                    minReplicas:
+                      type: integer
+                      minimum: 1
+                      default: 3
+                    drainTimeoutSeconds:
+                      type: integer
+                      minimum: 1
+                      default: 300
+                    endpointRemovalStableSeconds:
+                      type: integer
+                      minimum: 1
+                      default: 5
+                    scaleInStabilizationSeconds:
+                      type: integer
+                      minimum: 10
+                      default: 60
+                    handoffRollbackThresholdPercent:
+                      type: integer
+                      minimum: 50
+                      maximum: 95
+                      default: 80
+                    drainTimeoutAction:
+                      type: string
+                      enum:
+                        - Rollback
+                        - ForceContinue
+                      default: Rollback
+                    allowLeaderScaleIn:
+                      type: boolean
+                      default: false
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+      additionalPrinterColumns:
+        - name: Replicas
+          type: integer
+          jsonPath: .status.replicas
+        - name: Ready
+          type: integer
+          jsonPath: .status.readyReplicas
+        - name: Phase
+          type: string
+          jsonPath: .status.phase
+        - name: Operation
+          type: string
+          jsonPath: .status.operation.phase
+        - name: Leader
+          type: integer
+          jsonPath: .status.leaderId

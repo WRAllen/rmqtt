@@ -62,7 +62,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::context::ServerContext;
 use crate::net::MqttError;
-use crate::queue::OnEventFn;
+use crate::queue::{OnDropFn, OnEventFn};
 use crate::types::{From, PacketId, Publish, TimestampMillis};
 use crate::types::{QoS, Reason};
 use crate::utils::timestamp_millis;
@@ -104,7 +104,6 @@ impl OutInflightMessage {
     }
 }
 
-#[derive(Clone)]
 pub struct OutInflight {
     cap: usize,
     interval: TimestampMillis,
@@ -112,6 +111,19 @@ pub struct OutInflight {
     queues: OutQueues,
     on_push_fn: Option<Arc<dyn OnEventFn>>,
     on_pop_fn: Option<Arc<dyn OnEventFn>>,
+    on_drop_fn: Option<Arc<dyn OnDropFn>>,
+}
+
+impl Drop for OutInflight {
+    #[inline]
+    fn drop(&mut self) {
+        let remaining = self.queues.len();
+        if remaining > 0 {
+            if let Some(f) = self.on_drop_fn.as_ref() {
+                f(remaining);
+            }
+        }
+    }
 }
 
 impl OutInflight {
@@ -125,6 +137,7 @@ impl OutInflight {
             queues: OutQueues::default(),
             on_push_fn: None,
             on_pop_fn: None,
+            on_drop_fn: None,
         }
     }
 
@@ -143,6 +156,15 @@ impl OutInflight {
         F: OnEventFn,
     {
         self.on_pop_fn = Some(Arc::new(f));
+        self
+    }
+
+    #[inline]
+    pub fn on_drop<F>(mut self, f: F) -> Self
+    where
+        F: OnDropFn,
+    {
+        self.on_drop_fn = Some(Arc::new(f));
         self
     }
 
@@ -301,6 +323,50 @@ impl OutInflight {
     #[inline]
     pub fn clone_inflight_messages(&mut self) -> Vec<OutInflightMessage> {
         self.queues.iter().map(|(_, msg)| msg.clone()).collect_vec()
+    }
+}
+
+#[cfg(test)]
+mod out_inflight_drop_tests {
+    use std::num::NonZeroU16;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+
+    use super::{MomentStatus, OutInflight, OutInflightMessage};
+    use crate::codec::v5::PublishProperties;
+    use crate::types::{ClientId, CodecPublish, From, Id, Publish, QoS, TopicName};
+
+    fn message(packet_id: u16) -> OutInflightMessage {
+        let from = From::from_system(Id::new(1, 0, None, None, ClientId::from_static("drop-test"), None));
+        let publish = CodecPublish {
+            dup: false,
+            retain: false,
+            qos: QoS::AtLeastOnce,
+            topic: TopicName::from_static("drop/test"),
+            packet_id: NonZeroU16::new(packet_id),
+            payload: Bytes::new(),
+            properties: Some(PublishProperties::default()),
+        };
+        OutInflightMessage::new(MomentStatus::UnAck, from, Publish::from(publish))
+    }
+
+    #[test]
+    fn drop_reports_only_remaining_inflight_messages() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        {
+            let dropped1 = dropped.clone();
+            let mut inflight = OutInflight::new(4, 0, 0).on_drop(move |remaining| {
+                dropped1.fetch_add(remaining, Ordering::SeqCst);
+            });
+
+            inflight.push_back(message(1));
+            inflight.push_back(message(2));
+            assert!(inflight.remove(&1).is_some());
+        }
+
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
     }
 }
 

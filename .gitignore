@@ -1,6 +1,7 @@
 target/
 .idea/
 .*
+!.dockerignore
 */.idea/
 */Cargo.lock
 */target/
@@ -13,3 +14,4 @@ target/
 !.github
 /publishs-dry-run.bat
 /publishs.bat
+/bench/*

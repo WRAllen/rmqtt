@@ -23,15 +23,32 @@ pub enum Message<'a> {
     StatsInfo,
     MetricsInfo,
     ClientSearch(Box<ClientSearchParams>),
-    ClientGet { clientid: &'a str },
+    ClientGet {
+        clientid: &'a str,
+    },
     Subscribe(SubscribeParams),
     Unsubscribe(UnsubscribeParams),
     GetPlugins,
-    GetPlugin { name: &'a str },
-    GetPluginConfig { name: &'a str },
-    ReloadPluginConfig { name: &'a str },
-    LoadPlugin { name: &'a str },
-    UnloadPlugin { name: &'a str },
+    GetPlugin {
+        name: &'a str,
+    },
+    GetPluginConfig {
+        name: &'a str,
+    },
+    ReloadPluginConfig {
+        name: &'a str,
+    },
+    LoadPlugin {
+        name: &'a str,
+    },
+    UnloadPlugin {
+        name: &'a str,
+    },
+    SendPluginMessage {
+        name: &'a str,
+        #[serde(serialize_with = "serialize_json_value", deserialize_with = "deserialize_json_value")]
+        msg: serde_json::Value,
+    },
 }
 
 impl Message<'_> {
@@ -62,6 +79,10 @@ pub enum MessageReply {
     ReloadPluginConfig,
     LoadPlugin,
     UnloadPlugin(bool),
+    SendPluginMessage(
+        #[serde(serialize_with = "serialize_json_value", deserialize_with = "deserialize_json_value")]
+        serde_json::Value,
+    ),
 }
 
 impl MessageReply {
@@ -73,6 +94,22 @@ impl MessageReply {
     pub fn decode(data: &[u8]) -> Result<MessageReply> {
         bincode::deserialize::<MessageReply>(data).map_err(anyhow::Error::new)
     }
+}
+
+#[inline]
+fn serialize_json_value<S>(value: &serde_json::Value, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    S: ser::Serializer,
+{
+    serde_json::to_vec(value).map_err(ser::Error::custom)?.serialize(serializer)
+}
+
+#[inline]
+fn deserialize_json_value<'de, D>(deserializer: D) -> std::result::Result<serde_json::Value, D::Error>
+where
+    D: de::Deserializer<'de>,
+{
+    serde_json::from_slice(&Vec::<u8>::deserialize(deserializer)?).map_err(de::Error::custom)
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
@@ -324,6 +361,48 @@ pub enum PrometheusDataType {
     All,
     Node(NodeId),
     Sum,
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{Message, MessageReply};
+
+    #[test]
+    fn send_plugin_message_bincode_round_trip() {
+        let expected = json!({
+            "action": "membership",
+            "node": {"id": 1, "available": true},
+            "values": [null, false, 42, "rmqtt"],
+        });
+        let encoded = Message::SendPluginMessage { name: "rmqtt-cluster-raft", msg: expected.clone() }
+            .encode()
+            .unwrap();
+
+        match Message::decode(&encoded).unwrap() {
+            Message::SendPluginMessage { name, msg } => {
+                assert_eq!(name, "rmqtt-cluster-raft");
+                assert_eq!(msg, expected);
+            }
+            message => panic!("unexpected message: {message:?}"),
+        }
+    }
+
+    #[test]
+    fn send_plugin_message_reply_bincode_round_trip() {
+        let expected = json!({
+            "leaderId": 1,
+            "voters": [1, 2, 3, 4],
+            "available": true,
+        });
+        let encoded = MessageReply::SendPluginMessage(expected.clone()).encode().unwrap();
+
+        match MessageReply::decode(&encoded).unwrap() {
+            MessageReply::SendPluginMessage(reply) => assert_eq!(reply, expected),
+            reply => panic!("unexpected reply: {reply:?}"),
+        }
+    }
 }
 
 // #[inline]

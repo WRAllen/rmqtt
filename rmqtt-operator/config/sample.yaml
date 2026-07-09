@@ -1,0 +1,28 @@
+apiVersion: rmqtt.io/v1alpha1
+kind: RmqttCluster
+metadata:
+  name: rmqtt-optest
+  namespace: rmqtt-test
+spec:
+  replicas: 3
+  image: registry.cn-sh-02.sensecore.cn/ccr-ams-public/mirror/docker/rmqtt-test/rmqtt:latest
+  imagePullPolicy: IfNotPresent
+  imageUpdate:
+    autoRollout: true
+    stabilizationSeconds: 60
+  service:
+    mqttPort: 1883
+    mqttsPort: 8883
+    wsPort: 8080
+    wssPort: 8083
+    httpApiPort: 6060
+    grpcPort: 5363
+    raftPort: 6003
+  raft:
+    minReplicas: 3
+    drainTimeoutSeconds: 300
+    endpointRemovalStableSeconds: 5
+    scaleInStabilizationSeconds: 60
+    handoffRollbackThresholdPercent: 80
+    drainTimeoutAction: Rollback
+    allowLeaderScaleIn: false

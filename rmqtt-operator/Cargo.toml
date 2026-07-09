@@ -1,0 +1,19 @@
+[package]
+name = "rmqtt-operator"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Kubernetes operator for RMQTT raft clusters"
+repository.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono = { workspace = true, features = ["clock"] }
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+log.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread", "time"] }

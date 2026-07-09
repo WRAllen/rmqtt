@@ -73,6 +73,9 @@ impl<T, P> PolicyFn<P> for T where T: 'static + Sync + Send + Clone + Fn(&P) -> 
 pub trait OnEventFn: 'static + Sync + Send + Fn() {}
 impl<T> OnEventFn for T where T: 'static + Sync + Send + Clone + Fn() {}
 
+pub trait OnDropFn: 'static + Sync + Send + Fn(usize) {}
+impl<T> OnDropFn for T where T: 'static + Sync + Send + Clone + Fn(usize) {}
+
 pub struct Sender<T> {
     tx: mpsc::Sender<()>,
     queue: Arc<Queue<T>>,
@@ -186,19 +189,26 @@ pub struct Queue<T> {
     inner: Mutex<VecDeque<T>>,
     on_push_fn: Option<Arc<dyn OnEventFn>>,
     on_pop_fn: Option<Arc<dyn OnEventFn>>,
+    on_drop_fn: Option<Arc<dyn OnDropFn>>,
 }
 
 impl<T> Drop for Queue<T> {
     #[inline]
     fn drop(&mut self) {
-        log::debug!("Queue Drop ... len: {}", self.len());
+        let remaining = self.inner.get_mut().len();
+        log::debug!("Queue Drop ... len: {remaining}");
+        if remaining > 0 {
+            if let Some(f) = self.on_drop_fn.as_ref() {
+                f(remaining);
+            }
+        }
     }
 }
 
 impl<T> Queue<T> {
     #[inline]
     pub fn new(cap: usize) -> Self {
-        Self { cap, inner: Mutex::new(VecDeque::new()), on_push_fn: None, on_pop_fn: None }
+        Self { cap, inner: Mutex::new(VecDeque::new()), on_push_fn: None, on_pop_fn: None, on_drop_fn: None }
     }
 
     #[inline]
@@ -215,6 +225,14 @@ impl<T> Queue<T> {
         F: OnEventFn,
     {
         self.on_pop_fn = Some(Arc::new(f));
+    }
+
+    #[inline]
+    pub fn on_drop<F>(&mut self, f: F)
+    where
+        F: OnDropFn,
+    {
+        self.on_drop_fn = Some(Arc::new(f));
     }
 
     #[inline]
@@ -292,5 +310,45 @@ mod test {
         while let Some(v) = rx.next().await {
             println!("{} queue recv: {:?}", Local::now().format("%Y-%m-%d %H:%M:%S%.3f %z"), v);
         }
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::Queue;
+
+    #[test]
+    fn drop_reports_only_remaining_items() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        {
+            let mut queue = Queue::new(4);
+            let dropped1 = dropped.clone();
+            queue.on_drop(move |remaining| {
+                dropped1.fetch_add(remaining, Ordering::SeqCst);
+            });
+
+            queue.push(1).unwrap();
+            queue.push(2).unwrap();
+            assert_eq!(queue.pop(), Some(1));
+        }
+
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn drop_ignores_an_empty_queue() {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        {
+            let mut queue = Queue::<u8>::new(1);
+            let dropped1 = dropped.clone();
+            queue.on_drop(move |remaining| {
+                dropped1.fetch_add(remaining, Ordering::SeqCst);
+            });
+        }
+
+        assert_eq!(dropped.load(Ordering::SeqCst), 0);
     }
 }

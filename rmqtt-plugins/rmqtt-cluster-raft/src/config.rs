@@ -44,6 +44,20 @@ pub struct PluginConfig {
     #[serde(default)]
     pub leader_id: NodeId,
 
+    /// Controls whether this process may initialize a brand-new single-node
+    /// raft cluster. `None` preserves the legacy auto-discovery behavior for
+    /// non-operator deployments, `Some(true)` explicitly allows bootstrap,
+    /// and `Some(false)` makes startup fail closed until an existing leader is
+    /// found.
+    #[serde(default)]
+    pub bootstrap: Option<bool>,
+
+    /// Join an existing cluster as a learner. Operator-managed deployments
+    /// enable this so a new pod cannot change quorum or receive business
+    /// traffic until it has restored and caught up.
+    #[serde(default)]
+    pub join_as_learner: bool,
+
     #[serde(default = "PluginConfig::try_lock_timeout_default", deserialize_with = "deserialize_duration")]
     pub try_lock_timeout: Duration, //Message::HandshakeTryLock
 
@@ -61,6 +75,9 @@ pub struct PluginConfig {
 
     #[serde(default)]
     pub health: Health,
+
+    #[serde(default)]
+    pub handoff: Handoff,
 
     #[serde(default = "PluginConfig::raft_default")]
     pub raft: RaftConfig,
@@ -178,6 +195,128 @@ impl Health {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Handoff {
+    #[serde(default = "Handoff::enabled_default")]
+    pub enabled: bool,
+    #[serde(default = "Handoff::max_pending_messages_default")]
+    pub max_pending_messages: usize,
+    #[serde(default = "Handoff::max_pending_bytes_default")]
+    pub max_pending_bytes: usize,
+    #[serde(default = "Handoff::retry_timeout_default", deserialize_with = "deserialize_duration")]
+    pub retry_timeout: Duration,
+    #[serde(default = "Handoff::retry_interval_default", deserialize_with = "deserialize_duration")]
+    pub retry_interval: Duration,
+    #[serde(default = "Handoff::retry_max_interval_default", deserialize_with = "deserialize_duration")]
+    pub retry_max_interval: Duration,
+    #[serde(default = "Handoff::batch_max_messages_default")]
+    pub batch_max_messages: usize,
+    #[serde(default = "Handoff::batch_max_bytes_default")]
+    pub batch_max_bytes: usize,
+    #[serde(default = "Handoff::disconnect_batch_size_default")]
+    pub disconnect_batch_size: usize,
+    #[serde(
+        default = "Handoff::disconnect_batch_interval_default",
+        deserialize_with = "deserialize_duration"
+    )]
+    pub disconnect_batch_interval: Duration,
+    #[serde(default = "Handoff::dedup_ttl_default", deserialize_with = "deserialize_duration")]
+    pub dedup_ttl: Duration,
+}
+
+impl Default for Handoff {
+    fn default() -> Self {
+        Self {
+            enabled: Self::enabled_default(),
+            max_pending_messages: Self::max_pending_messages_default(),
+            max_pending_bytes: Self::max_pending_bytes_default(),
+            retry_timeout: Self::retry_timeout_default(),
+            retry_interval: Self::retry_interval_default(),
+            retry_max_interval: Self::retry_max_interval_default(),
+            batch_max_messages: Self::batch_max_messages_default(),
+            batch_max_bytes: Self::batch_max_bytes_default(),
+            disconnect_batch_size: Self::disconnect_batch_size_default(),
+            disconnect_batch_interval: Self::disconnect_batch_interval_default(),
+            dedup_ttl: Self::dedup_ttl_default(),
+        }
+    }
+}
+
+impl Handoff {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.max_pending_messages == 0 {
+            return Err(anyhow!("handoff.max_pending_messages must be greater than zero"));
+        }
+        if self.max_pending_bytes == 0 {
+            return Err(anyhow!("handoff.max_pending_bytes must be greater than zero"));
+        }
+        if self.batch_max_messages == 0 {
+            return Err(anyhow!("handoff.batch_max_messages must be greater than zero"));
+        }
+        if self.batch_max_bytes == 0 || self.batch_max_bytes > 2 * 1024 * 1024 {
+            return Err(anyhow!(
+                "handoff.batch_max_bytes must be between 1 and 2097152 to stay below the cluster gRPC frame limit"
+            ));
+        }
+        if self.retry_interval.is_zero() || self.retry_max_interval < self.retry_interval {
+            return Err(anyhow!(
+                "handoff.retry_max_interval must be greater than or equal to a non-zero handoff.retry_interval"
+            ));
+        }
+        if self.dedup_ttl < self.retry_timeout {
+            return Err(anyhow!("handoff.dedup_ttl must be greater than or equal to handoff.retry_timeout"));
+        }
+        if self.disconnect_batch_size == 0 || self.disconnect_batch_interval.is_zero() {
+            return Err(anyhow!("handoff disconnect batch size and interval must both be greater than zero"));
+        }
+        Ok(())
+    }
+
+    fn enabled_default() -> bool {
+        true
+    }
+
+    fn max_pending_messages_default() -> usize {
+        100_000
+    }
+
+    fn max_pending_bytes_default() -> usize {
+        512 * 1024 * 1024
+    }
+
+    fn retry_timeout_default() -> Duration {
+        Duration::from_secs(120)
+    }
+
+    fn retry_interval_default() -> Duration {
+        Duration::from_millis(20)
+    }
+
+    fn retry_max_interval_default() -> Duration {
+        Duration::from_secs(1)
+    }
+
+    fn batch_max_messages_default() -> usize {
+        64
+    }
+
+    fn batch_max_bytes_default() -> usize {
+        2 * 1024 * 1024
+    }
+
+    fn disconnect_batch_size_default() -> usize {
+        64
+    }
+
+    fn disconnect_batch_interval_default() -> Duration {
+        Duration::from_millis(100)
+    }
+
+    fn dedup_ttl_default() -> Duration {
+        Duration::from_secs(600)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct RaftConfig {
     #[serde(default = "RaftConfig::grpc_reuseaddr_default")]
@@ -186,6 +325,8 @@ pub struct RaftConfig {
     pub grpc_reuseport: bool,
     #[serde(default, deserialize_with = "deserialize_duration_option")]
     pub grpc_timeout: Option<Duration>,
+    #[serde(default, deserialize_with = "deserialize_duration_option")]
+    pub join_connect_retry_timeout: Option<Duration>,
     pub grpc_concurrency_limit: Option<usize>,
     pub grpc_message_size: Option<usize>,
     pub grpc_breaker_threshold: Option<u64>,
@@ -278,6 +419,9 @@ impl RaftConfig {
         cfg.reuseport = self.grpc_reuseport;
         if let Some(grpc_timeout) = self.grpc_timeout {
             cfg.grpc_timeout = grpc_timeout;
+        }
+        if let Some(join_connect_retry_timeout) = self.join_connect_retry_timeout {
+            cfg.join_connect_retry_timeout = join_connect_retry_timeout;
         }
         if let Some(grpc_concurrency_limit) = self.grpc_concurrency_limit {
             cfg.grpc_concurrency_limit = grpc_concurrency_limit;
@@ -384,6 +528,33 @@ impl RaftConfig {
             ReadOnlyOption::LeaseBased => "leasebased",
         };
         rop_str.serialize(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_connect_retry_timeout_uses_rmqtt_raft_default() {
+        let cfg = RaftConfig::default().to_raft_config();
+        assert_eq!(cfg.join_connect_retry_timeout, Duration::from_secs(20));
+    }
+
+    #[test]
+    fn join_connect_retry_timeout_can_be_overridden() {
+        let cfg =
+            RaftConfig { join_connect_retry_timeout: Some(Duration::from_secs(7)), ..Default::default() }
+                .to_raft_config();
+        assert_eq!(cfg.join_connect_retry_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn reliable_handoff_defaults_fit_grpc_and_dedup_constraints() {
+        assert!(Handoff::default().validate().is_ok());
+
+        let invalid = Handoff { batch_max_bytes: 4 * 1024 * 1024, ..Handoff::default() };
+        assert!(invalid.validate().is_err());
     }
 }
 

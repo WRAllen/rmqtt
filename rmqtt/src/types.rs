@@ -171,6 +171,14 @@ impl ConnectInfo {
     }
 
     #[inline]
+    pub fn relocated_to(&self, node_id: NodeId) -> Self {
+        match self {
+            ConnectInfo::V3(id, connect) => ConnectInfo::V3(id.relocated_to(node_id), connect.clone()),
+            ConnectInfo::V5(id, connect) => ConnectInfo::V5(id.relocated_to(node_id), connect.clone()),
+        }
+    }
+
+    #[inline]
     pub fn client_id(&self) -> &ClientId {
         match self {
             ConnectInfo::V3(id, _) => &id.client_id,
@@ -1651,6 +1659,26 @@ impl Id {
         }))
     }
 
+    /// Build an identity for an operator-coordinated session relocation.
+    ///
+    /// Keeping the original connection epoch is intentional.  A real client
+    /// reconnect always receives a newer epoch and therefore wins the Raft
+    /// ownership race over this offline standby session.  The relocation can
+    /// never replace a newer live connection merely because its gRPC request
+    /// arrived later.
+    #[inline]
+    pub fn relocated_to(&self, node_id: NodeId) -> Self {
+        Self(Arc::new(_Id {
+            node_id,
+            lid: self.lid,
+            local_addr: self.local_addr,
+            remote_addr: self.remote_addr,
+            client_id: self.client_id.clone(),
+            username: self.username.clone(),
+            create_time: self.create_time,
+        }))
+    }
+
     #[inline]
     pub fn to_json(&self) -> serde_json::Value {
         json!({
@@ -1900,6 +1928,11 @@ pub enum Message {
     Forward(From, Publish),
     SendRerelease(OutInflightMessage),
     Kick(oneshot::Sender<()>, Id, CleanStart, IsAdmin),
+    /// Disconnect the network connection for a planned broker drain while
+    /// keeping the MQTT session alive in its offline event loop. Unlike
+    /// `Kick`, this preserves the local mailbox so messages selected through
+    /// a not-yet-converged route can still be queued until session takeover.
+    Drain(oneshot::Sender<()>, Id),
     // Disconnect(Disconnect),
     Closed(Reason),
     Subscribe(Subscribe, oneshot::Sender<Result<SubscribeReturn>>),
@@ -2315,6 +2348,7 @@ bitflags! {
         const DisconnectReceived = 0b00000100;
         const CleanStart = 0b00001000;
         const Ping = 0b00010000;
+        const Draining = 0b00100000;
     }
 }
 
@@ -2925,4 +2959,14 @@ fn test_reason() {
 
     let reasons = Reason::Reasons(vec![Reason::ConnectKicked(false), Reason::MessageExpiration]);
     assert_eq!(reasons.to_string(), "Kicked,MessageExpiration");
+}
+
+#[test]
+fn relocated_session_keeps_connection_epoch() {
+    let source = Id::new(1, 3, None, None, ClientId::from_static("relocated-client"), None);
+    let relocated = source.relocated_to(2);
+    assert_eq!(relocated.node_id, 2);
+    assert_eq!(relocated.lid, source.lid);
+    assert_eq!(relocated.client_id, source.client_id);
+    assert_eq!(relocated.create_time, source.create_time);
 }

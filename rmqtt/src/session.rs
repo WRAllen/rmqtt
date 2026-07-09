@@ -121,6 +121,16 @@ impl Deref for SessionState {
 
 impl SessionState {
     #[inline]
+    fn preserve_offline_session(flags: StateFlags, clean_session: bool) -> bool {
+        flags.contains(StateFlags::Draining) || !clean_session
+    }
+
+    #[inline]
+    pub(crate) fn clear_transferred_subscriptions(clean_start: bool, has_transferred_state: bool) -> bool {
+        clean_start && !has_transferred_state
+    }
+
+    #[inline]
     pub(crate) fn new(
         session: Session,
         hook: Arc<dyn Hook>,
@@ -196,6 +206,25 @@ impl SessionState {
         }
         self.scx.connections.dec();
 
+        // A planned operator drain is the one shutdown path where the broker
+        // already knows the MQTT reason before closing the transport.  Send
+        // MQTT 5 ServerShuttingDown while the socket is still writable.  MQTT
+        // 3 has no server DISCONNECT packet, so its behaviour remains a TCP
+        // close.  Sink::close still provides the bounded force-close fallback
+        // if the peer stops reading.
+        let mut drain_disconnect_sent = false;
+        if flags.contains(StateFlags::Draining) {
+            if let Sink::V5(s) = &mut sink {
+                let reason = Reason::ConnectRemoteClose;
+                let d = v5::Disconnect {
+                    reason_code: reason.to_reason_code(),
+                    reason_string: Some(reason.to_string().into()),
+                    ..Default::default()
+                };
+                drain_disconnect_sent = s.send_disconnect(d).await.is_ok();
+            }
+        }
+
         if let Err(e) = sink.close().await {
             log::info!("{} close io error, {e:?}", self.id);
         }
@@ -248,17 +277,19 @@ impl SessionState {
             Reason::ConnectRemoteClose
         };
 
-        if let Sink::V5(s) = &mut sink {
-            let d = if let Reason::ConnectDisconnect(Some(Disconnect::V5(d))) = &reason {
-                d.clone()
-            } else {
-                v5::Disconnect {
-                    reason_code: reason.to_reason_code(),
-                    reason_string: Some(reason.to_string().into()),
-                    ..Default::default()
-                }
-            };
-            let _ = s.send_disconnect(d).await;
+        if !drain_disconnect_sent {
+            if let Sink::V5(s) = &mut sink {
+                let d = if let Reason::ConnectDisconnect(Some(Disconnect::V5(d))) = &reason {
+                    d.clone()
+                } else {
+                    v5::Disconnect {
+                        reason_code: reason.to_reason_code(),
+                        reason_string: Some(reason.to_string().into()),
+                        ..Default::default()
+                    }
+                };
+                let _ = s.send_disconnect(d).await;
+            }
         }
 
         self.hook.client_disconnected(reason).await;
@@ -268,10 +299,17 @@ impl SessionState {
                 self.clean(&deliver_queue_tx, self.disconnected_reason_take().await.unwrap_or_default())
                     .await;
             }
-        } else if clean_session {
+        } else if !Self::preserve_offline_session(flags, clean_session) {
             self.clean(&deliver_queue_tx, self.disconnected_reason_take().await.unwrap_or_default()).await;
         } else {
-            let session_expiry_interval = self.fitter.session_expiry_interval(disconnect.as_ref());
+            let mut session_expiry_interval = self.fitter.session_expiry_interval(disconnect.as_ref());
+            if flags.contains(StateFlags::Draining) {
+                // Clean-Start clients normally have a zero-length offline
+                // session.  During a planned broker drain the snapshot must
+                // survive long enough for broker-to-broker relocation even if
+                // that client is temporarily unable to reconnect.
+                session_expiry_interval = session_expiry_interval.max(Duration::from_secs(600));
+            }
             //hook, offline_inflight_messages
             let inflight_messages = self.out_inflight().write().await.clone_inflight_messages();
             if !inflight_messages.is_empty() {
@@ -447,6 +485,20 @@ impl SessionState {
                                     log::warn!("{:?} offline Kick sender is closed, to {:?}, clean_start: {}, is_admin: {}", self.id, by_id, clean_start, is_admin);
                                 }
                             },
+                            Message::Drain(sender, by_id) => {
+                                log::debug!(
+                                    "{:?} already offline for planned drain requested by {:?}",
+                                    self.id,
+                                    by_id
+                                );
+                                if !sender.is_closed() && sender.send(()).is_err() {
+                                    log::warn!(
+                                        "{:?} offline drain acknowledgement receiver is closed, requested by {:?}",
+                                        self.id,
+                                        by_id
+                                    );
+                                }
+                            },
                             _ => {
                                 log::debug!("{:?} offline receive message is {:?}", self.id, msg);
                             }
@@ -546,6 +598,38 @@ impl SessionState {
         Ok(msg_tx)
     }
 
+    /// Restore a session snapshot directly as an offline session on another
+    /// broker.  This is used only during an operator-coordinated drain; normal
+    /// MQTT connect/reconnect continues to use the established handshake path.
+    /// Routes are installed before the source acknowledges the relocation so
+    /// deliveries have an owner even when the client itself is still offline.
+    #[inline]
+    pub async fn offline_restart_with_state(
+        session: Session,
+        offline_info: OfflineInfo,
+        session_expiry_interval: Duration,
+    ) -> Result<Tx> {
+        let hook = session.scx.extends.hook_mgr().hook(session.clone());
+        let mut state = SessionState::new(session, hook, 0, 0);
+        let msg_tx = state.tx.clone();
+        let limiter = {
+            let (burst, replenish_n_per) = state.fitter.mqueue_rate_limit();
+            Limiter::new(burst, replenish_n_per)
+        };
+
+        state.transfer_session_state(false, offline_info).await?;
+        tokio::spawn(async move {
+            let (deliver_queue_tx, _deliver_queue_rx) = state.deliver_queue_channel(&limiter);
+            let mut flags = StateFlags::empty();
+            state.offline_run_loop(&deliver_queue_tx, &mut flags, None, session_expiry_interval).await;
+            if !flags.contains(StateFlags::Kicked) {
+                state.clean(&deliver_queue_tx, Reason::SessionExpiration).await;
+            }
+        });
+
+        Ok(msg_tx)
+    }
+
     #[inline]
     async fn process_message<Io>(
         &mut self,
@@ -600,6 +684,18 @@ impl SessionState {
                         is_admin
                     );
                 }
+            }
+            Message::Drain(sender, by_id) => {
+                log::debug!(
+                    "{:?} Message::Drain, preserve offline session and disconnect network, requested by {:?}",
+                    self.id,
+                    by_id
+                );
+                if !sender.is_closed() && sender.send(()).is_err() {
+                    log::warn!("{:?} Message::Drain acknowledgement receiver is closed", self.id);
+                }
+                flags.insert(StateFlags::Draining);
+                return Err(Reason::ConnectRemoteClose);
             }
             Message::Subscribe(sub, reply_tx) => {
                 log::debug!("{:?} Message::Subscribe, sub {:?}", self.id, sub,);
@@ -822,7 +918,8 @@ impl SessionState {
     #[inline]
     fn last_will_enable(&self, flags: StateFlags, clean_session: bool) -> bool {
         let session_present =
-            flags.contains(StateFlags::Kicked) && !flags.contains(StateFlags::CleanStart) && !clean_session;
+            (flags.contains(StateFlags::Kicked) && !flags.contains(StateFlags::CleanStart) && !clean_session)
+                || flags.contains(StateFlags::Draining);
         !(flags.contains(StateFlags::DisconnectReceived) || session_present)
     }
 
@@ -1382,7 +1479,7 @@ impl SessionState {
     }
 
     #[inline]
-    async fn transfer_session_state(
+    pub(crate) async fn transfer_session_state(
         &self,
         clear_subscriptions: bool,
         mut offline_info: OfflineInfo,
@@ -1844,6 +1941,26 @@ impl SessionState {
     }
 }
 
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    #[test]
+    fn planned_drain_selects_the_offline_session_path() {
+        assert!(SessionState::preserve_offline_session(StateFlags::Draining, true));
+        assert!(SessionState::preserve_offline_session(StateFlags::empty(), false));
+        assert!(!SessionState::preserve_offline_session(StateFlags::empty(), true));
+    }
+
+    #[test]
+    fn planned_handoff_restores_subscriptions_before_clean_start_resubscribe() {
+        assert!(!SessionState::clear_transferred_subscriptions(true, true));
+        assert!(!SessionState::clear_transferred_subscriptions(false, true));
+        assert!(SessionState::clear_transferred_subscriptions(true, false));
+        assert!(!SessionState::clear_transferred_subscriptions(false, false));
+    }
+}
+
 #[derive(Clone)]
 pub struct Session(Arc<_Session>);
 
@@ -1874,14 +1991,19 @@ impl Deref for _Session {
 
 impl Drop for _Session {
     fn drop(&mut self) {
-        // #[cfg(feature = "stats")]
-        self.scx.sessions.dec();
         let id = self.id.clone();
         let s = self.inner.clone();
+        let scx = self.scx.clone();
         tokio::spawn(async move {
             if let Err(e) = s.on_drop().await {
                 log::error!("{id:?} session clear error, {e:?}");
             }
+            // Keep the session visible to drain_status until the concrete
+            // session and its queue/inflight containers have completed their
+            // cleanup. Otherwise sessions=0 can be observed before queue Drop
+            // callbacks have corrected their gauges.
+            drop(s);
+            scx.sessions.dec();
         });
     }
 }
@@ -1939,17 +2061,35 @@ impl Session {
             });
         }
 
+        #[cfg(feature = "stats")]
+        {
+            let scx1 = scx.clone();
+            deliver_queue.on_drop(move |remaining| {
+                scx1.stats.message_queues.decs(remaining as isize);
+                scx1.stats.message_queue_drops.incs(remaining as isize);
+                log::error!("destroyed a session message queue with {remaining} undelivered messages");
+            });
+        }
+
         let out_inflight = OutInflight::new(max_inflight, message_retry_interval, message_expiry_interval);
         #[cfg(feature = "stats")]
         let out_inflight = {
             let scx1 = scx.clone();
             let scx2 = scx.clone();
+            let scx3 = scx.clone();
             out_inflight
                 .on_push(move || {
                     scx1.stats.out_inflights.inc();
                 })
                 .on_pop(move || {
                     scx2.stats.out_inflights.dec();
+                })
+                .on_drop(move |remaining| {
+                    scx3.stats.out_inflights.decs(remaining as isize);
+                    scx3.stats.out_inflight_drops.incs(remaining as isize);
+                    log::error!(
+                        "destroyed an outbound inflight window with {remaining} unacknowledged messages"
+                    );
                 })
         };
 
