@@ -5130,7 +5130,7 @@ dependencies = [
 [[package]]
 name = "rmqtt-raft"
 version = "0.6.0"
-source = "git+https://github.com/WRAllen/rmqtt-raft.git?branch=0.6.0-dynamic-peers#6a3c3a71bb762516376885a09b5f4b743caf127a"
+source = "git+https://github.com/WRAllen/rmqtt-raft.git?branch=0.6.0-dynamic-peers#5bc11e0cf7f6d617c20599d445614abda38087d7"
 dependencies = [
  "ahash",
  "anyhow",

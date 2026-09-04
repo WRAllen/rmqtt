@@ -20,12 +20,21 @@ The operator owns the Kubernetes reconciliation flow for an RMQTT raft cluster:
 - checks both raft voters and business-layer gRPC peers before completing a scale step
 - drains and removes one voter before reducing StatefulSet replicas
 - optionally turns an RMQTT image change into a Raft-aware, one-pod-at-a-time update
+- keeps verified in-memory survivors available for best-effort MQTT traffic after lost Raft quorum
+- automatically restores a writable Raft quorum from the best surviving state
 
 The broker readiness probe uses `GET /api/v1/health/ready` and only succeeds when the local node has restored a snapshot, applied its local committed index, is a voter, reports raft `started` and `available`, has a current leader, is present in business peers, and is not draining. Deploy the operator together with a broker image containing this endpoint.
 
-New and recreated pods start with `rmqtt.io/serving=false`, so they are excluded from the client Service. The operator queries every reachable raft node, accepts membership only from the node that reports itself as the current leader, and changes the pod to `rmqtt.io/serving=true` only after local readiness and leader-authoritative voter, raft-peer, and business-peer checks all pass. The headless Service continues to publish not-ready addresses so raft discovery does not depend on client traffic admission.
+New and recreated pods start with `rmqtt.io/serving=false`, so they are excluded from the client Service. During normal operation, the operator queries every reachable raft node, accepts membership only from the node that reports itself as the current leader, and changes the pod to `rmqtt.io/serving=true` only after local readiness and leader-authoritative voter, raft-peer, and business-peer checks all pass. The headless Service continues to publish not-ready addresses so raft discovery does not depend on client traffic admission. A separate, bounded degraded-serving rule applies only after quorum loss has been verified, as described below.
 
 Controlled bootstrap is intentionally fail-closed. The operator sets `bootstrap=true` only on the first single-node StatefulSet. After that node is healthy, it updates the template to `bootstrap=false` before creating another pod. A restarted or scaled-out node retries leader discovery and exits without calling `raft.lead()` if no existing leader can be found.
+
+Operator-managed Pods also render
+`health.exit_on_node_unavailable=false`. A quorum failure therefore does not
+terminate the last processes holding volatile Raft, session, and router state;
+Kubernetes readiness and the client-admission policy decide whether they may
+receive traffic. This changes only failure handling and adds no work to the
+normal MQTT publish path.
 
 `status.confChange` is kept for compatibility with the first MVP. Newer logic also writes `status.operation`, which records the operation type, phase, node id, replica transition, and reconfiguration mode.
 
@@ -175,6 +184,15 @@ The automatic image setting controls only image rollout. Scale-out, scale-in,
 and restart recovery continue to use their existing flows. A replica change
 that arrives between completed image-update steps pauses the rollout so
 scaling can reconcile first.
+
+The operator also detects drift in the Pod scheduling template, including Pod
+annotations, service account, image pull secrets, scheduler, affinity,
+tolerations, service-link policy, and termination grace period. These changes
+are copied from `RmqttCluster.spec.pod` into the StatefulSet even when the image
+is unchanged. Because the StatefulSet uses `OnDelete`, scheduling-only changes
+do not implicitly restart a healthy Raft cluster; run `kubectl rollout restart`
+after the StatefulSet template contains the expected values to request the
+normal operator-managed one-Pod-at-a-time restart.
 
 Use immutable image tags or digests. Re-pushing different content under the
 same image string does not change the `RmqttCluster` spec and therefore cannot
@@ -336,9 +354,97 @@ Raft/business membership must stay healthy for
 Any observed unhealthy state resets this window. The existing image rollout
 and rolling restart stabilization flow remains unchanged.
 
+## Quorum Loss Recovery
+
+Quorum recovery is an operator availability guarantee and has no per-cluster
+feature switch. It is activated only when no available authoritative Raft
+leader can be found; it adds no work to the normal MQTT publish path. The
+operator first waits a fixed 30-second detection period and a 60-second natural
+recovery period. Any authoritative leader observed during that window cancels
+recovery without changing Raft membership.
+
+When no authoritative leader exists, the operator reads local Raft status from
+reachable Pods. A response is a recoverable survivor when its node identity
+matches the queried Pod, its Raft snapshot is restored, and it still reports its
+old voter set. Pod readiness, `available`, and `started` are deliberately not
+used as evidence that local state is absent: those fields can be false precisely
+because quorum was lost. Only these verified old survivors retain
+`rmqtt.io/serving=true`; rejected, unreachable, new, and empty-state Pods remain
+excluded. The client Service temporarily publishes those survivors despite the
+strict Pod readiness probe. Rollout, scale, learner promotion, and all other
+control-plane checks continue to use strict readiness, so normal behavior is
+unchanged.
+
+Before the window expires, verified survivors can remain published as degraded
+endpoints, although operations requiring a Raft commit can still fail. After
+expiry, the operator selects the survivor with the most advanced applied state,
+using committed/log progress and local client-state count only as tie-breakers.
+This handles both cases where the old leader survived and where only followers
+remain; stale leader identity never outranks more advanced recoverable state.
+
+The operator removes every non-seed old Pod from the client Service, deletes
+those Pods, and verifies their old Kubernetes UIDs are gone before asking the
+seed to replace its local Raft runtime with a singleton. The seed keeps its
+in-memory router/session ownership snapshot and resumes writable service as a
+one-voter quorum. Recreated Pods then join as learners and are promoted one at a
+time. Every promoted node must then remain Pod-ready and answer its own local
+membership request continuously for 15 seconds before another node is started.
+The operator also revalidates every previously rebuilt node before continuing.
+If a promoted or previously rebuilt voter is both Pod-NotReady and unable to
+answer its local membership check continuously for 30 seconds, the operator can
+recycle that one Pod and let it rejoin as a learner. A failure of only one signal
+is treated as a readiness or control-path problem and resets the recycle timer.
+Before every delete attempt the operator waits for the client EndpointSlice to
+exclude the Pod, queries the recovery seed again, verifies the recovery epoch,
+leader identity, and current quorum, and confirms that the node is neither the
+seed nor the leader. The exact old Pod UID is persisted and supplied as a
+Kubernetes delete precondition, so an operator restart or a concurrent
+StatefulSet recreation cannot delete the replacement.
+Automatic recycling is limited to two attempts per node; when the current
+quorum cannot survive the restart or the retry budget is exhausted, recovery
+stays in `DegradedServing` and preserves the verified leader instead of risking
+an outage loop. These checks and deletes exist only inside an active quorum
+recovery and do not change normal rollout, scaling, or MQTT message handling.
+
+If an `OrderedReady` target Pod has not actually been created, the membership
+operation is cleared and the verified leader stays admitted while
+reconciliation reports the blocking predecessor. The operator never reports
+learner catch-up for a nonexistent Pod. Status progresses through
+`SelectingRecoverySeed`, `DegradedServing`, `RebuildingQuorum`,
+`StabilizingRecoveryNode`, and when necessary `RecyclingRecoveryNode`; it
+returns to `Running` only after all desired voters, business peers, and Pods
+converge.
+
+If no recoverable survivor remains, the operator automatically performs an
+empty bootstrap to restore availability. It first scales the StatefulSet to
+zero, removes every old Pod from Service, waits for every old Pod UID to
+terminate, and only then creates one bootstrap seed. If an old process cannot
+be proven terminated, recovery remains blocked rather than risk two writable
+leaders. Empty bootstrap restores service but loses all in-memory cluster
+state.
+
+This recovery is availability-first. It can lose messages and sessions that
+existed only on discarded nodes, and concurrent client retry can still create
+duplicates. QoS 2 does not make volatile multi-node state durable. The feature
+adds no disk IO, general-purpose deduplication, or work to the normal publish
+fast path.
+
+Transient retries for the read-only `membership` action are logged at `DEBUG`.
+Their final results remain visible through an aggregated membership scan record
+whenever the reachable node set, generic error kind, or recovery phase changes,
+and at least once every 30 seconds while unchanged. The record includes the
+original final error text for every failed node. Non-transient membership errors
+and all state-changing recovery actions also continue to log their individual
+failures at `WARN`.
+
 ## Failure Boundary
 
-This conservative flow preserves service during one-at-a-time restarts and updates as long as a raft quorum remains running. `rmqtt-raft 0.6.0` still stores raft logs and hard state in memory, so a simultaneous loss or restart of every pod cannot be recovered automatically without a future persistent WAL implementation.
+The conservative lifecycle preserves service during one-at-a-time restarts and
+updates while a Raft quorum remains running. `rmqtt-raft 0.6.0` still stores
+Raft logs and hard state in memory. Automatic quorum recovery prefers one
+survivor and rebuilds availability, but it cannot reconstruct state that no
+surviving process holds. Recovering that state requires durable storage or an
+external replayable source of truth.
 
 ## Inspect
 

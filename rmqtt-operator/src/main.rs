@@ -9,7 +9,7 @@ use std::env;
 use std::fmt;
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::time::sleep;
 
@@ -32,6 +32,12 @@ const OPERATOR_BUILD_ID: &str = match option_env!("RMQTT_OPERATOR_BUILD_ID") {
 };
 
 static LAST_LOGGED_STATUS: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
+static LAST_RECOVERY_SCAN_LOG: OnceLock<Mutex<HashMap<String, RecoveryScanLogEntry>>> = OnceLock::new();
+
+const RECOVERY_SCAN_LOG_HEARTBEAT_SECONDS: u64 = 30;
+const QUORUM_RECOVERY_NODE_STABILIZATION_SECONDS: u64 = 15;
+const QUORUM_RECOVERY_NODE_UNHEALTHY_GRACE_SECONDS: u64 = 30;
+const QUORUM_RECOVERY_NODE_MAX_RECYCLE_ATTEMPTS: u32 = 2;
 
 const RENDER_SCRIPT: &str = r###"#!/bin/sh
 set -eu
@@ -123,6 +129,15 @@ if grep -q '^join_as_learner = ' "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.t
   sed -i 's/^join_as_learner = .*/join_as_learner = true/' "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.toml"
 else
   printf '\njoin_as_learner = true\n' >> "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.toml"
+fi
+# A quorum failure must not destroy the only processes that still own the
+# in-memory Raft/session/router state. Kubernetes readiness and the operator
+# control admission; the broker itself must remain alive for observation and
+# optional survivor-based recovery.
+if grep -q '^health\.exit_on_node_unavailable = ' "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.toml"; then
+  sed -i 's/^health\.exit_on_node_unavailable = .*/health.exit_on_node_unavailable = false/' "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.toml"
+else
+  printf '\nhealth.exit_on_node_unavailable = false\n' >> "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.toml"
 fi
 if grep -q '^#laddr = ' "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.toml"; then
   sed -i "s|^#laddr = .*|laddr = \"0.0.0.0:${RAFT_PORT}\"|" "${WORK_DIR}/rmqtt-plugins/rmqtt-cluster-raft.toml"
@@ -297,7 +312,7 @@ struct BrokerPodSpec {
     termination_grace_period_seconds: Option<i64>,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq, Eq)]
 struct NamedReference {
     name: String,
 }
@@ -397,6 +412,8 @@ struct PodMetadata {
     #[serde(default)]
     name: String,
     #[serde(default)]
+    uid: String,
+    #[serde(default)]
     labels: BTreeMap<String, String>,
     #[serde(default)]
     annotations: BTreeMap<String, String>,
@@ -459,10 +476,36 @@ impl StatefulSet {
         self.spec.template.spec.containers.iter().find(|container| container.name == "rmqtt")
     }
 
-    fn broker_template_matches(&self, spec: &ClusterSpec) -> bool {
+    fn broker_image_matches(&self, spec: &ClusterSpec) -> bool {
         self.rmqtt_container().is_some_and(|container| {
             container.image == spec.image && container.image_pull_policy == spec.image_pull_policy
         })
+    }
+
+    fn broker_template_matches(&self, spec: &ClusterSpec) -> bool {
+        let pod = &self.spec.template.spec;
+        let annotations = self
+            .spec
+            .template
+            .metadata
+            .annotations
+            .iter()
+            .filter(|(key, _)| key.as_str() != KUBECTL_RESTARTED_AT_ANNOTATION)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        self.broker_image_matches(spec)
+            && annotations == spec.pod.annotations
+            && pod.service_account_name.as_deref().unwrap_or("default")
+                == spec.pod.service_account_name.as_deref().unwrap_or("default")
+            && pod.image_pull_secrets == spec.pod.image_pull_secrets
+            && pod.scheduler_name.as_deref().unwrap_or("default-scheduler")
+                == spec.pod.scheduler_name.as_deref().unwrap_or("default-scheduler")
+            && pod.affinity == spec.pod.affinity
+            && pod.tolerations == spec.pod.tolerations
+            && pod.enable_service_links.unwrap_or(true) == spec.pod.enable_service_links.unwrap_or(false)
+            && pod.termination_grace_period_seconds.unwrap_or(30)
+                == spec.pod.termination_grace_period_seconds.unwrap_or(30)
     }
 
     fn bootstrap_allowed(&self) -> bool {
@@ -497,9 +540,24 @@ struct StatefulSetPodTemplateMetadata {
 }
 
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct StatefulSetPodSpec {
     #[serde(default)]
     containers: Vec<StatefulSetContainerSpec>,
+    #[serde(default)]
+    service_account_name: Option<String>,
+    #[serde(default)]
+    image_pull_secrets: Vec<NamedReference>,
+    #[serde(default)]
+    scheduler_name: Option<String>,
+    #[serde(default)]
+    affinity: Option<Value>,
+    #[serde(default)]
+    tolerations: Vec<Value>,
+    #[serde(default)]
+    enable_service_links: Option<bool>,
+    #[serde(default)]
+    termination_grace_period_seconds: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -546,6 +604,18 @@ enum RmqttActionErrorKind {
     InvalidResponse,
 }
 
+impl RmqttActionErrorKind {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Connection => "connection",
+            Self::TransientHttpStatus => "transient_http_status",
+            Self::HttpStatus => "http_status",
+            Self::InvalidResponse => "invalid_response",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct RmqttActionError {
     kind: RmqttActionErrorKind,
@@ -580,6 +650,27 @@ impl fmt::Display for RmqttActionError {
 }
 
 impl std::error::Error for RmqttActionError {}
+
+fn error_chain_text(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut messages = Vec::new();
+    let mut current = Some(error);
+    while let Some(source) = current {
+        let message = source.to_string();
+        if messages.last() != Some(&message) {
+            messages.push(message);
+        }
+        current = source.source();
+    }
+    messages.join(": ")
+}
+
+fn classify_reqwest_error(error: &reqwest::Error) -> RmqttActionErrorKind {
+    if error.is_timeout() {
+        RmqttActionErrorKind::Timeout
+    } else {
+        RmqttActionErrorKind::Connection
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeDrainStage {
@@ -832,6 +923,8 @@ struct MembershipStatus {
     #[serde(default)]
     last_index: u64,
     #[serde(default)]
+    client_states: usize,
+    #[serde(default)]
     voters: Vec<i32>,
     #[serde(default)]
     learners: Vec<i32>,
@@ -841,6 +934,10 @@ struct MembershipStatus {
     business_peers: Vec<Value>,
     #[serde(default)]
     supports: Value,
+    #[serde(default)]
+    quorum_recovery_active: bool,
+    #[serde(default)]
+    quorum_recovery_epoch: u64,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -942,11 +1039,56 @@ fn scale_in_recovery_decision(
 #[serde(rename_all = "camelCase")]
 struct ClusterStatus {
     #[serde(default)]
+    phase: String,
+    #[serde(default)]
     conf_change: Option<ConfChangeStatus>,
     #[serde(default)]
     operation: Option<OperationStatus>,
     #[serde(default)]
     observed_restart_at: Option<String>,
+    #[serde(default)]
+    quorum_recovery: Option<QuorumRecoveryStatus>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct QuorumRecoveryStatus {
+    #[serde(default)]
+    epoch: u64,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    seed_node_id: Option<i32>,
+    #[serde(default)]
+    old_voters: Vec<i32>,
+    #[serde(default)]
+    survivor_node_ids: Vec<i32>,
+    #[serde(default)]
+    rejected_node_ids: Vec<i32>,
+    #[serde(default)]
+    unreachable_node_ids: Vec<i32>,
+    #[serde(default)]
+    restarting_node_id: Option<i32>,
+    #[serde(default)]
+    restarted_node_ids: Vec<i32>,
+    #[serde(default)]
+    stabilizing_node_id: Option<i32>,
+    #[serde(default)]
+    stabilizing_started_at: Option<String>,
+    #[serde(default)]
+    unhealthy_node_id: Option<i32>,
+    #[serde(default)]
+    unhealthy_started_at: Option<String>,
+    #[serde(default)]
+    recycling_node_id: Option<i32>,
+    #[serde(default)]
+    recycling_pod_uid: Option<String>,
+    #[serde(default)]
+    recycle_attempts: BTreeMap<String, u32>,
+    #[serde(default)]
+    last_error: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -1053,6 +1195,16 @@ fn default_replicas() -> i32 {
 
 fn default_min_replicas() -> i32 {
     3
+}
+
+// Quorum recovery is an availability guarantee of the operator rather than a
+// per-cluster opt-in. Keep the observation window out of the RMQTT publish path:
+// it is consulted only after no available authoritative leader can be found.
+const QUORUM_RECOVERY_DETECTION_SECONDS: u64 = 30;
+const QUORUM_NATURAL_RECOVERY_SECONDS: u64 = 60;
+
+fn quorum_recovery_wait_seconds() -> u64 {
+    QUORUM_RECOVERY_DETECTION_SECONDS.saturating_add(QUORUM_NATURAL_RECOVERY_SECONDS)
 }
 
 fn default_image() -> String {
@@ -1449,8 +1601,15 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, mut cluster: Rmqt
             change.kind == "RemoveVoter" || (is_rollout_operation_kind(&change.kind) && change.node_id > 0)
         })
         .map(|change| change.node_id);
-    ensure_unready_pods_not_serving(kube, namespace, name, current_replicas, planned_draining_node_id)
-        .await?;
+    ensure_unready_pods_not_serving(
+        kube,
+        namespace,
+        name,
+        current_replicas,
+        planned_draining_node_id,
+        degraded_client_endpoints_enabled(&cluster),
+    )
+    .await?;
     if stateful_set.bootstrap_allowed() {
         finish_controlled_bootstrap(kube, namespace, &cluster, current_replicas).await?;
         return Ok(());
@@ -1470,6 +1629,29 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, mut cluster: Rmqt
     }
 
     let pending_restart_at = pending_rollout_restart_at(&stateful_set, &cluster);
+
+    if let Some(recovery) = cluster.status.as_ref().and_then(|status| status.quorum_recovery.clone()) {
+        // Quorum recovery owns its membership repairs. Route even an active
+        // confChange through the recovery guard so a missing target Pod or a
+        // previously rebuilt node that regressed cannot be mistaken for
+        // normal learner catch-up.
+        continue_quorum_recovery(kube, namespace, &cluster, current_replicas, recovery).await?;
+        return Ok(());
+    }
+
+    if cluster.status.as_ref().is_some_and(|status| status.phase == "WaitingRaftLeader")
+        && leader_membership(kube, namespace, &cluster, current_replicas).await.is_err()
+    {
+        begin_quorum_recovery(
+            kube,
+            namespace,
+            &cluster,
+            current_replicas,
+            "the previous reconciliation was already waiting for an authoritative raft leader",
+        )
+        .await?;
+        return Ok(());
+    }
 
     let image_rollout_operation = cluster
         .status
@@ -1541,19 +1723,12 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, mut cluster: Rmqt
             let membership = match leader_membership(kube, namespace, &cluster, current_replicas).await {
                 Ok(membership) => membership,
                 Err(e) => {
-                    patch_status(
+                    begin_quorum_recovery(
                         kube,
                         namespace,
-                        name,
-                        json!({
-                            "phase": "WaitingRaftLeader",
-                            "message": format!("no authoritative raft leader membership is available; refusing to start the next scale-out step: {e}"),
-                            "replicas": current_replicas,
-                            "desiredReplicas": cluster.spec.replicas,
-                            "operation": null,
-                            "confChange": null,
-                            "observedGeneration": cluster.metadata.generation,
-                        }),
+                        &cluster,
+                        current_replicas,
+                        &format!("refusing to start the next scale-out step: {e}"),
                     )
                     .await?;
                     return Ok(());
@@ -1618,8 +1793,13 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, mut cluster: Rmqt
     }
 
     if !stateful_set.broker_template_matches(&cluster.spec) {
+        let image_changed = !stateful_set.broker_image_matches(&cluster.spec);
         apply_stateful_set(kube, namespace, &cluster, current_replicas, false).await?;
-        let auto_rollout = cluster.spec.image_update.auto_rollout;
+        // imageUpdate.autoRollout governs binary changes only. Scheduling and
+        // other Pod-template changes are applied to the OnDelete StatefulSet,
+        // then wait for an explicit rollout restart so a CR metadata-only
+        // change cannot unexpectedly restart a healthy Raft cluster.
+        let auto_rollout = image_changed && cluster.spec.image_update.auto_rollout;
         patch_status(
             kube,
             namespace,
@@ -1628,8 +1808,10 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, mut cluster: Rmqt
                 "phase": if auto_rollout { "PreparingImageRollout" } else { "UpdatingStatefulSetTemplate" },
                 "message": if auto_rollout {
                     json!("StatefulSet pod template was updated; preparing an operator-managed one-pod-at-a-time image rollout")
+                } else if image_changed {
+                    json!("StatefulSet image template was updated from RmqttCluster spec; imageUpdate.autoRollout is disabled, so existing Pods require an explicit rollout restart")
                 } else {
-                    json!("StatefulSet pod template was updated from RmqttCluster spec; updateStrategy=OnDelete requires existing pods to be recreated before they use the new template")
+                    json!("StatefulSet Pod configuration was updated from RmqttCluster spec; updateStrategy=OnDelete requires an explicit rollout restart before existing Pods use the new template")
                 },
                 "replicas": current_replicas,
                 "desiredReplicas": cluster.spec.replicas,
@@ -1658,20 +1840,12 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, mut cluster: Rmqt
     let membership = match leader_membership(kube, namespace, &cluster, current_replicas).await {
         Ok(membership) => membership,
         Err(e) => {
-            patch_status(
+            begin_quorum_recovery(
                 kube,
                 namespace,
-                name,
-                json!({
-                    "phase": "WaitingRaftLeader",
-                    "message": format!("all pods are locally ready but no authoritative raft leader membership is available: {e}"),
-                    "replicas": current_replicas,
-                    "readyReplicas": ready_replicas,
-                    "desiredReplicas": cluster.spec.replicas,
-                    "operation": null,
-                    "confChange": null,
-                    "observedGeneration": cluster.metadata.generation,
-                }),
+                &cluster,
+                current_replicas,
+                &format!("all pods are locally ready but no authoritative leader is available: {e}"),
             )
             .await?;
             return Ok(());
@@ -4930,6 +5104,2496 @@ fn is_authoritative_leader(membership: &MembershipStatus) -> bool {
     membership.id > 0 && membership.is_leader && membership.leader_id == Some(membership.id)
 }
 
+fn is_available_authoritative_leader(membership: &MembershipStatus) -> bool {
+    is_authoritative_leader(membership) && membership.started && membership.available
+}
+
+#[derive(Debug, Clone)]
+struct LocalMembershipObservation {
+    node_id: i32,
+    membership: MembershipStatus,
+}
+
+#[derive(Debug, Default)]
+struct LocalMembershipScan {
+    observations: Vec<LocalMembershipObservation>,
+    unreachable_node_ids: Vec<i32>,
+    failure_kinds: BTreeMap<String, Vec<i32>>,
+    failures: BTreeMap<i32, String>,
+}
+
+struct RecoveryScanLogEntry {
+    signature: Value,
+    logged_at: Instant,
+}
+
+async fn local_membership_observations(
+    namespace: &str,
+    cluster: &RmqttCluster,
+    replicas: i32,
+) -> LocalMembershipScan {
+    let mut tasks = tokio::task::JoinSet::new();
+    for node_id in 1..=replicas {
+        let namespace = namespace.to_string();
+        let cluster = cluster.clone();
+        tasks.spawn(async move {
+            let result =
+                try_rmqtt_action::<MembershipStatus>(&namespace, &cluster, node_id, "membership").await;
+            (node_id, result)
+        });
+    }
+
+    let mut scan = LocalMembershipScan::default();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((node_id, Ok(membership))) => {
+                scan.observations.push(LocalMembershipObservation { node_id, membership });
+            }
+            Ok((node_id, Err(error))) => {
+                scan.unreachable_node_ids.push(node_id);
+                let kind = error.kind.label();
+                scan.failure_kinds.entry(kind.to_string()).or_default().push(node_id);
+                scan.failures.insert(node_id, error.to_string());
+                if error.is_transient() {
+                    log::debug!(
+                        "RMQTT membership query failed and will be included in the recovery scan summary node_id={node_id} kind={kind} error={error}"
+                    );
+                } else {
+                    log::warn!(
+                        "non-transient RMQTT membership query failure node_id={node_id} kind={kind} error={error}"
+                    );
+                }
+            }
+            Err(error) => log::warn!("local raft membership query task failed: {error}"),
+        }
+    }
+    scan.observations.sort_by_key(|observation| observation.node_id);
+    scan.unreachable_node_ids.sort_unstable();
+    scan.unreachable_node_ids.dedup();
+    for node_ids in scan.failure_kinds.values_mut() {
+        node_ids.sort_unstable();
+        node_ids.dedup();
+    }
+    scan
+}
+
+fn recovery_old_voters(observations: &[LocalMembershipObservation], replicas: i32) -> Vec<i32> {
+    let mut voters = observations
+        .iter()
+        .filter(|observation| observation_has_recoverable_raft_state(observation))
+        .max_by_key(|observation| {
+            (
+                observation.membership.applied_index,
+                observation.membership.committed_index,
+                observation.membership.voters.len(),
+            )
+        })
+        .map(|observation| observation.membership.voters.clone())
+        .unwrap_or_else(|| (1..=replicas).collect());
+    if voters.is_empty() {
+        voters = (1..=replicas).collect();
+    }
+    voters.sort_unstable();
+    voters.dedup();
+    voters
+}
+
+fn observation_has_recoverable_raft_state(observation: &LocalMembershipObservation) -> bool {
+    let membership = &observation.membership;
+    membership.id > 0
+        && membership.id == observation.node_id
+        && membership.snapshot_restored
+        && !membership.voters.is_empty()
+}
+
+fn recoverable_voter_count(observations: &[LocalMembershipObservation], voters: &[i32]) -> usize {
+    observations
+        .iter()
+        .filter(|observation| {
+            voters.contains(&observation.membership.id) && observation_has_recoverable_raft_state(observation)
+        })
+        .map(|observation| observation.membership.id)
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+}
+
+fn recovery_survivor_node_ids(observations: &[LocalMembershipObservation]) -> Vec<i32> {
+    observations
+        .iter()
+        .filter(|observation| observation_has_recoverable_raft_state(observation))
+        .map(|observation| observation.node_id)
+        .collect()
+}
+
+fn recovery_rejected_node_ids(observations: &[LocalMembershipObservation]) -> Vec<i32> {
+    observations
+        .iter()
+        .filter(|observation| !observation_has_recoverable_raft_state(observation))
+        .map(|observation| observation.node_id)
+        .collect()
+}
+
+fn recovery_node_locally_healthy(
+    observations: &[LocalMembershipObservation],
+    node_id: i32,
+    leader_id: i32,
+) -> bool {
+    observations.iter().any(|observation| {
+        let membership = &observation.membership;
+        observation.node_id == node_id && recovery_membership_locally_healthy(membership, node_id, leader_id)
+    })
+}
+
+fn recovery_membership_locally_healthy(membership: &MembershipStatus, node_id: i32, leader_id: i32) -> bool {
+    membership.id == node_id
+        && membership.leader_id == Some(leader_id)
+        && membership.started
+        && membership.available
+        && membership.caught_up
+        && membership.snapshot_restored
+        && !membership.draining
+        && membership.voters.contains(&node_id)
+        && member_exists(&membership.business_peers, node_id)
+}
+
+fn recovery_node_healthy(
+    pods: &[Pod],
+    cluster_name: &str,
+    observations: &[LocalMembershipObservation],
+    node_id: i32,
+    leader_id: i32,
+) -> bool {
+    pod_for_node(pods, cluster_name, node_id).is_some_and(pod_is_ready)
+        && recovery_node_locally_healthy(observations, node_id, leader_id)
+}
+
+fn unhealthy_rebuilt_node_ids(
+    recovery: &QuorumRecoveryStatus,
+    pods: &[Pod],
+    cluster_name: &str,
+    observations: &[LocalMembershipObservation],
+    leader_id: i32,
+) -> Vec<i32> {
+    recovery
+        .restarted_node_ids
+        .iter()
+        .copied()
+        .filter(|node_id| {
+            Some(*node_id) != recovery.seed_node_id
+                && !recovery_node_healthy(pods, cluster_name, observations, *node_id, leader_id)
+        })
+        .collect()
+}
+
+fn missing_recovery_target_blockers(
+    pods: &[Pod],
+    cluster_name: &str,
+    target_node_id: i32,
+) -> Option<Vec<i32>> {
+    if pod_for_node(pods, cluster_name, target_node_id)
+        .is_some_and(|pod| pod.metadata.deletion_timestamp.is_none())
+    {
+        return None;
+    }
+    Some(
+        (1..target_node_id)
+            .filter(|node_id| pod_for_node(pods, cluster_name, *node_id).is_none_or(|pod| !pod_is_ready(pod)))
+            .collect(),
+    )
+}
+
+fn recovery_node_stabilization_elapsed(recovery: &QuorumRecoveryStatus, node_id: i32) -> Option<u64> {
+    if recovery.stabilizing_node_id != Some(node_id) {
+        return None;
+    }
+    let started_at = recovery.stabilizing_started_at.as_deref()?;
+    let started_at = DateTime::parse_from_rfc3339(started_at).ok()?;
+    Some(Utc::now().signed_duration_since(started_at.with_timezone(&Utc)).num_seconds().max(0) as u64)
+}
+
+fn recovery_node_unhealthy_elapsed(recovery: &QuorumRecoveryStatus, node_id: i32) -> Option<u64> {
+    if recovery.unhealthy_node_id != Some(node_id) {
+        return None;
+    }
+    let started_at = recovery.unhealthy_started_at.as_deref()?;
+    let started_at = DateTime::parse_from_rfc3339(started_at).ok()?;
+    Some(Utc::now().signed_duration_since(started_at.with_timezone(&Utc)).num_seconds().max(0) as u64)
+}
+
+fn recovery_node_recycle_attempts(recovery: &QuorumRecoveryStatus, node_id: i32) -> u32 {
+    recovery.recycle_attempts.get(&node_id.to_string()).copied().unwrap_or_default()
+}
+
+fn recovery_node_auto_recycle_candidate(pod_ready: bool, local_membership_healthy: bool) -> bool {
+    !pod_ready && !local_membership_healthy
+}
+
+fn recovery_seed_membership_blocker(
+    recovery: &QuorumRecoveryStatus,
+    membership: &MembershipStatus,
+) -> Option<String> {
+    let Some(seed_node_id) = recovery.seed_node_id else {
+        return Some("quorum recovery seed is missing".to_string());
+    };
+    if !is_available_authoritative_leader(membership) {
+        return Some("the refreshed seed response is not an available authoritative leader".to_string());
+    }
+    if membership.id != seed_node_id {
+        return Some(format!(
+            "the refreshed leader is node {}, but recovery seed is node {seed_node_id}",
+            membership.id
+        ));
+    }
+    if membership.quorum_recovery_epoch != recovery.epoch {
+        return Some(format!(
+            "the refreshed recovery epoch is {}, but operator recovery epoch is {}",
+            membership.quorum_recovery_epoch, recovery.epoch
+        ));
+    }
+    None
+}
+
+async fn fresh_recovery_seed_membership(
+    namespace: &str,
+    cluster: &RmqttCluster,
+    recovery: &QuorumRecoveryStatus,
+) -> Result<MembershipStatus> {
+    let seed_node_id = recovery.seed_node_id.ok_or_else(|| anyhow!("quorum recovery seed is missing"))?;
+    let membership = rmqtt_action::<MembershipStatus>(namespace, cluster, seed_node_id, "membership").await?;
+    if let Some(blocker) = recovery_seed_membership_blocker(recovery, &membership) {
+        bail!("refreshed recovery seed validation failed: {blocker}");
+    }
+    Ok(membership)
+}
+
+async fn fresh_recovery_node_signals(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    node_id: i32,
+    expected_uid: &str,
+    leader_id: i32,
+) -> Result<Option<(bool, bool)>> {
+    let pods = cluster_pods(kube, namespace, &cluster.metadata.name).await?;
+    let Some(pod) = pod_for_node(&pods, &cluster.metadata.name, node_id) else {
+        return Ok(None);
+    };
+    if pod.metadata.uid != expected_uid || pod.metadata.deletion_timestamp.is_some() {
+        return Ok(None);
+    }
+
+    let pod_ready = pod_is_ready(pod);
+    let payload = json!({"action": "membership"});
+    let local_membership_healthy =
+        match try_rmqtt_action_value_once(namespace, cluster, node_id, payload).await {
+            Ok(value) => serde_json::from_value::<MembershipStatus>(value).ok().is_some_and(|membership| {
+                recovery_membership_locally_healthy(&membership, node_id, leader_id)
+            }),
+            Err(error) => {
+                log::debug!(
+                    "fresh recovery node membership recheck failed node_id={} error_kind={} error={}",
+                    node_id,
+                    error.kind.label(),
+                    error
+                );
+                false
+            }
+        };
+    Ok(Some((pod_ready, local_membership_healthy)))
+}
+
+fn recovery_node_recycle_blocker(
+    recovery: &QuorumRecoveryStatus,
+    membership: &MembershipStatus,
+    node_id: i32,
+) -> Option<String> {
+    if recovery.seed_node_id == Some(node_id) {
+        return Some(format!("node {node_id} is the active recovery seed"));
+    }
+    if membership.leader_id == Some(node_id) {
+        return Some(format!("node {node_id} is the current raft leader"));
+    }
+    if !voter_exists(membership, node_id) {
+        return Some(format!("node {node_id} is not a current voter"));
+    }
+
+    // Recycling does not first change Raft membership. The replacement joins
+    // by removing its stale identity and adding the same ID back as a learner,
+    // so the remaining live voters must satisfy the *current* configuration's
+    // quorum while that happens. This is deliberately stricter than the
+    // scale-in check, which reasons about the post-removal configuration.
+    let quorum = membership.voters.len() / 2 + 1;
+    let recently_active_remaining = membership
+        .voters
+        .iter()
+        .copied()
+        .filter(|candidate| *candidate != node_id)
+        .filter(|candidate| {
+            membership.leader_id == Some(*candidate)
+                || membership.raft_peers.iter().any(|peer| {
+                    peer.id == *candidate
+                        && peer.available
+                        && peer.recent_active
+                        && peer.pending_snapshot == 0
+                })
+        })
+        .count();
+    if recently_active_remaining < quorum {
+        return Some(format!(
+            "only {recently_active_remaining} recently-active voters would remain, but the current {}-voter configuration still requires quorum {quorum}",
+            membership.voters.len()
+        ));
+    }
+    None
+}
+
+fn pod_delete_options(uid: &str) -> Value {
+    json!({
+        "apiVersion": "v1",
+        "kind": "DeleteOptions",
+        "preconditions": {
+            "uid": uid,
+        },
+    })
+}
+
+fn select_recovery_seed(observations: &[LocalMembershipObservation]) -> Option<&LocalMembershipObservation> {
+    observations.iter().filter(|observation| observation_has_recoverable_raft_state(observation)).max_by(
+        |left, right| {
+            (
+                left.membership.snapshot_restored,
+                left.membership.applied_index,
+                left.membership.committed_index,
+                left.membership.last_index,
+                left.membership.caught_up,
+                left.membership.client_states,
+                std::cmp::Reverse(left.node_id),
+            )
+                .cmp(&(
+                    right.membership.snapshot_restored,
+                    right.membership.applied_index,
+                    right.membership.committed_index,
+                    right.membership.last_index,
+                    right.membership.caught_up,
+                    right.membership.client_states,
+                    std::cmp::Reverse(right.node_id),
+                ))
+        },
+    )
+}
+
+fn recovery_elapsed_seconds(recovery: &QuorumRecoveryStatus) -> i64 {
+    let Some(started_at) = recovery.started_at.as_deref() else {
+        return 0;
+    };
+    let Ok(started_at) = DateTime::parse_from_rfc3339(started_at) else {
+        return 0;
+    };
+    Utc::now().signed_duration_since(started_at.with_timezone(&Utc)).num_seconds().max(0)
+}
+
+fn quorum_recovery_status_json(recovery: &QuorumRecoveryStatus) -> Value {
+    json!({
+        "epoch": recovery.epoch,
+        "phase": recovery.phase,
+        "startedAt": recovery.started_at,
+        "seedNodeId": recovery.seed_node_id,
+        "oldVoters": recovery.old_voters,
+        "survivorNodeIds": recovery.survivor_node_ids,
+        "rejectedNodeIds": recovery.rejected_node_ids,
+        "unreachableNodeIds": recovery.unreachable_node_ids,
+        "restartingNodeId": recovery.restarting_node_id,
+        "restartedNodeIds": recovery.restarted_node_ids,
+        "stabilizingNodeId": recovery.stabilizing_node_id,
+        "stabilizingStartedAt": recovery.stabilizing_started_at,
+        "unhealthyNodeId": recovery.unhealthy_node_id,
+        "unhealthyStartedAt": recovery.unhealthy_started_at,
+        "recyclingNodeId": recovery.recycling_node_id,
+        "recyclingPodUid": recovery.recycling_pod_uid,
+        "recycleAttempts": recovery.recycle_attempts,
+        "lastError": recovery.last_error,
+    })
+}
+
+fn recovery_scan_log_signature(
+    recovery: &QuorumRecoveryStatus,
+    scan: &LocalMembershipScan,
+    ready_replicas: i32,
+) -> Value {
+    json!({
+        "epoch": recovery.epoch,
+        "phase": recovery.phase,
+        "seedNodeId": recovery.seed_node_id,
+        "restartingNodeId": recovery.restarting_node_id,
+        "stabilizingNodeId": recovery.stabilizing_node_id,
+        "unhealthyNodeId": recovery.unhealthy_node_id,
+        "recyclingNodeId": recovery.recycling_node_id,
+        "recycleAttempts": recovery.recycle_attempts,
+        "readyReplicas": ready_replicas,
+        "survivorNodeIds": recovery_survivor_node_ids(&scan.observations),
+        "rejectedNodeIds": recovery_rejected_node_ids(&scan.observations),
+        "unreachableNodeIds": scan.unreachable_node_ids,
+        "failureKinds": scan.failure_kinds,
+    })
+}
+
+fn recovery_scan_log_due(previous: Option<&RecoveryScanLogEntry>, signature: &Value, now: Instant) -> bool {
+    previous.is_none_or(|entry| {
+        entry.signature != *signature
+            || now.saturating_duration_since(entry.logged_at)
+                >= Duration::from_secs(RECOVERY_SCAN_LOG_HEARTBEAT_SECONDS)
+    })
+}
+
+fn log_control_membership_scan(namespace: &str, name: &str, scan: &LocalMembershipScan, ready_replicas: i32) {
+    let reachable_node_ids =
+        scan.observations.iter().map(|observation| observation.node_id).collect::<Vec<_>>();
+    let non_authoritative_node_ids = scan
+        .observations
+        .iter()
+        .filter(|observation| !is_available_authoritative_leader(&observation.membership))
+        .map(|observation| observation.node_id)
+        .collect::<Vec<_>>();
+    let signature = json!({
+        "context": "leader_verification",
+        "readyReplicas": ready_replicas,
+        "reachableNodeIds": reachable_node_ids,
+        "nonAuthoritativeNodeIds": non_authoritative_node_ids,
+        "unreachableNodeIds": scan.unreachable_node_ids,
+        "failureKinds": scan.failure_kinds,
+    });
+    let now = Instant::now();
+    let cache = LAST_RECOVERY_SCAN_LOG.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{namespace}/{name}/control");
+    let should_log = {
+        let mut scans = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !recovery_scan_log_due(scans.get(&key), &signature, now) {
+            false
+        } else {
+            scans.insert(key, RecoveryScanLogEntry { signature, logged_at: now });
+            true
+        }
+    };
+    if should_log {
+        log::warn!(
+            "event=RMQTT_MEMBERSHIP_SCAN context=leader_verification ready_replicas={} \
+             reachable_node_ids={:?} non_authoritative_node_ids={:?} unreachable_node_ids={:?} \
+             failure_kinds={:?} failures={:?} namespace={} cluster={}",
+            ready_replicas,
+            reachable_node_ids,
+            non_authoritative_node_ids,
+            scan.unreachable_node_ids,
+            scan.failure_kinds,
+            scan.failures,
+            namespace,
+            name,
+        );
+    }
+}
+
+fn log_recovery_membership_scan(
+    namespace: &str,
+    name: &str,
+    recovery: &QuorumRecoveryStatus,
+    scan: &LocalMembershipScan,
+    ready_replicas: i32,
+) {
+    let signature = recovery_scan_log_signature(recovery, scan, ready_replicas);
+    let now = Instant::now();
+    let cache = LAST_RECOVERY_SCAN_LOG.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = format!("{namespace}/{name}/recovery");
+    let should_log = {
+        let mut scans = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !recovery_scan_log_due(scans.get(&key), &signature, now) {
+            false
+        } else {
+            scans.insert(key, RecoveryScanLogEntry { signature, logged_at: now });
+            true
+        }
+    };
+    if !should_log {
+        return;
+    }
+
+    let elapsed_seconds = recovery_elapsed_seconds(recovery) as u64;
+    let wait_seconds = quorum_recovery_wait_seconds();
+    let remaining_seconds = wait_seconds.saturating_sub(elapsed_seconds);
+    let reachable_node_ids =
+        scan.observations.iter().map(|observation| observation.node_id).collect::<Vec<_>>();
+    let survivor_node_ids = recovery_survivor_node_ids(&scan.observations);
+    let rejected_node_ids = recovery_rejected_node_ids(&scan.observations);
+    let details = format!(
+        "event=QUORUM_RECOVERY_MEMBERSHIP_SCAN epoch={} recovery_phase={} elapsed_seconds={} \
+         wait_seconds={} remaining_seconds={} ready_replicas={} reachable_node_ids={:?} \
+         survivor_node_ids={:?} rejected_node_ids={:?} unreachable_node_ids={:?} \
+         failure_kinds={:?} failures={:?} namespace={} cluster={}",
+        recovery.epoch,
+        recovery.phase,
+        elapsed_seconds,
+        wait_seconds,
+        remaining_seconds,
+        ready_replicas,
+        reachable_node_ids,
+        survivor_node_ids,
+        rejected_node_ids,
+        scan.unreachable_node_ids,
+        scan.failure_kinds,
+        scan.failures,
+        namespace,
+        name,
+    );
+    if recovery.phase == "QuorumLost"
+        || recovery.phase == "RecoveryBlocked"
+        || !scan.unreachable_node_ids.is_empty()
+        || !rejected_node_ids.is_empty()
+    {
+        log::warn!("{details}");
+    } else {
+        log::info!("{details}");
+    }
+}
+
+async fn begin_quorum_recovery(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    current_replicas: i32,
+    leader_error: &str,
+) -> Result<()> {
+    let name = cluster.metadata.name.as_str();
+    let pods = cluster_pods(kube, namespace, name).await?;
+    let ready_replicas = pods.iter().filter(|pod| pod_is_ready(pod)).count() as i32;
+    let scan = local_membership_observations(namespace, cluster, current_replicas).await;
+    let observations = &scan.observations;
+    if let Some(leader) =
+        observations.iter().find(|observation| is_available_authoritative_leader(&observation.membership))
+    {
+        apply_client_service(kube, namespace, cluster, false).await?;
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "WaitingRaftMembers",
+                "message": "an authoritative raft leader appeared while quorum loss was being verified; destructive recovery was not started",
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": leader.membership.leader_id,
+                "raftStatus": membership_status_json(&leader.membership, current_replicas),
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if ready_replicas > 0 {
+        // A Ready Pod has independently passed the strict local readiness
+        // check, including an available leader. Treat failure to query that
+        // leader from the operator as a control-path problem, not proof of
+        // quorum loss. In particular, do not alter client admission or arm a
+        // destructive recovery from incomplete observations.
+        log_control_membership_scan(namespace, name, &scan, ready_replicas);
+        apply_client_service(kube, namespace, cluster, false).await?;
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "WaitingRaftLeader",
+                "message": format!("{ready_replicas} Pod(s) still pass strict readiness, but the operator cannot query an available authoritative leader; retaining normal client admission: {leader_error}"),
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let old_voters = recovery_old_voters(observations, current_replicas);
+    let recoverable_voters = recoverable_voter_count(observations, &old_voters);
+    let quorum = old_voters.len() / 2 + 1;
+    let survivor_node_ids = recovery_survivor_node_ids(observations);
+    let rejected_node_ids = recovery_rejected_node_ids(observations);
+    if survivor_node_ids.is_empty() {
+        apply_client_service(kube, namespace, cluster, false).await?;
+    } else {
+        ensure_degraded_survivor_admission(kube, namespace, cluster, current_replicas, observations).await?;
+        // Kubernetes normally excludes NotReady Pods even when their explicit
+        // serving label remains true. During a verified quorum-loss state only,
+        // publish those locally validated survivors so the MQTT data plane can
+        // keep using its preserved in-memory sessions and routes. This does not
+        // weaken the Pod readiness gate used by rollout and membership control.
+        apply_client_service(kube, namespace, cluster, true).await?;
+    }
+
+    let epoch = Utc::now().timestamp_millis() as u64;
+    for observation in observations {
+        let node_id = observation.node_id;
+        if let Err(error) = rmqtt_action_value_with_payload(
+            namespace,
+            cluster,
+            node_id,
+            json!({
+                "action": "prepare_quorum_recovery",
+                "recoveryEpoch": epoch,
+            }),
+        )
+        .await
+        {
+            log::warn!(
+                "failed to prepare quorum recovery on survivor node_id={} epoch={} error={error:#}",
+                node_id,
+                epoch
+            );
+        }
+    }
+
+    let recovery_phase = if recoverable_voters >= quorum { "LeaderElectionPending" } else { "QuorumLost" };
+    let recovery = QuorumRecoveryStatus {
+        epoch,
+        phase: recovery_phase.to_string(),
+        started_at: Some(utc_now_rfc3339()),
+        seed_node_id: None,
+        old_voters,
+        survivor_node_ids,
+        rejected_node_ids,
+        unreachable_node_ids: scan.unreachable_node_ids.clone(),
+        restarting_node_id: None,
+        restarted_node_ids: Vec::new(),
+        stabilizing_node_id: None,
+        stabilizing_started_at: None,
+        unhealthy_node_id: None,
+        unhealthy_started_at: None,
+        recycling_node_id: None,
+        recycling_pod_uid: None,
+        recycle_attempts: BTreeMap::new(),
+        last_error: Some(leader_error.to_string()),
+    };
+    log_recovery_membership_scan(namespace, name, &recovery, &scan, ready_replicas);
+    patch_status(
+        kube,
+        namespace,
+        name,
+        json!({
+            "phase": recovery_phase,
+            "message": if recoverable_voters >= quorum {
+                format!(
+                    "no leader exists despite {recoverable_voters}/{} recoverable voters (quorum={quorum}); waiting {}s detection plus {}s natural recovery before selecting the best preserved seed",
+                    recovery.old_voters.len(),
+                    QUORUM_RECOVERY_DETECTION_SECONDS,
+                    QUORUM_NATURAL_RECOVERY_SECONDS,
+                )
+            } else {
+                format!(
+                    "raft quorum is unavailable ({recoverable_voters}/{} recoverable voters, quorum={quorum}); waiting {}s detection plus {}s natural recovery before selecting the best preserved seed",
+                    recovery.old_voters.len(),
+                    QUORUM_RECOVERY_DETECTION_SECONDS,
+                    QUORUM_NATURAL_RECOVERY_SECONDS,
+                )
+            },
+            "replicas": current_replicas,
+            "readyReplicas": ready_replicas,
+            "desiredReplicas": cluster.spec.replicas,
+            "leaderId": null,
+            "operation": null,
+            "confChange": null,
+            "quorumRecovery": quorum_recovery_status_json(&recovery),
+            "observedGeneration": cluster.metadata.generation,
+        }),
+    )
+    .await
+}
+
+async fn continue_quorum_recovery(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    current_replicas: i32,
+    mut recovery: QuorumRecoveryStatus,
+) -> Result<()> {
+    let name = cluster.metadata.name.as_str();
+    let pods = cluster_pods(kube, namespace, name).await?;
+    let ready_replicas = pods.iter().filter(|pod| pod_is_ready(pod)).count() as i32;
+    let scan = local_membership_observations(namespace, cluster, current_replicas).await;
+    let observations = &scan.observations;
+    recovery.survivor_node_ids = recovery_survivor_node_ids(observations);
+    recovery.rejected_node_ids = recovery_rejected_node_ids(observations);
+    recovery.unreachable_node_ids.clone_from(&scan.unreachable_node_ids);
+    log_recovery_membership_scan(namespace, name, &recovery, &scan, ready_replicas);
+    let leader =
+        observations.iter().find(|observation| is_available_authoritative_leader(&observation.membership));
+    if recovery.seed_node_id.is_none() && leader.is_none() && ready_replicas > 0 {
+        recovery.phase = "LeaderElectionPending".to_string();
+        recovery.started_at = Some(utc_now_rfc3339());
+        recovery.last_error = Some(
+            "strict-ready Pods exist but the operator cannot query an available authoritative leader"
+                .to_string(),
+        );
+        apply_client_service(kube, namespace, cluster, false).await?;
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "LeaderElectionPending",
+                "message": format!("{ready_replicas} Pod(s) still pass strict readiness; treating the missing leader response as a control-path failure and restarting the recovery detection window"),
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+    if recovery.seed_node_id.is_none() && !recovery.survivor_node_ids.is_empty() {
+        ensure_degraded_survivor_admission(kube, namespace, cluster, current_replicas, observations).await?;
+    }
+    apply_client_service(kube, namespace, cluster, !recovery.survivor_node_ids.is_empty()).await?;
+
+    if recovery.seed_node_id.is_some() {
+        if let Some(leader) = leader {
+            ensure_recovery_node_admission(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                &pods,
+                observations,
+                leader.membership.id,
+            )
+            .await?;
+        }
+    }
+
+    if let Some(conf_change) = cluster.status.as_ref().and_then(|status| status.conf_change.clone()) {
+        if let Some(leader) = leader {
+            return continue_quorum_recovery_conf_change(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                recovery,
+                &pods,
+                observations,
+                &leader.membership,
+                conf_change,
+            )
+            .await;
+        }
+        // Without an authoritative seed leader the recovery state machine
+        // below clears the stale operation and either waits or reselects a
+        // survivor. Never continue a membership change without that leader.
+    }
+
+    if recovery.phase == "FreshBootstrapping" {
+        let Some(leader) = leader else {
+            recovery.last_error =
+                Some("empty bootstrap node has not exposed an authoritative leader yet".to_string());
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "FreshBootstrapping",
+                    "message": "waiting for the automatic empty-bootstrap node to become the recovery seed",
+                    "replicas": current_replicas,
+                    "readyReplicas": ready_replicas,
+                    "desiredReplicas": cluster.spec.replicas,
+                    "operation": null,
+                    "confChange": null,
+                    "quorumRecovery": quorum_recovery_status_json(&recovery),
+                    "observedGeneration": cluster.metadata.generation,
+                }),
+            )
+            .await?;
+            return Ok(());
+        };
+        let seed_node_id = recovery.seed_node_id.unwrap_or(1);
+        if leader.node_id != seed_node_id || !membership_ready_for_replicas(&leader.membership, 1) {
+            recovery.phase = "RecoveryBlocked".to_string();
+            recovery.last_error = Some(format!(
+                "empty bootstrap returned unexpected seed state: expected node {seed_node_id}, observed node {} leaderId={:?}",
+                leader.node_id, leader.membership.leader_id
+            ));
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "RecoveryBlocked",
+                    "message": recovery.last_error,
+                    "replicas": current_replicas,
+                    "readyReplicas": ready_replicas,
+                    "desiredReplicas": cluster.spec.replicas,
+                    "operation": null,
+                    "confChange": null,
+                    "quorumRecovery": quorum_recovery_status_json(&recovery),
+                    "observedGeneration": cluster.metadata.generation,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        rmqtt_action_value_with_payload(
+            namespace,
+            cluster,
+            seed_node_id,
+            json!({
+                "action": "prepare_quorum_recovery",
+                "recoveryEpoch": recovery.epoch,
+            }),
+        )
+        .await?;
+        recovery.phase = "RebuildingQuorum".to_string();
+        recovery.seed_node_id = Some(seed_node_id);
+        recovery.restarted_node_ids = vec![seed_node_id];
+        recovery.stabilizing_node_id = None;
+        recovery.stabilizing_started_at = None;
+        recovery.last_error = None;
+        patch_pod_serving(kube, namespace, &pod_name(name, seed_node_id)).await?;
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "DegradedServing",
+                "message": format!("empty bootstrap node {seed_node_id} is serving as the automatic recovery seed; rebuilding desired voters one at a time"),
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": seed_node_id,
+                "raftStatus": membership_status_json(&leader.membership, 1),
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if recovery.phase == "RebuildingQuorum"
+        || recovery.phase == "DegradedServing"
+        || recovery.phase == "StabilizingRecoveryNode"
+        || recovery.phase == "RecyclingRecoveryNode"
+    {
+        if let Some(leader) = leader {
+            return rebuild_quorum_from_seed(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                recovery,
+                &leader.membership,
+                &pods,
+                observations,
+            )
+            .await;
+        }
+        recovery.last_error = Some("recovery seed has not exposed an authoritative leader yet".to_string());
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "EmergencyRecovering",
+                "message": "the selected recovery seed is restarting its local raft runtime; client traffic remains limited to surviving service endpoints",
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if let Some(leader) = leader {
+        for observation in observations {
+            let _ = rmqtt_action_value_with_payload(
+                namespace,
+                cluster,
+                observation.node_id,
+                json!({
+                    "action": "cancel_quorum_recovery",
+                    "recoveryEpoch": recovery.epoch,
+                }),
+            )
+            .await;
+        }
+        apply_client_service(kube, namespace, cluster, false).await?;
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "WaitingRaftMembers",
+                "message": "raft quorum and leader recovered naturally; emergency rebootstrap was cancelled",
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": leader.membership.leader_id,
+                "raftStatus": membership_status_json(&leader.membership, current_replicas),
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let elapsed = recovery_elapsed_seconds(&recovery);
+    let wait_seconds = quorum_recovery_wait_seconds();
+    if elapsed < wait_seconds as i64 {
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": recovery.phase,
+                "message": format!(
+                    "authoritative leader is still unavailable; recoverable survivors={:?}, rejected responses={:?}, unreachable nodes={:?}; natural recovery window {elapsed}/{wait_seconds}s",
+                    recovery.survivor_node_ids,
+                    recovery.rejected_node_ids,
+                    recovery.unreachable_node_ids,
+                ),
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let Some(seed) = select_recovery_seed(observations) else {
+        let old_pods = cluster_pods(kube, namespace, name)
+            .await?
+            .into_iter()
+            .map(|pod| (pod.metadata.name, pod.metadata.uid))
+            .collect::<Vec<_>>();
+        for (old_pod, _) in &old_pods {
+            patch_pod_unavailable(kube, namespace, old_pod).await?;
+        }
+        // Scale to zero before deletion so OrderedReady cannot recreate an old
+        // ordinal while stale in-memory Raft processes are still terminating.
+        apply_stateful_set(kube, namespace, cluster, 0, false).await?;
+        for (old_pod, _) in &old_pods {
+            kube.delete(&format!("/api/v1/namespaces/{namespace}/pods/{old_pod}")).await?;
+        }
+        let old_pod_uids =
+            old_pods.iter().map(|(_, uid)| uid.as_str()).filter(|uid| !uid.is_empty()).collect::<Vec<_>>();
+        for _ in 0..60 {
+            let old_process_exists = cluster_pods(kube, namespace, name)
+                .await?
+                .iter()
+                .any(|pod| old_pod_uids.contains(&pod.metadata.uid.as_str()));
+            if !old_process_exists {
+                break;
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+        let lingering_old_pods = cluster_pods(kube, namespace, name)
+            .await?
+            .into_iter()
+            .filter(|pod| old_pod_uids.contains(&pod.metadata.uid.as_str()))
+            .map(|pod| pod.metadata.name)
+            .collect::<Vec<_>>();
+        if !lingering_old_pods.is_empty() {
+            recovery.phase = "RecoveryBlocked".to_string();
+            recovery.last_error =
+                Some(format!("old Pods did not terminate before empty bootstrap: {lingering_old_pods:?}"));
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "RecoveryBlocked",
+                    "message": recovery.last_error,
+                    "replicas": 0,
+                    "readyReplicas": 0,
+                    "desiredReplicas": cluster.spec.replicas,
+                    "operation": null,
+                    "confChange": null,
+                    "quorumRecovery": quorum_recovery_status_json(&recovery),
+                    "observedGeneration": cluster.metadata.generation,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        apply_stateful_set(kube, namespace, cluster, 1, true).await?;
+        recovery.phase = "FreshBootstrapping".to_string();
+        recovery.seed_node_id = Some(1);
+        recovery.survivor_node_ids.clear();
+        recovery.rejected_node_ids.clear();
+        recovery.unreachable_node_ids.clear();
+        recovery.restarting_node_id = None;
+        recovery.restarted_node_ids.clear();
+        recovery.stabilizing_node_id = None;
+        recovery.stabilizing_started_at = None;
+        recovery.last_error =
+            Some("no recoverable local raft state remained after the natural recovery window; automatically bootstrapping an empty cluster to restore availability".to_string());
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "FreshBootstrapping",
+                "message": "all in-memory raft survivors are gone and every old Pod UID has terminated; recreating node 1 as an empty cluster to restore availability, with data loss",
+                "replicas": 1,
+                "readyReplicas": 0,
+                "desiredReplicas": cluster.spec.replicas,
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    };
+
+    if seed.membership.supports.get("forceRebootstrap").and_then(Value::as_bool) != Some(true) {
+        recovery.phase = "RecoveryBlocked".to_string();
+        recovery.last_error =
+            Some(format!("selected seed node {} does not advertise forceRebootstrap support", seed.node_id));
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "RecoveryBlocked",
+                "message": recovery.last_error,
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let seed_node_id = seed.node_id;
+    let old_non_seed_pods = cluster_pods(kube, namespace, name)
+        .await?
+        .into_iter()
+        .filter(|pod| pod.metadata.name != pod_name(name, seed_node_id))
+        .map(|pod| (pod.metadata.name, pod.metadata.uid))
+        .collect::<Vec<_>>();
+    for (target_pod, _) in &old_non_seed_pods {
+        patch_pod_unavailable(kube, namespace, target_pod).await?;
+        kube.delete(&format!("/api/v1/namespaces/{namespace}/pods/{target_pod}")).await?;
+    }
+
+    let old_pod_uids = old_non_seed_pods
+        .iter()
+        .map(|(_, uid)| uid.as_str())
+        .filter(|uid| !uid.is_empty())
+        .collect::<Vec<_>>();
+    for _ in 0..60 {
+        let old_process_exists = cluster_pods(kube, namespace, name)
+            .await?
+            .iter()
+            .any(|pod| old_pod_uids.contains(&pod.metadata.uid.as_str()));
+        if !old_process_exists {
+            break;
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+    let lingering_old_pods = cluster_pods(kube, namespace, name)
+        .await?
+        .into_iter()
+        .filter(|pod| old_pod_uids.contains(&pod.metadata.uid.as_str()))
+        .map(|pod| pod.metadata.name)
+        .collect::<Vec<_>>();
+    if !lingering_old_pods.is_empty() {
+        recovery.phase = "RecoveryBlocked".to_string();
+        recovery.last_error = Some(format!(
+            "old raft survivor Pods did not terminate before seed rebootstrap: {lingering_old_pods:?}"
+        ));
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "RecoveryBlocked",
+                "message": recovery.last_error,
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    recovery.phase = "SelectingRecoverySeed".to_string();
+    recovery.seed_node_id = Some(seed_node_id);
+    recovery.restarting_node_id = None;
+    recovery.restarted_node_ids.clear();
+    recovery.stabilizing_node_id = None;
+    recovery.stabilizing_started_at = None;
+    recovery.unhealthy_node_id = None;
+    recovery.unhealthy_started_at = None;
+    recovery.recycling_node_id = None;
+    recovery.recycling_pod_uid = None;
+    recovery.recycle_attempts.clear();
+    patch_status(
+        kube,
+        namespace,
+        name,
+        json!({
+            "phase": "SelectingRecoverySeed",
+            "message": format!("selected node {seed_node_id} as the most advanced in-memory survivor; all other old raft processes are gone"),
+            "replicas": current_replicas,
+            "readyReplicas": ready_replicas,
+            "desiredReplicas": cluster.spec.replicas,
+            "operation": null,
+            "confChange": null,
+            "quorumRecovery": quorum_recovery_status_json(&recovery),
+            "observedGeneration": cluster.metadata.generation,
+        }),
+    )
+    .await?;
+
+    rmqtt_action_value_with_payload(
+        namespace,
+        cluster,
+        seed_node_id,
+        json!({
+            "action": "force_rebootstrap",
+            "recoveryEpoch": recovery.epoch,
+        }),
+    )
+    .await?;
+    patch_pod_serving(kube, namespace, &pod_name(name, seed_node_id)).await?;
+    recovery.phase = "RebuildingQuorum".to_string();
+    recovery.last_error = None;
+    patch_status(
+        kube,
+        namespace,
+        name,
+        json!({
+            "phase": "DegradedServing",
+            "message": format!("node {seed_node_id} is serving from preserved in-memory state as a singleton; rebuilding the remaining voters one at a time"),
+            "replicas": current_replicas,
+            "readyReplicas": ready_pods(kube, namespace, name).await?.len(),
+            "desiredReplicas": cluster.spec.replicas,
+            "leaderId": seed_node_id,
+            "operation": null,
+            "confChange": null,
+            "quorumRecovery": quorum_recovery_status_json(&recovery),
+            "observedGeneration": cluster.metadata.generation,
+        }),
+    )
+    .await
+}
+
+async fn patch_quorum_recovery_hold(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    current_replicas: i32,
+    ready_replicas: i32,
+    membership: &MembershipStatus,
+    mut recovery: QuorumRecoveryStatus,
+    message: String,
+) -> Result<()> {
+    recovery.phase = "DegradedServing".to_string();
+    recovery.stabilizing_node_id = None;
+    recovery.stabilizing_started_at = None;
+    recovery.last_error = Some(message.clone());
+    patch_status(
+        kube,
+        namespace,
+        &cluster.metadata.name,
+        json!({
+            "phase": "DegradedServing",
+            "message": message,
+            "replicas": current_replicas,
+            "readyReplicas": ready_replicas,
+            "desiredReplicas": cluster.spec.replicas,
+            "leaderId": membership.leader_id,
+            "raftStatus": membership_status_json(membership, current_replicas),
+            "operation": null,
+            "confChange": null,
+            "quorumRecovery": quorum_recovery_status_json(&recovery),
+            "observedGeneration": cluster.metadata.generation,
+        }),
+    )
+    .await
+}
+
+fn clear_recovery_unhealthy_observation(recovery: &mut QuorumRecoveryStatus, node_id: i32) {
+    if recovery.unhealthy_node_id == Some(node_id) {
+        recovery.unhealthy_node_id = None;
+        recovery.unhealthy_started_at = None;
+    }
+}
+
+fn begin_recovery_node_stabilization(recovery: &mut QuorumRecoveryStatus, node_id: i32) {
+    recovery.phase = "StabilizingRecoveryNode".to_string();
+    recovery.restarting_node_id = Some(node_id);
+    recovery.stabilizing_node_id = Some(node_id);
+    recovery.stabilizing_started_at = Some(utc_now_rfc3339());
+    recovery.last_error = None;
+}
+
+async fn patch_recovery_health_observation_reset(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    current_replicas: i32,
+    ready_replicas: i32,
+    membership: &MembershipStatus,
+    mut recovery: QuorumRecoveryStatus,
+    node_id: i32,
+    pod_ready: bool,
+    local_membership_healthy: bool,
+) -> Result<()> {
+    clear_recovery_unhealthy_observation(&mut recovery, node_id);
+    recovery.last_error = None;
+    if local_membership_healthy {
+        patch_pod_serving(kube, namespace, &pod_name(&cluster.metadata.name, node_id)).await?;
+    }
+    patch_status(
+        kube,
+        namespace,
+        &cluster.metadata.name,
+        json!({
+            "phase": "DegradedServing",
+            "message": format!(
+                "recovery node {node_id} no longer has both recycle-failure signals; reset the continuous unhealthy window: podReady={pod_ready}, localMembershipHealthy={local_membership_healthy}"
+            ),
+            "replicas": current_replicas,
+            "readyReplicas": ready_replicas,
+            "desiredReplicas": cluster.spec.replicas,
+            "leaderId": membership.leader_id,
+            "raftStatus": membership_status_json(membership, current_replicas),
+            "quorumRecovery": quorum_recovery_status_json(&recovery),
+            "observedGeneration": cluster.metadata.generation,
+        }),
+    )
+    .await
+}
+
+async fn continue_recovery_node_recycle(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    current_replicas: i32,
+    ready_replicas: i32,
+    membership: &MembershipStatus,
+    mut recovery: QuorumRecoveryStatus,
+    pods: &[Pod],
+) -> Result<()> {
+    let name = cluster.metadata.name.as_str();
+    let node_id = recovery.recycling_node_id.ok_or_else(|| anyhow!("recovery recycle node is missing"))?;
+    let expected_uid = recovery.recycling_pod_uid.clone().unwrap_or_default();
+    recovery.restarting_node_id = Some(node_id);
+    recovery.restarted_node_ids.retain(|restarted| *restarted != node_id);
+    recovery.stabilizing_node_id = None;
+    recovery.stabilizing_started_at = None;
+    clear_recovery_unhealthy_observation(&mut recovery, node_id);
+
+    match pod_for_node(pods, name, node_id) {
+        Some(pod) if !expected_uid.is_empty() && pod.metadata.uid == expected_uid => {
+            patch_pod_unavailable(kube, namespace, &pod.metadata.name).await?;
+            let deleting = pod.metadata.deletion_timestamp.is_some();
+            let mut refreshed_membership = None;
+            let mut delete_accepted = true;
+            if !deleting {
+                if let Err(error) = wait_for_client_endpoint_removal(
+                    kube,
+                    namespace,
+                    name,
+                    &pod.metadata.name,
+                    cluster.spec.raft.endpoint_removal_stable_seconds,
+                )
+                .await
+                {
+                    return patch_quorum_recovery_hold(
+                        kube,
+                        namespace,
+                        cluster,
+                        current_replicas,
+                        ready_replicas,
+                        membership,
+                        recovery,
+                        format!(
+                            "waiting to retry recovery voter {node_id} recycle because its client endpoint was not removed safely: {error}"
+                        ),
+                    )
+                    .await;
+                }
+
+                let seed_node_id = recovery
+                    .seed_node_id
+                    .ok_or_else(|| anyhow!("quorum recovery seed is missing before Pod recycle"))?;
+                match fresh_recovery_node_signals(
+                    kube,
+                    namespace,
+                    cluster,
+                    node_id,
+                    &expected_uid,
+                    seed_node_id,
+                )
+                .await?
+                {
+                    Some((pod_ready, local_membership_healthy))
+                        if !recovery_node_auto_recycle_candidate(pod_ready, local_membership_healthy) =>
+                    {
+                        recovery.recycling_node_id = None;
+                        recovery.recycling_pod_uid = None;
+                        recovery.phase = "RebuildingQuorum".to_string();
+                        return patch_recovery_health_observation_reset(
+                            kube,
+                            namespace,
+                            cluster,
+                            current_replicas,
+                            ready_replicas,
+                            membership,
+                            recovery,
+                            node_id,
+                            pod_ready,
+                            local_membership_healthy,
+                        )
+                        .await;
+                    }
+                    Some(_) => {}
+                    None => {
+                        return patch_quorum_recovery_hold(
+                            kube,
+                            namespace,
+                            cluster,
+                            current_replicas,
+                            ready_replicas,
+                            membership,
+                            recovery,
+                            format!(
+                                "waiting to retry recovery voter {node_id} recycle because its Pod UID or termination state changed during safety validation"
+                            ),
+                        )
+                        .await;
+                    }
+                }
+
+                let fresh = match fresh_recovery_seed_membership(namespace, cluster, &recovery).await {
+                    Ok(fresh) => fresh,
+                    Err(error) => {
+                        return patch_quorum_recovery_hold(
+                            kube,
+                            namespace,
+                            cluster,
+                            current_replicas,
+                            ready_replicas,
+                            membership,
+                            recovery,
+                            format!(
+                                "waiting to retry recovery voter {node_id} recycle because fresh seed validation failed: {error:#}"
+                            ),
+                        )
+                        .await;
+                    }
+                };
+                if !voter_exists(&fresh, node_id) {
+                    recovery.recycling_node_id = None;
+                    recovery.recycling_pod_uid = None;
+                    recovery.phase = "RebuildingQuorum".to_string();
+                    recovery.last_error = None;
+                    return patch_status(
+                        kube,
+                        namespace,
+                        name,
+                        json!({
+                            "phase": "DegradedServing",
+                            "message": format!("recovery node {node_id} is no longer a voter; cancelled its pending Pod recycle and resumed learner repair"),
+                            "replicas": current_replicas,
+                            "readyReplicas": ready_replicas,
+                            "desiredReplicas": cluster.spec.replicas,
+                            "leaderId": fresh.leader_id,
+                            "raftStatus": membership_status_json(&fresh, current_replicas),
+                            "operation": null,
+                            "confChange": null,
+                            "quorumRecovery": quorum_recovery_status_json(&recovery),
+                            "observedGeneration": cluster.metadata.generation,
+                        }),
+                    )
+                    .await;
+                }
+                if let Some(blocker) = recovery_node_recycle_blocker(&recovery, &fresh, node_id) {
+                    return patch_quorum_recovery_hold(
+                        kube,
+                        namespace,
+                        cluster,
+                        current_replicas,
+                        ready_replicas,
+                        &fresh,
+                        recovery,
+                        format!(
+                            "waiting to retry recovery voter {node_id} recycle after fresh quorum validation: {blocker}"
+                        ),
+                    )
+                    .await;
+                }
+                delete_accepted = kube
+                    .delete_with_uid_precondition(
+                        &format!("/api/v1/namespaces/{namespace}/pods/{}", pod.metadata.name),
+                        &expected_uid,
+                    )
+                    .await?;
+                refreshed_membership = Some(fresh);
+            }
+            let status_membership = refreshed_membership.as_ref().unwrap_or(membership);
+            if !deleting && !delete_accepted {
+                recovery.recycling_node_id = None;
+                recovery.recycling_pod_uid = None;
+                recovery.phase = "RebuildingQuorum".to_string();
+                recovery.last_error = None;
+                return patch_status(
+                    kube,
+                    namespace,
+                    name,
+                    json!({
+                        "phase": "DegradedServing",
+                        "message": format!(
+                            "Pod UID precondition rejected deletion of recovery voter {node_id} UID {expected_uid}; cancelled the pending recycle and will inspect the current Pod"
+                        ),
+                        "replicas": current_replicas,
+                        "readyReplicas": ready_replicas,
+                        "desiredReplicas": cluster.spec.replicas,
+                        "leaderId": status_membership.leader_id,
+                        "raftStatus": membership_status_json(status_membership, current_replicas),
+                        "operation": null,
+                        "confChange": null,
+                        "quorumRecovery": quorum_recovery_status_json(&recovery),
+                        "observedGeneration": cluster.metadata.generation,
+                    }),
+                )
+                .await;
+            }
+            let attempt = recovery_node_recycle_attempts(&recovery, node_id);
+            recovery.phase = "RecyclingRecoveryNode".to_string();
+            recovery.last_error = None;
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "DegradedServing",
+                    "message": format!(
+                        "{} old Pod UID {} for unhealthy recovery voter {node_id}; waiting for StatefulSet recreation (attempt {attempt}/{})",
+                        if deleting {
+                            "waiting for termination of"
+                        } else {
+                            "atomically deleted"
+                        },
+                        expected_uid,
+                        QUORUM_RECOVERY_NODE_MAX_RECYCLE_ATTEMPTS,
+                    ),
+                    "replicas": current_replicas,
+                    "readyReplicas": ready_replicas,
+                    "desiredReplicas": cluster.spec.replicas,
+                    "leaderId": status_membership.leader_id,
+                    "raftStatus": membership_status_json(status_membership, current_replicas),
+                    "operation": null,
+                    "confChange": null,
+                    "quorumRecovery": quorum_recovery_status_json(&recovery),
+                    "observedGeneration": cluster.metadata.generation,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        Some(pod) if !expected_uid.is_empty() && pod.metadata.uid != expected_uid => {
+            let replacement_uid = pod.metadata.uid.clone();
+            recovery.recycling_node_id = None;
+            recovery.recycling_pod_uid = None;
+            recovery.phase = "RebuildingQuorum".to_string();
+            recovery.last_error = None;
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "DegradedServing",
+                    "message": format!("replacement Pod UID {replacement_uid} is present for recovery node {node_id}; resuming learner catch-up"),
+                    "replicas": current_replicas,
+                    "readyReplicas": ready_replicas,
+                    "desiredReplicas": cluster.spec.replicas,
+                    "leaderId": membership.leader_id,
+                    "raftStatus": membership_status_json(membership, current_replicas),
+                    "operation": null,
+                    "confChange": null,
+                    "quorumRecovery": quorum_recovery_status_json(&recovery),
+                    "observedGeneration": cluster.metadata.generation,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+        Some(_) => {
+            recovery.recycling_node_id = None;
+            recovery.recycling_pod_uid = None;
+            recovery.phase = "RebuildingQuorum".to_string();
+            recovery.last_error = Some(format!(
+                "recycle state for node {node_id} had no original Pod UID; discarded the stale marker without deleting a Pod"
+            ));
+        }
+        None => {}
+    }
+
+    let blockers = missing_recovery_target_blockers(pods, name, node_id).unwrap_or_default();
+    patch_status(
+        kube,
+        namespace,
+        name,
+        json!({
+            "phase": "DegradedServing",
+            "message": format!("waiting for replacement Pod for recycled recovery node {node_id}; OrderedReady blockers={blockers:?}"),
+            "replicas": current_replicas,
+            "readyReplicas": ready_replicas,
+            "desiredReplicas": cluster.spec.replicas,
+            "leaderId": membership.leader_id,
+            "raftStatus": membership_status_json(membership, current_replicas),
+            "operation": null,
+            "confChange": null,
+            "quorumRecovery": quorum_recovery_status_json(&recovery),
+            "observedGeneration": cluster.metadata.generation,
+        }),
+    )
+    .await
+}
+
+async fn handle_unhealthy_recovery_voter(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    current_replicas: i32,
+    ready_replicas: i32,
+    membership: &MembershipStatus,
+    mut recovery: QuorumRecoveryStatus,
+    pods: &[Pod],
+    observations: &[LocalMembershipObservation],
+    node_id: i32,
+    context: &str,
+) -> Result<()> {
+    recovery.stabilizing_node_id = None;
+    recovery.stabilizing_started_at = None;
+
+    let Some(target_pod) = pod_for_node(pods, &cluster.metadata.name, node_id) else {
+        recovery.restarting_node_id = Some(node_id);
+        recovery.restarted_node_ids.retain(|restarted| *restarted != node_id);
+        clear_recovery_unhealthy_observation(&mut recovery, node_id);
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            format!("{context}: recovery voter {node_id} Pod is already absent; waiting for its replacement"),
+        )
+        .await;
+    };
+    if target_pod.metadata.deletion_timestamp.is_some() {
+        recovery.restarting_node_id = Some(node_id);
+        recovery.restarted_node_ids.retain(|restarted| *restarted != node_id);
+        clear_recovery_unhealthy_observation(&mut recovery, node_id);
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            format!(
+                "{context}: recovery voter {node_id} Pod is already terminating; waiting for its replacement"
+            ),
+        )
+        .await;
+    }
+
+    let pod_ready = pod_is_ready(target_pod);
+    let local_membership_healthy = recovery_node_locally_healthy(observations, node_id, membership.id);
+    if !recovery_node_auto_recycle_candidate(pod_ready, local_membership_healthy) {
+        return patch_recovery_health_observation_reset(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            node_id,
+            pod_ready,
+            local_membership_healthy,
+        )
+        .await;
+    }
+
+    let unhealthy_elapsed = recovery_node_unhealthy_elapsed(&recovery, node_id);
+    if unhealthy_elapsed.is_none() {
+        recovery.unhealthy_node_id = Some(node_id);
+        recovery.unhealthy_started_at = Some(utc_now_rfc3339());
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            format!(
+                "{context}: recovery voter {node_id} failed its local Pod/membership health check; observing for {}s before considering a safe Pod recycle",
+                QUORUM_RECOVERY_NODE_UNHEALTHY_GRACE_SECONDS
+            ),
+        )
+        .await;
+    }
+
+    let unhealthy_elapsed = unhealthy_elapsed.unwrap_or_default();
+    if unhealthy_elapsed < QUORUM_RECOVERY_NODE_UNHEALTHY_GRACE_SECONDS {
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            format!(
+                "{context}: recovery voter {node_id} remains locally unhealthy; observation {unhealthy_elapsed}/{}s, with no further voter being added",
+                QUORUM_RECOVERY_NODE_UNHEALTHY_GRACE_SECONDS
+            ),
+        )
+        .await;
+    }
+
+    let attempts = recovery_node_recycle_attempts(&recovery, node_id);
+    if attempts >= QUORUM_RECOVERY_NODE_MAX_RECYCLE_ATTEMPTS {
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            format!(
+                "{context}: recovery voter {node_id} is still locally unhealthy after {attempts} automatic recycle attempts; preserving the recovered leader and stopping automatic deletion"
+            ),
+        )
+        .await;
+    }
+
+    if let Some(blocker) = recovery_node_recycle_blocker(&recovery, membership, node_id) {
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            format!(
+                "{context}: recovery voter {node_id} remains locally unhealthy, but it cannot be recycled safely: {blocker}; preserving degraded service"
+            ),
+        )
+        .await;
+    }
+
+    if target_pod.metadata.uid.is_empty() {
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            format!("{context}: recovery voter {node_id} Pod has no UID; refusing an unidentifiable delete"),
+        )
+        .await;
+    }
+
+    let attempt = attempts + 1;
+    let pod_uid = target_pod.metadata.uid.clone();
+    let pod_name = target_pod.metadata.name.clone();
+    patch_pod_unavailable(kube, namespace, &pod_name).await?;
+    if let Err(error) = wait_for_client_endpoint_removal(
+        kube,
+        namespace,
+        &cluster.metadata.name,
+        &pod_name,
+        cluster.spec.raft.endpoint_removal_stable_seconds,
+    )
+    .await
+    {
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            format!(
+                "{context}: recovery voter {node_id} remains unhealthy, but its client endpoint was not removed safely: {error}"
+            ),
+        )
+        .await;
+    }
+
+    let seed_node_id =
+        recovery.seed_node_id.ok_or_else(|| anyhow!("quorum recovery seed is missing before Pod recycle"))?;
+    match fresh_recovery_node_signals(kube, namespace, cluster, node_id, &pod_uid, seed_node_id).await? {
+        Some((pod_ready, local_membership_healthy))
+            if !recovery_node_auto_recycle_candidate(pod_ready, local_membership_healthy) =>
+        {
+            return patch_recovery_health_observation_reset(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                ready_replicas,
+                membership,
+                recovery,
+                node_id,
+                pod_ready,
+                local_membership_healthy,
+            )
+            .await;
+        }
+        Some(_) => {}
+        None => {
+            return patch_quorum_recovery_hold(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                ready_replicas,
+                membership,
+                recovery,
+                format!(
+                    "{context}: recovery voter {node_id} Pod UID or termination state changed during final safety validation; no delete was sent"
+                ),
+            )
+            .await;
+        }
+    }
+
+    let fresh_membership = match fresh_recovery_seed_membership(namespace, cluster, &recovery).await {
+        Ok(fresh_membership) => fresh_membership,
+        Err(error) => {
+            return patch_quorum_recovery_hold(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                ready_replicas,
+                membership,
+                recovery,
+                format!(
+                    "{context}: recovery voter {node_id} remains unhealthy, but fresh seed validation failed before deletion: {error:#}"
+                ),
+            )
+            .await;
+        }
+    };
+    if !voter_exists(&fresh_membership, node_id) {
+        clear_recovery_unhealthy_observation(&mut recovery, node_id);
+        recovery.phase = "RebuildingQuorum".to_string();
+        recovery.last_error = None;
+        return patch_status(
+            kube,
+            namespace,
+            &cluster.metadata.name,
+            json!({
+                "phase": "DegradedServing",
+                "message": format!("recovery node {node_id} is no longer a voter after fresh validation; cancelled Pod recycle and resumed learner repair"),
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": fresh_membership.leader_id,
+                "raftStatus": membership_status_json(&fresh_membership, current_replicas),
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await;
+    }
+    if let Some(blocker) = recovery_node_recycle_blocker(&recovery, &fresh_membership, node_id) {
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            &fresh_membership,
+            recovery,
+            format!(
+                "{context}: recovery voter {node_id} remains unhealthy, but fresh quorum validation blocked deletion: {blocker}"
+            ),
+        )
+        .await;
+    }
+
+    recovery.phase = "RecyclingRecoveryNode".to_string();
+    recovery.recycling_node_id = Some(node_id);
+    recovery.recycling_pod_uid = Some(pod_uid.clone());
+    recovery.recycle_attempts.insert(node_id.to_string(), attempt);
+    recovery.restarting_node_id = Some(node_id);
+    recovery.restarted_node_ids.retain(|restarted| *restarted != node_id);
+    clear_recovery_unhealthy_observation(&mut recovery, node_id);
+    recovery.last_error = None;
+    patch_status(
+        kube,
+        namespace,
+        &cluster.metadata.name,
+        json!({
+            "phase": "DegradedServing",
+            "message": format!("{context}: safely recycling locally unhealthy recovery voter {node_id}, Pod UID {pod_uid} (attempt {attempt}/{})", QUORUM_RECOVERY_NODE_MAX_RECYCLE_ATTEMPTS),
+            "replicas": current_replicas,
+            "readyReplicas": ready_replicas,
+            "desiredReplicas": cluster.spec.replicas,
+            "leaderId": fresh_membership.leader_id,
+            "raftStatus": membership_status_json(&fresh_membership, current_replicas),
+            "operation": null,
+            "confChange": null,
+            "quorumRecovery": quorum_recovery_status_json(&recovery),
+            "observedGeneration": cluster.metadata.generation,
+        }),
+    )
+    .await?;
+    let deleted = kube
+        .delete_with_uid_precondition(&format!("/api/v1/namespaces/{namespace}/pods/{pod_name}"), &pod_uid)
+        .await?;
+    if !deleted {
+        recovery.recycling_node_id = None;
+        recovery.recycling_pod_uid = None;
+        recovery.phase = "RebuildingQuorum".to_string();
+        recovery.last_error = None;
+        if attempts == 0 {
+            recovery.recycle_attempts.remove(&node_id.to_string());
+        } else {
+            recovery.recycle_attempts.insert(node_id.to_string(), attempts);
+        }
+        log::warn!(
+            "recovery Pod delete UID precondition was rejected; cancelled the pending recycle without consuming an attempt node_id={} expected_pod_uid={} namespace={} cluster={}",
+            node_id,
+            pod_uid,
+            namespace,
+            cluster.metadata.name,
+        );
+        return patch_status(
+            kube,
+            namespace,
+            &cluster.metadata.name,
+            json!({
+                "phase": "DegradedServing",
+                "message": format!(
+                    "{context}: Pod UID precondition rejected deletion of recovery voter {node_id} UID {pod_uid}; cancelled the pending recycle without consuming an attempt"
+                ),
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": fresh_membership.leader_id,
+                "raftStatus": membership_status_json(&fresh_membership, current_replicas),
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await;
+    }
+    log::warn!(
+        "event=QUORUM_RECOVERY_NODE_RECYCLE epoch={} node_id={} pod_uid={} attempt={}/{} namespace={} cluster={}",
+        recovery.epoch,
+        node_id,
+        pod_uid,
+        attempt,
+        QUORUM_RECOVERY_NODE_MAX_RECYCLE_ATTEMPTS,
+        namespace,
+        cluster.metadata.name,
+    );
+    Ok(())
+}
+
+async fn continue_quorum_recovery_conf_change(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    current_replicas: i32,
+    recovery: QuorumRecoveryStatus,
+    pods: &[Pod],
+    observations: &[LocalMembershipObservation],
+    membership: &MembershipStatus,
+    conf_change: ConfChangeStatus,
+) -> Result<()> {
+    if conf_change.kind != "AddLearnerAndPromote" {
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            pods.iter().filter(|pod| pod_is_ready(pod)).count() as i32,
+            membership,
+            recovery,
+            format!(
+                "paused quorum rebuild because unexpected membership operation {} is active",
+                conf_change.kind
+            ),
+        )
+        .await;
+    }
+
+    if let Some(blocker) = recovery_seed_membership_blocker(&recovery, membership) {
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            pods.iter().filter(|pod| pod_is_ready(pod)).count() as i32,
+            membership,
+            recovery,
+            format!("paused quorum rebuild membership operation because seed validation failed: {blocker}"),
+        )
+        .await;
+    }
+
+    let ready_replicas = pods.iter().filter(|pod| pod_is_ready(pod)).count() as i32;
+    if let Some(node_id) = recovery.unhealthy_node_id {
+        let pod_ready = pod_for_node(pods, &cluster.metadata.name, node_id).is_some_and(pod_is_ready);
+        let local_membership_healthy = recovery_node_locally_healthy(observations, node_id, membership.id);
+        if !recovery_node_auto_recycle_candidate(pod_ready, local_membership_healthy) {
+            return patch_recovery_health_observation_reset(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                ready_replicas,
+                membership,
+                recovery,
+                node_id,
+                pod_ready,
+                local_membership_healthy,
+            )
+            .await;
+        }
+    }
+    let unhealthy =
+        unhealthy_rebuilt_node_ids(&recovery, pods, &cluster.metadata.name, observations, membership.id);
+    if unhealthy.len() > 1 {
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            format!(
+                "paused quorum rebuild before node {} because multiple rebuilt voters are locally unhealthy: {unhealthy:?}; automatic recycling is limited to one isolated failure",
+                conf_change.node_id
+            ),
+        )
+        .await;
+    }
+    if let Some(node_id) = unhealthy.first().copied() {
+        return handle_unhealthy_recovery_voter(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            pods,
+            observations,
+            node_id,
+            &format!("paused quorum rebuild before node {}", conf_change.node_id),
+        )
+        .await;
+    }
+
+    let target_node_id = conf_change.node_id;
+    if let Some(blocking_predecessors) =
+        missing_recovery_target_blockers(pods, &cluster.metadata.name, target_node_id)
+    {
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            format!(
+                "waiting for recovery target node {target_node_id} Pod to be created; OrderedReady blockers={blocking_predecessors:?}; no learner wait was started"
+            ),
+        )
+        .await;
+    }
+
+    if membership.voters.contains(&target_node_id) {
+        if !recovery_node_healthy(pods, &cluster.metadata.name, observations, target_node_id, membership.id) {
+            return handle_unhealthy_recovery_voter(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                ready_replicas,
+                membership,
+                recovery,
+                pods,
+                observations,
+                target_node_id,
+                "learner promotion completed but local startup did not remain healthy",
+            )
+            .await;
+        }
+
+        // A recovery membership change must return to the recovery state
+        // machine instead of the generic scale-out completion path. The
+        // generic path reports Running when this is the final desired node,
+        // even though the mandatory recovery stabilization window is still
+        // active.
+        let mut recovery = recovery;
+        clear_recovery_unhealthy_observation(&mut recovery, target_node_id);
+        patch_pod_serving(kube, namespace, &pod_name(&cluster.metadata.name, target_node_id)).await?;
+        begin_recovery_node_stabilization(&mut recovery, target_node_id);
+        patch_status(
+            kube,
+            namespace,
+            &cluster.metadata.name,
+            json!({
+                "phase": "StabilizingRecoveryNode",
+                "message": format!(
+                    "node {target_node_id} joined as a voter and is locally healthy; requiring {}s of continuous stability before continuing quorum recovery",
+                    QUORUM_RECOVERY_NODE_STABILIZATION_SECONDS
+                ),
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": membership.leader_id,
+                "raftStatus": membership_status_json(membership, current_replicas),
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    continue_conf_change(kube, namespace, cluster, current_replicas, conf_change).await
+}
+
+async fn rebuild_quorum_from_seed(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    current_replicas: i32,
+    mut recovery: QuorumRecoveryStatus,
+    membership: &MembershipStatus,
+    pods: &[Pod],
+    observations: &[LocalMembershipObservation],
+) -> Result<()> {
+    let name = cluster.metadata.name.as_str();
+    let seed_node_id = recovery.seed_node_id.ok_or_else(|| anyhow!("quorum recovery seed is missing"))?;
+    if membership.id != seed_node_id || membership.quorum_recovery_epoch != recovery.epoch {
+        recovery.phase = "RecoveryBlocked".to_string();
+        recovery.last_error = Some(format!(
+            "authoritative leader {} does not match recovery seed {} at epoch {}",
+            membership.id, seed_node_id, recovery.epoch
+        ));
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "RecoveryBlocked",
+                "message": recovery.last_error,
+                "replicas": current_replicas,
+                "readyReplicas": ready_pods(kube, namespace, name).await?.len(),
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": membership.leader_id,
+                "raftStatus": membership_status_json(membership, current_replicas),
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let ready_replicas = pods.iter().filter(|pod| pod_is_ready(pod)).count() as i32;
+    if recovery.recycling_node_id.is_some() {
+        return continue_recovery_node_recycle(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            pods,
+        )
+        .await;
+    }
+    if let Some(node_id) = recovery.unhealthy_node_id {
+        let pod_ready = pod_for_node(pods, name, node_id).is_some_and(pod_is_ready);
+        let local_membership_healthy = recovery_node_locally_healthy(observations, node_id, membership.id);
+        if !recovery_node_auto_recycle_candidate(pod_ready, local_membership_healthy) {
+            return patch_recovery_health_observation_reset(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                ready_replicas,
+                membership,
+                recovery,
+                node_id,
+                pod_ready,
+                local_membership_healthy,
+            )
+            .await;
+        }
+    }
+    let unhealthy = unhealthy_rebuilt_node_ids(&recovery, pods, name, observations, membership.id);
+    if unhealthy.len() > 1 {
+        return patch_quorum_recovery_hold(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            format!(
+                "multiple rebuilt voters are locally unhealthy: {unhealthy:?}; preserving degraded service because automatic recycling is limited to one isolated failure"
+            ),
+        )
+        .await;
+    }
+    if let Some(node_id) = unhealthy.first().copied() {
+        let next_node = recovery.restarting_node_id;
+        return handle_unhealthy_recovery_voter(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            ready_replicas,
+            membership,
+            recovery,
+            pods,
+            observations,
+            node_id,
+            &format!(
+                "paused quorum rebuild{} because a previously rebuilt voter regressed",
+                next_node.map(|next_id| format!(" before node {next_id}")).unwrap_or_default()
+            ),
+        )
+        .await;
+    }
+
+    if let Some(node_id) = recovery.restarting_node_id {
+        if let Some(blocking_predecessors) = missing_recovery_target_blockers(pods, name, node_id) {
+            return patch_quorum_recovery_hold(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                ready_replicas,
+                membership,
+                recovery,
+                format!(
+                    "waiting for recovery target node {node_id} Pod to be created; OrderedReady blockers={blocking_predecessors:?}; the operator will not wait for or promote a nonexistent learner"
+                ),
+            )
+            .await;
+        }
+        let target_pod = pod_for_node(pods, name, node_id)
+            .expect("missing recovery target is handled before membership repair");
+
+        let target_ready = pod_is_ready(target_pod);
+        let target_locally_healthy = recovery_node_locally_healthy(observations, node_id, membership.id);
+        let target_complete = voter_exists(membership, node_id)
+            && member_exists(&membership.business_peers, node_id)
+            && target_ready
+            && target_locally_healthy;
+        if target_complete {
+            clear_recovery_unhealthy_observation(&mut recovery, node_id);
+            patch_pod_serving(kube, namespace, &pod_name(name, node_id)).await?;
+
+            let stable_elapsed = recovery_node_stabilization_elapsed(&recovery, node_id);
+            if stable_elapsed.is_none() {
+                begin_recovery_node_stabilization(&mut recovery, node_id);
+                patch_status(
+                    kube,
+                    namespace,
+                    name,
+                    json!({
+                        "phase": "StabilizingRecoveryNode",
+                        "message": format!("node {node_id} joined as a voter and is locally healthy; requiring {}s of continuous stability before continuing quorum recovery", QUORUM_RECOVERY_NODE_STABILIZATION_SECONDS),
+                        "replicas": current_replicas,
+                        "readyReplicas": ready_replicas,
+                        "desiredReplicas": cluster.spec.replicas,
+                        "leaderId": membership.leader_id,
+                        "raftStatus": membership_status_json(membership, current_replicas),
+                        "operation": null,
+                        "confChange": null,
+                        "quorumRecovery": quorum_recovery_status_json(&recovery),
+                        "observedGeneration": cluster.metadata.generation,
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            let stable_elapsed = stable_elapsed.unwrap_or_default();
+            if stable_elapsed < QUORUM_RECOVERY_NODE_STABILIZATION_SECONDS {
+                recovery.phase = "StabilizingRecoveryNode".to_string();
+                patch_status(
+                    kube,
+                    namespace,
+                    name,
+                    json!({
+                        "phase": "StabilizingRecoveryNode",
+                        "message": format!("node {node_id} remains locally healthy; stabilization {stable_elapsed}/{}s before rebuilding another node", QUORUM_RECOVERY_NODE_STABILIZATION_SECONDS),
+                        "replicas": current_replicas,
+                        "readyReplicas": ready_replicas,
+                        "desiredReplicas": cluster.spec.replicas,
+                        "leaderId": membership.leader_id,
+                        "raftStatus": membership_status_json(membership, current_replicas),
+                        "operation": null,
+                        "confChange": null,
+                        "quorumRecovery": quorum_recovery_status_json(&recovery),
+                        "observedGeneration": cluster.metadata.generation,
+                    }),
+                )
+                .await?;
+                return Ok(());
+            }
+
+            recovery.restarted_node_ids.push(node_id);
+            recovery.restarted_node_ids.sort_unstable();
+            recovery.restarted_node_ids.dedup();
+            recovery.restarting_node_id = None;
+            recovery.stabilizing_node_id = None;
+            recovery.stabilizing_started_at = None;
+            recovery.last_error = None;
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "RebuildingQuorum",
+                    "message": format!("node {node_id} remained locally healthy for {}s; selecting the next recovery node", QUORUM_RECOVERY_NODE_STABILIZATION_SECONDS),
+                    "replicas": current_replicas,
+                    "readyReplicas": ready_replicas,
+                    "desiredReplicas": cluster.spec.replicas,
+                    "leaderId": membership.leader_id,
+                    "raftStatus": membership_status_json(membership, current_replicas),
+                    "operation": null,
+                    "confChange": null,
+                    "quorumRecovery": quorum_recovery_status_json(&recovery),
+                    "observedGeneration": cluster.metadata.generation,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+
+        recovery.stabilizing_node_id = None;
+        recovery.stabilizing_started_at = None;
+        if voter_exists(membership, node_id) {
+            return handle_unhealthy_recovery_voter(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                ready_replicas,
+                membership,
+                recovery,
+                pods,
+                observations,
+                node_id,
+                "promoted recovery voter did not pass local Pod and membership health checks",
+            )
+            .await;
+        }
+
+        let conf_change = ConfChangeStatus {
+            kind: "AddLearnerAndPromote".to_string(),
+            node_id,
+            from_replicas: current_replicas,
+            to_replicas: current_replicas,
+            requested_replicas: cluster.spec.replicas,
+        };
+        continue_add_learner_and_promote(kube, namespace, cluster, current_replicas, &conf_change).await?;
+        return Ok(());
+    }
+
+    if let Some(node_id) = (1..=current_replicas)
+        .filter(|node_id| *node_id != seed_node_id)
+        .find(|node_id| !recovery.restarted_node_ids.contains(node_id))
+    {
+        recovery.restarting_node_id = Some(node_id);
+        recovery.stabilizing_node_id = None;
+        recovery.stabilizing_started_at = None;
+        recovery.last_error = None;
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "RebuildingQuorum",
+                "message": format!("waiting for recreated node {node_id} to join seed {seed_node_id} as a learner"),
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": membership.leader_id,
+                "raftStatus": membership_status_json(membership, current_replicas),
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    if current_replicas < cluster.spec.replicas {
+        let node_id = current_replicas + 1;
+        apply_stateful_set(kube, namespace, cluster, node_id, false).await?;
+        recovery.restarting_node_id = Some(node_id);
+        recovery.stabilizing_node_id = None;
+        recovery.stabilizing_started_at = None;
+        recovery.last_error = None;
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "RebuildingQuorum",
+                "message": format!("creating node {node_id} to join recovery seed {seed_node_id} as a learner"),
+                "replicas": node_id,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": membership.leader_id,
+                "raftStatus": membership_status_json(membership, current_replicas),
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+
+    let members_ready = membership_ready_for_replicas(membership, current_replicas);
+    if ready_replicas == current_replicas && members_ready {
+        rmqtt_action_value_with_payload(
+            namespace,
+            cluster,
+            seed_node_id,
+            json!({
+                "action": "cancel_quorum_recovery",
+                "recoveryEpoch": recovery.epoch,
+            }),
+        )
+        .await?;
+        ensure_ready_pods_serving(kube, namespace, name, current_replicas).await?;
+        apply_client_service(kube, namespace, cluster, false).await?;
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "Running",
+                "message": "raft quorum recovery completed; all desired voters and business members are ready",
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": membership.leader_id,
+                "raftStatus": membership_status_json(membership, current_replicas),
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": null,
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+    } else {
+        patch_status(
+            kube,
+            namespace,
+            name,
+            json!({
+                "phase": "RebuildingQuorum",
+                "message": "all recovery nodes were processed; waiting for final pod and membership convergence",
+                "replicas": current_replicas,
+                "readyReplicas": ready_replicas,
+                "desiredReplicas": cluster.spec.replicas,
+                "leaderId": membership.leader_id,
+                "raftStatus": membership_status_json(membership, current_replicas),
+                "operation": null,
+                "confChange": null,
+                "quorumRecovery": quorum_recovery_status_json(&recovery),
+                "observedGeneration": cluster.metadata.generation,
+            }),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 async fn leader_membership(
     _kube: &KubeClient,
     namespace: &str,
@@ -4948,10 +7612,10 @@ async fn leader_membership_from_nodes(
     let mut observations = Vec::new();
     for id in node_ids {
         match rmqtt_action::<MembershipStatus>(namespace, cluster, *id, "membership").await {
-            Ok(status) if is_authoritative_leader(&status) => return Ok(status),
+            Ok(status) if is_available_authoritative_leader(&status) => return Ok(status),
             Ok(status) => observations.push(format!(
-                "node {} reported id={}, leaderId={:?}, isLeader={}",
-                id, status.id, status.leader_id, status.is_leader
+                "node {} reported id={}, leaderId={:?}, isLeader={}, started={}, available={}",
+                id, status.id, status.leader_id, status.is_leader, status.started, status.available
             )),
             Err(e) => observations.push(format!("node {id} query failed: {e:#}")),
         }
@@ -5043,7 +7707,8 @@ async fn try_rmqtt_action_value_with_payload(
     node_id: i32,
     payload: Value,
 ) -> std::result::Result<Value, RmqttActionError> {
-    let retry_safe = payload.get("action").and_then(Value::as_str).is_some_and(|action| {
+    let action = payload.get("action").and_then(Value::as_str);
+    let retry_safe = action.is_some_and(|action| {
         matches!(
             action,
             "membership"
@@ -5056,19 +7721,32 @@ async fn try_rmqtt_action_value_with_payload(
                 | "quiesce"
                 | "drain"
                 | "undrain"
+                | "prepare_quorum_recovery"
+                | "cancel_quorum_recovery"
+                | "force_rebootstrap"
         )
     });
     let mut delay = Duration::from_millis(200);
     for attempt in 1..=3 {
         match try_rmqtt_action_value_once(namespace, cluster, node_id, payload.clone()).await {
             Err(error) if retry_safe && error.is_transient() && attempt < 3 => {
-                log::warn!(
-                    "transient RMQTT control request failed, retrying node_id={} payload={} attempt={}/3 error={}",
-                    node_id,
-                    payload,
-                    attempt,
-                    error
-                );
+                if action == Some("membership") {
+                    log::debug!(
+                        "transient RMQTT membership request failed, retrying node_id={} attempt={}/3 error_kind={} error={}",
+                        node_id,
+                        attempt,
+                        error.kind.label(),
+                        error
+                    );
+                } else {
+                    log::warn!(
+                        "transient RMQTT control request failed, retrying node_id={} payload={} attempt={}/3 error={}",
+                        node_id,
+                        payload,
+                        attempt,
+                        error
+                    );
+                }
                 sleep(delay).await;
                 delay = delay.saturating_mul(2);
             }
@@ -5095,24 +7773,30 @@ async fn try_rmqtt_action_value_once(
         http_port,
         node_id
     );
-    let client = Client::builder().timeout(Duration::from_secs(10)).build().map_err(|error| {
+    let request_timeout = if payload.get("action").and_then(Value::as_str) == Some("force_rebootstrap") {
+        Duration::from_secs(60)
+    } else {
+        Duration::from_secs(10)
+    };
+    let client = Client::builder().timeout(request_timeout).build().map_err(|error| {
         RmqttActionError::new(
-            RmqttActionErrorKind::Connection,
+            classify_reqwest_error(&error),
             node_id,
             &payload,
-            format!("build HTTP client: {error}"),
+            format!("build HTTP client: {}", error_chain_text(&error)),
         )
     })?;
     let res = client.post(url).json(&payload).send().await.map_err(|error| {
-        let kind =
-            if error.is_timeout() { RmqttActionErrorKind::Timeout } else { RmqttActionErrorKind::Connection };
-        RmqttActionError::new(kind, node_id, &payload, error.to_string())
+        RmqttActionError::new(classify_reqwest_error(&error), node_id, &payload, error_chain_text(&error))
     })?;
     let status = res.status();
     let text = res.text().await.map_err(|error| {
-        let kind =
-            if error.is_timeout() { RmqttActionErrorKind::Timeout } else { RmqttActionErrorKind::Connection };
-        RmqttActionError::new(kind, node_id, &payload, format!("read response body: {error}"))
+        RmqttActionError::new(
+            classify_reqwest_error(&error),
+            node_id,
+            &payload,
+            format!("read response body: {}", error_chain_text(&error)),
+        )
     })?;
     if !status.is_success() {
         let kind = if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
@@ -5701,21 +8385,44 @@ async fn apply_services(kube: &KubeClient, namespace: &str, cluster: &RmqttClust
     });
     kube.apply(&format!("/api/v1/namespaces/{namespace}/services/{name}-headless"), &headless_obj).await?;
 
+    apply_client_service(kube, namespace, cluster, degraded_client_endpoints_enabled(cluster)).await
+}
+
+fn degraded_client_endpoints_enabled(cluster: &RmqttCluster) -> bool {
+    cluster.status.as_ref().is_some_and(|status| {
+        status.phase == "DegradedServing"
+            || status.quorum_recovery.as_ref().is_some_and(|recovery| !recovery.survivor_node_ids.is_empty())
+    })
+}
+
+fn client_service_object(namespace: &str, cluster: &RmqttCluster, publish_not_ready: bool) -> Value {
+    let name = cluster.metadata.name.as_str();
     let mut client_selector = selector(name);
     client_selector.insert("rmqtt.io/serving".to_string(), "true".to_string());
-    let client_obj = json!({
+    json!({
         "apiVersion": "v1",
         "kind": "Service",
         "metadata": {
             "name": name,
             "namespace": namespace,
-            "labels": labels,
+            "labels": labels(name),
         },
         "spec": {
+            "publishNotReadyAddresses": publish_not_ready,
             "selector": client_selector,
             "ports": client_service_ports(&cluster.spec.service),
         }
-    });
+    })
+}
+
+async fn apply_client_service(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    publish_not_ready: bool,
+) -> Result<()> {
+    let name = cluster.metadata.name.as_str();
+    let client_obj = client_service_object(namespace, cluster, publish_not_ready);
     kube.apply(&format!("/api/v1/namespaces/{namespace}/services/{name}"), &client_obj).await
 }
 
@@ -6013,12 +8720,73 @@ async fn ensure_ready_pods_serving(
     Ok(())
 }
 
+async fn ensure_degraded_survivor_admission(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    replicas: i32,
+    observations: &[LocalMembershipObservation],
+) -> Result<()> {
+    let name = cluster.metadata.name.as_str();
+    let survivor_node_ids = observations
+        .iter()
+        .filter(|observation| observation_has_recoverable_raft_state(observation))
+        .map(|observation| observation.node_id)
+        .collect::<std::collections::HashSet<_>>();
+    let pods = cluster_pods(kube, namespace, name).await?;
+    for node_id in 1..=replicas {
+        let expected_name = pod_name(name, node_id);
+        let Some(pod) = pods.iter().find(|pod| pod.metadata.name == expected_name) else {
+            continue;
+        };
+        let serving = pod.metadata.labels.get("rmqtt.io/serving").map(String::as_str);
+        let draining = pod.metadata.labels.get("rmqtt.io/draining").map(String::as_str);
+        if survivor_node_ids.contains(&node_id) {
+            if serving != Some("true") || draining != Some("false") {
+                patch_pod_serving(kube, namespace, &expected_name).await?;
+            }
+        } else if serving != Some("false") || draining != Some("false") {
+            patch_pod_unavailable(kube, namespace, &expected_name).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_recovery_node_admission(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    replicas: i32,
+    pods: &[Pod],
+    observations: &[LocalMembershipObservation],
+    leader_id: i32,
+) -> Result<()> {
+    let name = cluster.metadata.name.as_str();
+    for node_id in 1..=replicas {
+        let Some(pod) = pod_for_node(pods, name, node_id) else {
+            continue;
+        };
+        let expected_name = pod_name(name, node_id);
+        let serving = pod.metadata.labels.get("rmqtt.io/serving").map(String::as_str);
+        let draining = pod.metadata.labels.get("rmqtt.io/draining").map(String::as_str);
+        if recovery_node_locally_healthy(observations, node_id, leader_id) {
+            if serving != Some("true") || draining != Some("false") {
+                patch_pod_serving(kube, namespace, &expected_name).await?;
+            }
+        } else if serving != Some("false") || draining != Some("false") {
+            patch_pod_unavailable(kube, namespace, &expected_name).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn ensure_unready_pods_not_serving(
     kube: &KubeClient,
     namespace: &str,
     name: &str,
     replicas: i32,
     planned_draining_node_id: Option<i32>,
+    degraded_client_endpoints: bool,
 ) -> Result<()> {
     let pods = cluster_pods(kube, namespace, name).await?;
     for node_id in 1..=replicas {
@@ -6037,6 +8805,11 @@ async fn ensure_unready_pods_not_serving(
             if serving != Some("false") || draining != Some("true") {
                 patch_pod_draining(kube, namespace, &expected_name).await?;
             }
+        } else if degraded_client_endpoints {
+            // Admission is maintained from local membership observations in
+            // the quorum-loss path. Avoid toggling a verified survivor out of
+            // Service merely because strict Raft readiness requires a leader.
+            continue;
         } else if serving != Some("false") || draining != Some("false") {
             patch_pod_unavailable(kube, namespace, &expected_name).await?;
         }
@@ -6065,13 +8838,28 @@ async fn patch_observed_restart_baseline(
 
 async fn patch_status(kube: &KubeClient, namespace: &str, name: &str, status: Value) -> Result<()> {
     let patch = json!({ "status": &status });
-    kube.merge_patch(
-        &format!("/apis/{GROUP}/{VERSION}/namespaces/{namespace}/{PLURAL}/{name}/status"),
-        &patch,
-    )
-    .await?;
-    log_status_transition(namespace, name, &status);
+    let patched_resource = kube
+        .merge_patch_response(
+            &format!("/apis/{GROUP}/{VERSION}/namespaces/{namespace}/{PLURAL}/{name}/status"),
+            &patch,
+        )
+        .await?;
+    if patched_resource.as_ref().is_some_and(|resource| resource.get("status").is_none()) {
+        log::warn!(
+            "Kubernetes status patch response did not contain status; logging the requested partial status namespace={} cluster={}",
+            namespace,
+            name,
+        );
+    }
+    log_status_transition(namespace, name, status_for_transition_log(&status, patched_resource.as_ref()));
     Ok(())
+}
+
+fn status_for_transition_log<'a>(
+    requested_status: &'a Value,
+    patched_resource: Option<&'a Value>,
+) -> &'a Value {
+    patched_resource.and_then(|resource| resource.get("status")).unwrap_or(requested_status)
 }
 
 fn status_log_signature(status: &Value) -> Value {
@@ -6094,6 +8882,16 @@ fn status_log_signature(status: &Value) -> Value {
         "operationRetryCount": status.pointer("/operation/retryCount"),
         "confChangeType": status.pointer("/confChange/type"),
         "confChangeNodeId": status.pointer("/confChange/nodeId"),
+        "quorumRecoveryEpoch": status.pointer("/quorumRecovery/epoch"),
+        "quorumRecoveryPhase": status.pointer("/quorumRecovery/phase"),
+        "quorumRecoverySeedNodeId": status.pointer("/quorumRecovery/seedNodeId"),
+        "quorumRecoveryRestartingNodeId": status.pointer("/quorumRecovery/restartingNodeId"),
+        "quorumRecoveryStabilizingNodeId": status.pointer("/quorumRecovery/stabilizingNodeId"),
+        "quorumRecoveryUnhealthyNodeId": status.pointer("/quorumRecovery/unhealthyNodeId"),
+        "quorumRecoveryRecyclingNodeId": status.pointer("/quorumRecovery/recyclingNodeId"),
+        "quorumRecoveryRecycleAttempts": status.pointer("/quorumRecovery/recycleAttempts"),
+        "quorumRecoveryRejectedNodeIds": status.pointer("/quorumRecovery/rejectedNodeIds"),
+        "quorumRecoveryUnreachableNodeIds": status.pointer("/quorumRecovery/unreachableNodeIds"),
     })
 }
 
@@ -6140,6 +8938,14 @@ fn log_status_transition(namespace: &str, name: &str, status: &Value) {
     let operation_mode = status_field(status, "/operation/mode");
     let operation_node_id = status_field(status, "/operation/nodeId");
     let operation_retry_count = status_field(status, "/operation/retryCount");
+    let quorum_recovery_epoch = status_field(status, "/quorumRecovery/epoch");
+    let quorum_recovery_phase = status_field(status, "/quorumRecovery/phase");
+    let quorum_recovery_seed_node_id = status_field(status, "/quorumRecovery/seedNodeId");
+    let quorum_recovery_restarting_node_id = status_field(status, "/quorumRecovery/restartingNodeId");
+    let quorum_recovery_stabilizing_node_id = status_field(status, "/quorumRecovery/stabilizingNodeId");
+    let quorum_recovery_unhealthy_node_id = status_field(status, "/quorumRecovery/unhealthyNodeId");
+    let quorum_recovery_recycling_node_id = status_field(status, "/quorumRecovery/recyclingNodeId");
+    let quorum_recovery_recycle_attempts = status_field(status, "/quorumRecovery/recycleAttempts");
     let message = status_field(status, "/message");
 
     let details = format!(
@@ -6149,12 +8955,24 @@ fn log_status_transition(namespace: &str, name: &str, status: &Value) {
          target_image={target_image} target_restart_at={target_restart_at} updated_replicas={updated_replicas} \
          leader_id={leader_id} members_ready={members_ready} draining_node_id={draining_node_id} \
          operation_type={operation_type} operation_phase={operation_phase} operation_mode={operation_mode} \
-         operation_retry_count={operation_retry_count} message={message:?} \
+         operation_retry_count={operation_retry_count} quorum_recovery_epoch={quorum_recovery_epoch} \
+         quorum_recovery_phase={quorum_recovery_phase} quorum_recovery_seed_node_id={quorum_recovery_seed_node_id} \
+         quorum_recovery_restarting_node_id={quorum_recovery_restarting_node_id} \
+         quorum_recovery_stabilizing_node_id={quorum_recovery_stabilizing_node_id} \
+         quorum_recovery_unhealthy_node_id={quorum_recovery_unhealthy_node_id} \
+         quorum_recovery_recycling_node_id={quorum_recovery_recycling_node_id} \
+         quorum_recovery_recycle_attempts={quorum_recovery_recycle_attempts} message={message:?} \
          namespace={namespace} cluster={name}"
     );
     if matches!(
         phase.as_str(),
-        "Degraded" | "ScaleInBlocked" | "ImageRolloutBlocked" | "RollingRestartBlocked"
+        "Degraded"
+            | "DegradedServing"
+            | "ScaleInBlocked"
+            | "ImageRolloutBlocked"
+            | "RollingRestartBlocked"
+            | "QuorumLost"
+            | "RecoveryBlocked"
     ) {
         log::warn!("{details}");
     } else {
@@ -6378,6 +9196,7 @@ fn membership_status_json(membership: &MembershipStatus, expected_replicas: i32)
         "appliedIndex": membership.applied_index,
         "committedIndex": membership.committed_index,
         "lastIndex": membership.last_index,
+        "clientStates": membership.client_states,
         "voters": membership.voters,
         "learners": membership.learners,
         "raftPeers": membership.raft_peers.iter().map(|peer| json!({
@@ -6390,6 +9209,8 @@ fn membership_status_json(membership: &MembershipStatus, expected_replicas: i32)
         })).collect::<Vec<_>>(),
         "businessPeers": membership.business_peers,
         "supports": membership.supports,
+        "quorumRecoveryActive": membership.quorum_recovery_active,
+        "quorumRecoveryEpoch": membership.quorum_recovery_epoch,
     })
 }
 
@@ -6560,12 +9381,73 @@ impl KubeClient {
         self.expect_success(res, path).await
     }
 
+    async fn merge_patch_response(&self, path: &str, patch: &Value) -> Result<Option<Value>> {
+        let body = patch.to_string();
+        let res = self
+            .send_with_retry(Method::PATCH, path, Some("application/merge-patch+json"), Some(&body))
+            .await?;
+        let status = res.status();
+        let text = match res.text().await {
+            Ok(text) => text,
+            Err(error) if status.is_success() => {
+                log::warn!(
+                    "Kubernetes merge patch succeeded but its response body could not be read; falling back to the requested patch for logging path={} error={}",
+                    path,
+                    error,
+                );
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(anyhow!(
+                    "kubernetes request failed: {path}: {status}; response body error: {error}"
+                ));
+            }
+        };
+        if !status.is_success() {
+            return Err(anyhow!("kubernetes request failed: {path}: {status} {text}"));
+        }
+        if text.trim().is_empty() {
+            log::warn!(
+                "Kubernetes merge patch returned an empty success response; falling back to the requested patch for logging path={}",
+                path,
+            );
+            return Ok(None);
+        }
+        match serde_json::from_str(&text) {
+            Ok(resource) => Ok(Some(resource)),
+            Err(error) => {
+                log::warn!(
+                    "Kubernetes merge patch succeeded but its response was not valid JSON; falling back to the requested patch for logging path={} error={}",
+                    path,
+                    error,
+                );
+                Ok(None)
+            }
+        }
+    }
+
     async fn delete(&self, path: &str) -> Result<()> {
         let res = self.send_with_retry(Method::DELETE, path, None, None).await?;
         if res.status() == StatusCode::NOT_FOUND {
             return Ok(());
         }
         self.expect_success(res, path).await
+    }
+
+    async fn delete_with_uid_precondition(&self, path: &str, uid: &str) -> Result<bool> {
+        if uid.is_empty() {
+            bail!("refusing to delete {path} without a Pod UID precondition");
+        }
+        let body = pod_delete_options(uid).to_string();
+        let res = self.send_with_retry(Method::DELETE, path, Some("application/json"), Some(&body)).await?;
+        if res.status() == StatusCode::NOT_FOUND {
+            return Ok(true);
+        }
+        if res.status() == StatusCode::CONFLICT {
+            return Ok(false);
+        }
+        self.expect_success(res, path).await?;
+        Ok(true)
     }
 
     fn request(&self, method: Method, path: &str) -> reqwest::RequestBuilder {
@@ -6668,6 +9550,398 @@ impl KubeClient {
 mod tests {
     use super::*;
 
+    fn recovery_observation(
+        node_id: i32,
+        applied_index: u64,
+        committed_index: u64,
+        client_states: usize,
+    ) -> LocalMembershipObservation {
+        LocalMembershipObservation {
+            node_id,
+            membership: MembershipStatus {
+                id: node_id,
+                started: true,
+                caught_up: applied_index >= committed_index,
+                snapshot_restored: true,
+                applied_index,
+                committed_index,
+                last_index: applied_index,
+                client_states,
+                voters: vec![1, 2, 3, 4, 5],
+                ..MembershipStatus::default()
+            },
+        }
+    }
+
+    #[test]
+    fn recovery_seed_prefers_the_most_advanced_survivor() {
+        let observations = vec![
+            recovery_observation(1, 100, 100, 50),
+            recovery_observation(2, 105, 105, 10),
+            recovery_observation(3, 103, 103, 100),
+        ];
+        assert_eq!(select_recovery_seed(&observations).map(|seed| seed.node_id), Some(2));
+    }
+
+    #[test]
+    fn recovery_seed_can_preserve_a_surviving_old_leader() {
+        let mut old_leader = recovery_observation(2, 105, 105, 20);
+        old_leader.membership.is_leader = true;
+        old_leader.membership.leader_id = Some(2);
+        // check_quorum has made the isolated old leader unavailable, so it is
+        // not authoritative for normal changes but its local state is usable.
+        old_leader.membership.available = false;
+        let observations = vec![recovery_observation(1, 100, 100, 30), old_leader];
+
+        assert!(observations
+            .iter()
+            .all(|observation| { !is_available_authoritative_leader(&observation.membership) }));
+        assert_eq!(select_recovery_seed(&observations).map(|seed| seed.node_id), Some(2));
+    }
+
+    #[test]
+    fn recovery_seed_uses_the_best_follower_when_the_old_leader_is_gone() {
+        let observations = vec![recovery_observation(1, 100, 100, 30), recovery_observation(3, 104, 104, 20)];
+
+        assert!(observations.iter().all(|observation| {
+            !observation.membership.is_leader && observation.membership.leader_id.is_none()
+        }));
+        assert_eq!(select_recovery_seed(&observations).map(|seed| seed.node_id), Some(3));
+    }
+
+    #[test]
+    fn stale_leader_identity_is_not_accepted_for_control_plane_changes() {
+        let mut membership = recovery_observation(1, 100, 100, 10).membership;
+        membership.is_leader = true;
+        membership.leader_id = Some(1);
+        membership.available = false;
+        assert!(is_authoritative_leader(&membership));
+        assert!(!is_available_authoritative_leader(&membership));
+
+        membership.available = true;
+        assert!(is_available_authoritative_leader(&membership));
+    }
+
+    #[test]
+    fn recovery_seed_uses_client_state_count_only_after_raft_progress() {
+        let observations = vec![recovery_observation(1, 100, 100, 10), recovery_observation(2, 100, 100, 20)];
+        assert_eq!(select_recovery_seed(&observations).map(|seed| seed.node_id), Some(2));
+    }
+
+    #[test]
+    fn quorum_recovery_counts_snapshot_restored_voters_even_without_a_leader() {
+        let mut observations = vec![
+            recovery_observation(1, 100, 100, 10),
+            recovery_observation(2, 100, 100, 10),
+            recovery_observation(6, 100, 100, 10),
+        ];
+        observations[0].membership.started = false;
+        observations[0].membership.available = false;
+        observations[1].membership.snapshot_restored = false;
+        assert_eq!(recoverable_voter_count(&observations, &[1, 2, 3, 4, 5]), 1);
+        assert_eq!(select_recovery_seed(&observations).map(|seed| seed.node_id), Some(1));
+    }
+
+    #[test]
+    fn recovery_seed_rejects_unverified_or_mismatched_local_state() {
+        let mut no_snapshot = recovery_observation(1, 100, 100, 10);
+        no_snapshot.membership.snapshot_restored = false;
+        let mut wrong_identity = recovery_observation(2, 110, 110, 20);
+        wrong_identity.membership.id = 1;
+        let mut no_voters = recovery_observation(3, 120, 120, 30);
+        no_voters.membership.voters.clear();
+        let observations = vec![no_snapshot, wrong_identity, no_voters];
+
+        assert!(select_recovery_seed(&observations).is_none());
+        assert_eq!(recoverable_voter_count(&observations, &[1, 2, 3, 4, 5]), 0);
+        assert_eq!(recovery_old_voters(&observations, 5), vec![1, 2, 3, 4, 5]);
+        assert!(recovery_survivor_node_ids(&observations).is_empty());
+        assert_eq!(recovery_rejected_node_ids(&observations), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn quorum_recovery_is_an_internal_availability_policy() {
+        assert_eq!(QUORUM_RECOVERY_DETECTION_SECONDS, 30);
+        assert_eq!(QUORUM_NATURAL_RECOVERY_SECONDS, 60);
+        assert_eq!(quorum_recovery_wait_seconds(), 90);
+
+        // A stale quorumRecovery field from an older CRD is ignored. Recovery
+        // behavior no longer depends on a per-cluster opt-in.
+        let spec: ClusterSpec = serde_json::from_value(json!({
+            "raft": {
+                "quorumRecovery": {
+                    "enabled": false,
+                    "action": "Wait",
+                    "allowEmptyBootstrap": false
+                }
+            }
+        }))
+        .unwrap();
+        validate_spec(&spec).unwrap();
+    }
+
+    fn recovery_ready_pod(node_id: i32) -> Pod {
+        serde_json::from_value(json!({
+            "metadata": {"name": format!("rmqtt-{}", node_id - 1)},
+            "status": {
+                "phase": "Running",
+                "conditions": [{"type": "Ready", "status": "True"}]
+            }
+        }))
+        .unwrap()
+    }
+
+    fn healthy_recovery_observation(node_id: i32, leader_id: i32) -> LocalMembershipObservation {
+        let mut observation = recovery_observation(node_id, 100, 100, 10);
+        observation.membership.leader_id = Some(leader_id);
+        observation.membership.available = true;
+        observation.membership.business_peers = vec![json!({"id": node_id})];
+        observation
+    }
+
+    #[test]
+    fn recovery_health_requires_both_ready_pod_and_responsive_local_membership() {
+        let pods = vec![recovery_ready_pod(2), recovery_ready_pod(3)];
+        let observations = vec![healthy_recovery_observation(2, 1)];
+
+        assert!(recovery_node_healthy(&pods, "rmqtt", &observations, 2, 1));
+        // A Ready Pod is not enough when its local membership request timed
+        // out. This is the regression that previously allowed recovery to
+        // move on and strand the next OrderedReady ordinal.
+        assert!(!recovery_node_healthy(&pods, "rmqtt", &observations, 3, 1));
+    }
+
+    #[test]
+    fn recovery_auto_recycle_requires_both_independent_failure_signals() {
+        assert!(!recovery_node_auto_recycle_candidate(true, true));
+        assert!(!recovery_node_auto_recycle_candidate(true, false));
+        assert!(!recovery_node_auto_recycle_candidate(false, true));
+        assert!(recovery_node_auto_recycle_candidate(false, false));
+    }
+
+    #[test]
+    fn recovery_pauses_when_a_previously_rebuilt_node_regresses() {
+        let pods = vec![recovery_ready_pod(1), recovery_ready_pod(2), recovery_ready_pod(3)];
+        let observations = vec![healthy_recovery_observation(1, 1), healthy_recovery_observation(2, 1)];
+        let recovery = QuorumRecoveryStatus {
+            seed_node_id: Some(1),
+            restarted_node_ids: vec![2, 3],
+            restarting_node_id: Some(4),
+            ..QuorumRecoveryStatus::default()
+        };
+
+        assert_eq!(unhealthy_rebuilt_node_ids(&recovery, &pods, "rmqtt", &observations, 1), vec![3]);
+    }
+
+    #[test]
+    fn recovery_requires_a_continuous_node_stabilization_window() {
+        let recovery = QuorumRecoveryStatus {
+            stabilizing_node_id: Some(2),
+            stabilizing_started_at: Some(
+                (Utc::now() - chrono::Duration::seconds(QUORUM_RECOVERY_NODE_STABILIZATION_SECONDS as i64))
+                    .to_rfc3339(),
+            ),
+            ..QuorumRecoveryStatus::default()
+        };
+
+        assert!(
+            recovery_node_stabilization_elapsed(&recovery, 2).unwrap_or_default()
+                >= QUORUM_RECOVERY_NODE_STABILIZATION_SECONDS
+        );
+        assert!(recovery_node_stabilization_elapsed(&recovery, 3).is_none());
+    }
+
+    #[test]
+    fn promoted_recovery_node_enters_stabilization_instead_of_running() {
+        let mut recovery = QuorumRecoveryStatus {
+            phase: "RebuildingQuorum".to_string(),
+            restarting_node_id: Some(5),
+            last_error: Some("old error".to_string()),
+            ..QuorumRecoveryStatus::default()
+        };
+
+        begin_recovery_node_stabilization(&mut recovery, 5);
+
+        assert_eq!(recovery.phase, "StabilizingRecoveryNode");
+        assert_ne!(recovery.phase, "Running");
+        assert_eq!(recovery.restarting_node_id, Some(5));
+        assert_eq!(recovery.stabilizing_node_id, Some(5));
+        assert!(recovery.stabilizing_started_at.is_some());
+        assert!(recovery.last_error.is_none());
+    }
+
+    #[test]
+    fn recovery_recycles_only_when_the_current_quorum_survives_the_restart() {
+        let recovery = QuorumRecoveryStatus { seed_node_id: Some(1), ..Default::default() };
+        let three_voters = MembershipStatus {
+            id: 1,
+            leader_id: Some(1),
+            voters: vec![1, 2, 3],
+            raft_peers: vec![RaftPeerStatus {
+                id: 2,
+                available: true,
+                recent_active: true,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(recovery_node_recycle_blocker(&recovery, &three_voters, 3).is_none());
+
+        let two_voters = MembershipStatus { voters: vec![1, 2], ..three_voters.clone() };
+        assert!(recovery_node_recycle_blocker(&recovery, &two_voters, 2)
+            .is_some_and(|blocker| blocker.contains("still requires quorum 2")));
+    }
+
+    #[test]
+    fn recovery_never_recycles_its_seed_or_leader() {
+        let recovery = QuorumRecoveryStatus { seed_node_id: Some(1), ..Default::default() };
+        let membership =
+            MembershipStatus { id: 1, leader_id: Some(1), voters: vec![1, 2, 3], ..Default::default() };
+
+        assert!(recovery_node_recycle_blocker(&recovery, &membership, 1)
+            .is_some_and(|blocker| blocker.contains("recovery seed")));
+    }
+
+    #[test]
+    fn recovery_seed_validation_requires_the_same_authoritative_epoch() {
+        let recovery = QuorumRecoveryStatus { epoch: 42, seed_node_id: Some(1), ..Default::default() };
+        let valid = MembershipStatus {
+            id: 1,
+            leader_id: Some(1),
+            is_leader: true,
+            started: true,
+            available: true,
+            quorum_recovery_epoch: 42,
+            ..Default::default()
+        };
+        assert!(recovery_seed_membership_blocker(&recovery, &valid).is_none());
+
+        let wrong_leader = MembershipStatus { id: 2, leader_id: Some(2), ..valid.clone() };
+        assert!(recovery_seed_membership_blocker(&recovery, &wrong_leader)
+            .is_some_and(|blocker| blocker.contains("recovery seed")));
+
+        let wrong_epoch = MembershipStatus { quorum_recovery_epoch: 41, ..valid };
+        assert!(recovery_seed_membership_blocker(&recovery, &wrong_epoch)
+            .is_some_and(|blocker| blocker.contains("operator recovery epoch is 42")));
+    }
+
+    #[test]
+    fn recovery_pod_delete_uses_a_uid_precondition() {
+        let options = pod_delete_options("pod-uid-123");
+        assert_eq!(options["kind"], "DeleteOptions");
+        assert_eq!(options["preconditions"]["uid"], "pod-uid-123");
+    }
+
+    #[test]
+    fn recovery_unhealthy_window_and_recycle_attempts_are_persisted() {
+        let mut recycle_attempts = BTreeMap::new();
+        recycle_attempts.insert("3".to_string(), 2);
+        let recovery = QuorumRecoveryStatus {
+            unhealthy_node_id: Some(3),
+            unhealthy_started_at: Some(
+                (Utc::now() - chrono::Duration::seconds(QUORUM_RECOVERY_NODE_UNHEALTHY_GRACE_SECONDS as i64))
+                    .to_rfc3339(),
+            ),
+            recycling_node_id: Some(3),
+            recycling_pod_uid: Some("old-pod-uid".to_string()),
+            recycle_attempts,
+            ..Default::default()
+        };
+
+        assert!(
+            recovery_node_unhealthy_elapsed(&recovery, 3).unwrap_or_default()
+                >= QUORUM_RECOVERY_NODE_UNHEALTHY_GRACE_SECONDS
+        );
+        assert_eq!(recovery_node_recycle_attempts(&recovery, 3), 2);
+        assert_eq!(recovery_node_recycle_attempts(&recovery, 4), 0);
+        let status = quorum_recovery_status_json(&recovery);
+        assert_eq!(status["recyclingPodUid"], "old-pod-uid");
+        assert_eq!(status["recycleAttempts"]["3"], 2);
+    }
+
+    #[test]
+    fn recovery_scan_logs_on_change_or_heartbeat() {
+        let now = Instant::now();
+        let signature = json!({"unreachableNodeIds": [3, 4, 5]});
+        assert!(recovery_scan_log_due(None, &signature, now));
+
+        let recent = RecoveryScanLogEntry { signature: signature.clone(), logged_at: now };
+        assert!(!recovery_scan_log_due(Some(&recent), &signature, now));
+        assert!(recovery_scan_log_due(Some(&recent), &json!({"unreachableNodeIds": [4, 5]}), now));
+
+        let stale = RecoveryScanLogEntry {
+            signature: signature.clone(),
+            logged_at: now - Duration::from_secs(RECOVERY_SCAN_LOG_HEARTBEAT_SECONDS),
+        };
+        assert!(recovery_scan_log_due(Some(&stale), &signature, now));
+    }
+
+    #[test]
+    fn client_service_publishes_not_ready_addresses_only_for_verified_degraded_mode() {
+        let normal: RmqttCluster = serde_json::from_value(json!({
+            "metadata": {"name": "rmqtt"},
+            "status": {"phase": "Running"}
+        }))
+        .unwrap();
+        assert!(!degraded_client_endpoints_enabled(&normal));
+        assert_eq!(
+            client_service_object("rmqtt-test", &normal, false)["spec"]["publishNotReadyAddresses"],
+            false
+        );
+
+        let transient: RmqttCluster = serde_json::from_value(json!({
+            "metadata": {"name": "rmqtt"},
+            "status": {"phase": "WaitingRaftLeader"}
+        }))
+        .unwrap();
+        assert!(!degraded_client_endpoints_enabled(&transient));
+
+        let observation_only: RmqttCluster = serde_json::from_value(json!({
+            "metadata": {"name": "rmqtt"},
+            "status": {"phase": "DegradedServing"}
+        }))
+        .unwrap();
+        assert!(degraded_client_endpoints_enabled(&observation_only));
+
+        let unverified_recovery: RmqttCluster = serde_json::from_value(json!({
+            "metadata": {"name": "rmqtt"},
+            "status": {
+                "phase": "RecoveryBlocked",
+                "quorumRecovery": {"phase": "RecoveryBlocked"}
+            }
+        }))
+        .unwrap();
+        assert!(!degraded_client_endpoints_enabled(&unverified_recovery));
+
+        let recovering: RmqttCluster = serde_json::from_value(json!({
+            "metadata": {"name": "rmqtt"},
+            "status": {
+                "phase": "RecoveryBlocked",
+                "quorumRecovery": {
+                    "phase": "RecoveryBlocked",
+                    "survivorNodeIds": [1]
+                }
+            }
+        }))
+        .unwrap();
+        assert!(degraded_client_endpoints_enabled(&recovering));
+        assert_eq!(
+            client_service_object("rmqtt-test", &recovering, true)["spec"]["publishNotReadyAddresses"],
+            true
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_wait_for_a_learner_before_its_pod_exists() {
+        let pods = vec![recovery_ready_pod(1), recovery_ready_pod(2)];
+
+        assert_eq!(missing_recovery_target_blockers(&pods, "rmqtt", 4), Some(vec![3]));
+
+        let mut with_target = pods;
+        with_target.push(recovery_ready_pod(4));
+        assert_eq!(missing_recovery_target_blockers(&with_target, "rmqtt", 4), None);
+    }
+
     #[test]
     fn status_log_signature_deduplicates_message_only_updates() {
         let first = json!({
@@ -6721,6 +9995,49 @@ mod tests {
     }
 
     #[test]
+    fn status_transition_log_uses_complete_server_status() {
+        let requested_status = json!({
+            "phase": "PromotingRaftLearner",
+            "operation": {"type": "AddLearnerAndPromote", "nodeId": 5}
+        });
+        let patched_resource = json!({
+            "status": {
+                "phase": "PromotingRaftLearner",
+                "operation": {"type": "AddLearnerAndPromote", "nodeId": 5},
+                "quorumRecovery": {
+                    "epoch": 42,
+                    "phase": "RebuildingQuorum",
+                    "seedNodeId": 1,
+                    "restartingNodeId": 5
+                }
+            }
+        });
+
+        let logged = status_for_transition_log(&requested_status, Some(&patched_resource));
+
+        assert_eq!(status_field(logged, "/quorumRecovery/epoch"), "42");
+        assert_eq!(status_field(logged, "/quorumRecovery/phase"), "RebuildingQuorum");
+        assert_eq!(status_field(logged, "/quorumRecovery/restartingNodeId"), "5");
+    }
+
+    #[test]
+    fn status_transition_log_reflects_server_side_recovery_clear() {
+        let requested_status = json!({
+            "phase": "Running",
+            "quorumRecovery": null
+        });
+        let patched_resource = json!({
+            "status": {
+                "phase": "Running"
+            }
+        });
+
+        let logged = status_for_transition_log(&requested_status, Some(&patched_resource));
+
+        assert_eq!(status_field(logged, "/quorumRecovery/phase"), "-");
+    }
+
+    #[test]
     fn stateful_set_bootstrap_annotation_is_explicit() {
         let enabled: StatefulSet = serde_json::from_value(json!({
             "metadata": {"annotations": {"rmqtt.io/raft-bootstrap-allowed": "true"}},
@@ -6753,7 +10070,10 @@ mod tests {
             "spec": {
                 "replicas": 3,
                 "template": {
+                    "metadata": {"annotations": {}},
                     "spec": {
+                        "enableServiceLinks": false,
+                        "terminationGracePeriodSeconds": 30,
                         "containers": [{
                             "name": "rmqtt",
                             "image": "example/rmqtt:new",
@@ -6764,13 +10084,17 @@ mod tests {
             }
         }))
         .unwrap();
+        assert!(matching.broker_image_matches(&spec));
         assert!(matching.broker_template_matches(&spec));
 
         let stale_image: StatefulSet = serde_json::from_value(json!({
             "spec": {
                 "replicas": 3,
                 "template": {
+                    "metadata": {"annotations": {}},
                     "spec": {
+                        "enableServiceLinks": false,
+                        "terminationGracePeriodSeconds": 30,
                         "containers": [{
                             "name": "rmqtt",
                             "image": "example/rmqtt:old",
@@ -6787,7 +10111,10 @@ mod tests {
             "spec": {
                 "replicas": 3,
                 "template": {
+                    "metadata": {"annotations": {}},
                     "spec": {
+                        "enableServiceLinks": false,
+                        "terminationGracePeriodSeconds": 30,
                         "containers": [{
                             "name": "rmqtt",
                             "image": "example/rmqtt:new",
@@ -6799,6 +10126,98 @@ mod tests {
         }))
         .unwrap();
         assert!(!stale_pull_policy.broker_template_matches(&spec));
+    }
+
+    #[test]
+    fn stateful_set_detects_pod_scheduling_template_drift() {
+        let spec: ClusterSpec = serde_json::from_value(json!({
+            "image": "example/rmqtt:test",
+            "imagePullPolicy": "IfNotPresent",
+            "pod": {
+                "annotations": {"ams.studio.sensecore.cn/scheduler": "volcano"},
+                "serviceAccountName": "ams-rmqtt",
+                "imagePullSecrets": [{"name": "image-pull-secret-public"}],
+                "schedulerName": "default-scheduler",
+                "affinity": {
+                    "nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {}},
+                    "podAntiAffinity": {
+                        "requiredDuringSchedulingIgnoredDuringExecution": [{
+                            "labelSelector": {"matchLabels": {"app.kubernetes.io/name": "rmqtt"}},
+                            "topologyKey": "kubernetes.io/hostname"
+                        }]
+                    }
+                },
+                "tolerations": [{"key": "dedicated", "operator": "Exists"}],
+                "enableServiceLinks": false,
+                "terminationGracePeriodSeconds": 30
+            }
+        }))
+        .unwrap();
+        let matching: StatefulSet = serde_json::from_value(json!({
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "ams.studio.sensecore.cn/scheduler": "volcano",
+                            "kubectl.kubernetes.io/restartedAt": "2026-09-04T14:01:31+08:00"
+                        }
+                    },
+                    "spec": {
+                        "serviceAccountName": "ams-rmqtt",
+                        "imagePullSecrets": [{"name": "image-pull-secret-public"}],
+                        "schedulerName": "default-scheduler",
+                        "affinity": {
+                            "nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {}},
+                            "podAntiAffinity": {
+                                "requiredDuringSchedulingIgnoredDuringExecution": [{
+                                    "labelSelector": {"matchLabels": {"app.kubernetes.io/name": "rmqtt"}},
+                                    "topologyKey": "kubernetes.io/hostname"
+                                }]
+                            }
+                        },
+                        "tolerations": [{"key": "dedicated", "operator": "Exists"}],
+                        "enableServiceLinks": false,
+                        "terminationGracePeriodSeconds": 30,
+                        "containers": [{
+                            "name": "rmqtt",
+                            "image": "example/rmqtt:test",
+                            "imagePullPolicy": "IfNotPresent"
+                        }]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert!(matching.broker_template_matches(&spec));
+
+        let missing_pod_anti_affinity: StatefulSet = serde_json::from_value(json!({
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {"ams.studio.sensecore.cn/scheduler": "volcano"}
+                    },
+                    "spec": {
+                        "serviceAccountName": "ams-rmqtt",
+                        "imagePullSecrets": [{"name": "image-pull-secret-public"}],
+                        "schedulerName": "default-scheduler",
+                        "affinity": {
+                            "nodeAffinity": {"requiredDuringSchedulingIgnoredDuringExecution": {}}
+                        },
+                        "tolerations": [{"key": "dedicated", "operator": "Exists"}],
+                        "enableServiceLinks": false,
+                        "terminationGracePeriodSeconds": 30,
+                        "containers": [{
+                            "name": "rmqtt",
+                            "image": "example/rmqtt:test",
+                            "imagePullPolicy": "IfNotPresent"
+                        }]
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        assert!(missing_pod_anti_affinity.broker_image_matches(&spec));
+        assert!(!missing_pod_anti_affinity.broker_template_matches(&spec));
     }
 
     #[test]
@@ -6870,6 +10289,7 @@ mod tests {
         assert!(RENDER_SCRIPT.contains("listener.ws.external.addr"));
         assert!(RENDER_SCRIPT.contains("listener.wss.external.addr"));
         assert!(RENDER_SCRIPT.contains("rmqtt-cluster-broadcast.toml"));
+        assert!(RENDER_SCRIPT.contains("health.exit_on_node_unavailable = false"));
     }
 
     #[test]
@@ -7434,6 +10854,7 @@ mod tests {
         assert!(connection.is_transient());
         assert!(!http.is_transient());
         assert!(!invalid.is_transient());
+        assert_eq!(connection.kind.label(), "connection");
     }
 
     #[test]

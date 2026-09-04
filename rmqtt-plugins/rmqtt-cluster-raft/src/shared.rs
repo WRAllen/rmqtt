@@ -458,6 +458,36 @@ impl ClusterShared {
         self.nodes.grpc_client(node_id)
     }
 
+    #[inline]
+    fn grpc_client_with_generation(&self, node_id: u64) -> Option<(u64, GrpcClient)> {
+        self.nodes.grpc_client_with_generation(node_id)
+    }
+
+    /// Schedule a best-effort repair for future requests after a transport
+    /// failure. The failed request itself is never replayed here because the
+    /// caller cannot know whether the remote broker accepted it.
+    fn schedule_grpc_client_repair(&self, node_id: NodeId, failed_generation: u64, operation: &'static str) {
+        let nodes = self.nodes.clone();
+        if !nodes.try_begin_grpc_client_repair(node_id, failed_generation) {
+            return;
+        }
+        let message_type = self.message_type;
+        tokio::spawn(async move {
+            let result =
+                nodes.repair_grpc_client_after_failure(node_id, failed_generation, message_type).await;
+            nodes.finish_grpc_client_repair(node_id, failed_generation);
+            match result {
+                Ok(true) => log::info!(
+                    "business gRPC client repaired after {operation} failure, node_id={node_id}, failed_generation={failed_generation}"
+                ),
+                Ok(false) => {}
+                Err(error) => log::warn!(
+                    "business gRPC client repair failed after {operation} failure, node_id={node_id}, failed_generation={failed_generation}, error={error:?}"
+                ),
+            }
+        });
+    }
+
     /// During an operator-coordinated drain, a route selected immediately
     /// before session takeover can still point at the previous owner. Preserve
     /// that delivery in the same reliable queue as other drain-window traffic.
@@ -501,8 +531,25 @@ impl ClusterShared {
         }
     }
 
-    #[inline]
-    pub(crate) fn prepare_drain(&self, node_id: NodeId, allowed_targets: Option<Vec<NodeId>>) -> bool {
+    pub(crate) async fn prepare_drain(
+        &self,
+        node_id: NodeId,
+        allowed_targets: Option<Vec<NodeId>>,
+    ) -> Result<(bool, bool)> {
+        if !self.handoff.enabled() {
+            return Ok((false, false));
+        }
+
+        // The operator invokes prepare_drain on every broker before it
+        // diverts traffic. Verify the same bidirectional business gRPC path
+        // that forwarding uses, and repair a stale client once if necessary.
+        // This runs only during planned maintenance, never on the normal
+        // publish path.
+        let grpc_client_refreshed =
+            self.nodes.ensure_grpc_client_ready(node_id, self.message_type).await.map_err(|error| {
+                anyhow!("business gRPC preflight to drain target node {node_id} failed: {error:#}")
+            })?;
+
         if let Some(allowed_targets) = allowed_targets {
             let allowed_targets =
                 allowed_targets.into_iter().filter(|target_id| *target_id != node_id).collect::<HashSet<_>>();
@@ -510,7 +557,7 @@ impl ClusterShared {
         } else {
             self.drain_allowed_targets.remove(&node_id);
         }
-        self.handoff.prepare_drain(node_id)
+        Ok((self.handoff.prepare_drain(node_id), grpc_client_refreshed))
     }
 
     #[inline]
@@ -761,11 +808,19 @@ impl ClusterShared {
         target_node_id: NodeId,
         handoff: &SessionHandoff,
     ) -> Result<SessionHandoffReply> {
-        let mut client = self
-            .grpc_client(target_node_id)
+        let (client_generation, mut client) = self
+            .grpc_client_with_generation(target_node_id)
             .ok_or_else(|| anyhow!("grpc client for node {target_node_id} does not exist"))?;
         let data = RaftGrpcMessage::SessionHandoff(handoff.clone()).encode()?;
-        match client.send_message(self.message_type, Message::Data(data), Some(self.rw_timeout)).await? {
+        let reply = client.send_message(self.message_type, Message::Data(data), Some(self.rw_timeout)).await;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.schedule_grpc_client_repair(target_node_id, client_generation, "session handoff");
+                return Err(error);
+            }
+        };
+        match reply {
             MessageReply::Data(data) => {
                 let RaftGrpcMessageReply::SessionHandoff(reply) = RaftGrpcMessageReply::decode(&data)? else {
                     return Err(anyhow!("unexpected session handoff reply from node {target_node_id}"));
@@ -1062,8 +1117,8 @@ impl ClusterShared {
         target_node_id: NodeId,
         batch: &[PendingHandoff],
     ) -> Result<Vec<HandoffResult>> {
-        let mut batch_client = self
-            .grpc_client(target_node_id)
+        let (client_generation, mut batch_client) = self
+            .grpc_client_with_generation(target_node_id)
             .ok_or_else(|| anyhow!("grpc client for node {target_node_id} does not exist"))?;
         let forwards = batch
             .iter()
@@ -1076,8 +1131,16 @@ impl ClusterShared {
             })
             .collect();
         let data = RaftGrpcMessage::ReliableForwardBatch(forwards).encode()?;
-        match batch_client.send_message(self.message_type, Message::Data(data), Some(self.rw_timeout)).await?
-        {
+        let reply =
+            batch_client.send_message(self.message_type, Message::Data(data), Some(self.rw_timeout)).await;
+        let reply = match reply {
+            Ok(reply) => reply,
+            Err(error) => {
+                self.schedule_grpc_client_repair(target_node_id, client_generation, "reliable handoff batch");
+                return Err(error);
+            }
+        };
+        match reply {
             MessageReply::Data(data) => {
                 let RaftGrpcMessageReply::ReliableForwardBatch(statuses) =
                     RaftGrpcMessageReply::decode(&data)?
@@ -1259,7 +1322,9 @@ impl ClusterShared {
                 }
                 ForwardMode::Plain(plain_forward) => {
                     //forward other node
-                    if let Some(target_client) = self.grpc_client(target_nodeid) {
+                    if let Some((client_generation, target_client)) =
+                        self.grpc_client_with_generation(target_nodeid)
+                    {
                         let retry_from = from.clone();
                         let retry_publish = publish.clone();
                         let retry_relation = relations[0].clone();
@@ -1312,6 +1377,11 @@ impl ClusterShared {
                                 Err(e) => {
                                     log::warn!(
                                         "forwards Message::ForwardsTo to other node, to: {target_nodeid:?}, error: {e:?}"
+                                    );
+                                    shared.schedule_grpc_client_repair(
+                                        target_nodeid,
+                                        client_generation,
+                                        "direct forward",
                                     );
                                     if shared.handoff.is_draining_target(target_nodeid) {
                                         // A transport failure cannot tell whether the plain
@@ -1383,7 +1453,9 @@ impl ClusterShared {
                         }
                     }
                     ForwardMode::Plain(plain_forward) => {
-                        if let Some(mut client) = self.grpc_client(node_id) {
+                        if let Some((client_generation, mut client)) =
+                            self.grpc_client_with_generation(node_id)
+                        {
                             let from = from.clone();
                             let publish = publish.clone();
                             let retry_from = from.clone();
@@ -1397,7 +1469,14 @@ impl ClusterShared {
                                     Message::ForwardsTo(from, publish, relations),
                                     Some(rw_timeout),
                                 );
-                                (node_id, retry_from, retry_publish, retry_relations, msg_sender.await)
+                                (
+                                    node_id,
+                                    client_generation,
+                                    retry_from,
+                                    retry_publish,
+                                    retry_relations,
+                                    msg_sender.await,
+                                )
                             };
                             fut_senders.push(fut_sender.boxed());
                         } else {
@@ -1430,7 +1509,7 @@ impl ClusterShared {
                 let shared = self.clone();
                 let forwards_fut = async move {
                     let replys = futures::future::join_all(fut_senders).await;
-                    for (node_id, from, publish, relations, reply) in replys {
+                    for (node_id, client_generation, from, publish, relations, reply) in replys {
                         match reply {
                             Ok(MessageReply::Success) => {}
                             Ok(reply) => {
@@ -1459,6 +1538,11 @@ impl ClusterShared {
                             Err(e) => {
                                 log::warn!(
                                     "forwards Message::ForwardsTo to other node, from: {from:?}, to: {node_id:?}, error: {e:?}"
+                                );
+                                shared.schedule_grpc_client_repair(
+                                    node_id,
+                                    client_generation,
+                                    "subscription fan-out",
                                 );
                                 if shared.handoff.is_draining_target(node_id) {
                                     shared.handoff.mark_ambiguous_plain_failure();

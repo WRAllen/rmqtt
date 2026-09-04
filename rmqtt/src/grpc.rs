@@ -172,6 +172,26 @@ pub struct GrpcClient {
 }
 
 impl GrpcClient {
+    fn connect_lazy(
+        server_addr: &str,
+        client_timeout: Duration,
+        client_concurrency_limit: usize,
+    ) -> Result<Client> {
+        Client::new(server_addr.into())
+            .connect_timeout(client_timeout)
+            .concurrency_limit(client_concurrency_limit)
+            .chunk_size(1024 * 1024 * 2)
+            .connect_lazy()
+            .map_err(Into::into)
+    }
+
+    async fn from_client(mut client: Client) -> Self {
+        let duplex_mailbox = client.duplex_transfer_start(100_000).await;
+        let mailbox = client.transfer_start(100_000).await;
+        let active_tasks = Arc::new(Counter::new());
+        Self { mailbox, duplex_mailbox, active_tasks }
+    }
+
     //server_addr - ip:port, 127.0.0.1:6666
     #[inline]
     pub async fn new(
@@ -182,15 +202,29 @@ impl GrpcClient {
         log::info!(
             "GrpcClient::new server_addr: {server_addr}, client_concurrency_limit: {client_concurrency_limit}"
         );
-        let mut c = Client::new(server_addr.into())
-            .connect_timeout(client_timeout)
-            .concurrency_limit(client_concurrency_limit)
-            .chunk_size(1024 * 1024 * 2)
-            .connect_lazy()?;
-        let duplex_mailbox = c.duplex_transfer_start(100_000).await;
-        let mailbox = c.transfer_start(100_000).await;
-        let active_tasks = Arc::new(Counter::new());
-        Ok(Self { mailbox, duplex_mailbox, active_tasks })
+        let client = Self::connect_lazy(server_addr, client_timeout, client_concurrency_limit)?;
+        Ok(Self::from_client(client).await)
+    }
+
+    /// Verify that the remote application can process a request before
+    /// starting the long-lived transfer streams. This is intended for rare
+    /// client-repair paths, not normal message delivery.
+    pub async fn new_with_probe(
+        server_addr: &str,
+        client_timeout: Duration,
+        client_concurrency_limit: usize,
+        typ: MessageType,
+        msg: Message,
+        probe_timeout: Duration,
+    ) -> Result<(Self, MessageReply)> {
+        log::info!(
+            "GrpcClient::new_with_probe server_addr: {server_addr}, client_concurrency_limit: {client_concurrency_limit}"
+        );
+        let mut client = Self::connect_lazy(server_addr, client_timeout, client_concurrency_limit)?;
+        let request = msg.encode(typ)?;
+        let response = tokio::time::timeout(probe_timeout, client.send(request)).await??;
+        let reply = MessageReply::decode(&response)?;
+        Ok((Self::from_client(client).await, reply))
     }
 
     #[inline]

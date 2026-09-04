@@ -5,6 +5,13 @@ use async_trait::async_trait;
 use backoff::{future::retry, ExponentialBackoff};
 use rust_box::task_exec_queue::{SpawnExt, TaskExecQueue};
 
+use super::config::PluginConfig;
+use super::message::{Message, RaftGrpcMessage, RaftGrpcMessageReply};
+use super::router::ClusterRouter;
+use super::{
+    hook_message_dropped,
+    shared::{effective_source_session_policy, ClusterShared},
+};
 use rmqtt::context::ServerContext;
 use rmqtt::{
     grpc::{Message as GrpcMessage, MessageReply},
@@ -12,21 +19,13 @@ use rmqtt::{
     shared::Shared,
     types::Id,
 };
-use rmqtt_raft::Mailbox;
-
-use super::config::PluginConfig;
-use super::message::{Message, RaftGrpcMessage, RaftGrpcMessageReply};
-use super::{
-    hook_message_dropped,
-    shared::{effective_source_session_policy, ClusterShared},
-};
 
 pub(crate) struct HookHandler {
     scx: ServerContext,
     exec: TaskExecQueue,
     backoff_strategy: ExponentialBackoff,
     shared: ClusterShared,
-    raft_mailbox: Mailbox,
+    router: ClusterRouter,
 }
 
 impl HookHandler {
@@ -35,11 +34,11 @@ impl HookHandler {
         cfg: Arc<PluginConfig>,
         backoff_strategy: ExponentialBackoff,
         shared: ClusterShared,
-        raft_mailbox: Mailbox,
+        router: ClusterRouter,
     ) -> Self {
         let exec =
             scx.get_exec(("RAFT_DISCONNECTED_EXEC", cfg.task_exec_queue_workers, cfg.task_exec_queue_max));
-        Self { scx, exec, backoff_strategy, shared, raft_mailbox }
+        Self { scx, exec, backoff_strategy, shared, router }
     }
 }
 
@@ -57,13 +56,13 @@ impl Handler for HookHandler {
                             log::warn!("HookHandler, Message::Disconnected, message encode error, {e:?}");
                         }
                         Ok(msg) => {
-                            let raft_mailbox = self.raft_mailbox.clone();
+                            let router = self.router.clone();
                             let exec = self.exec.clone();
                             let backoff_strategy = self.backoff_strategy.clone();
                             tokio::spawn(async move {
                                 if let Err(e) = retry(backoff_strategy, || async {
                                     let msg = msg.clone();
-                                    let mailbox = raft_mailbox.clone();
+                                    let mailbox = router.raft_mailbox().await;
                                     let res = async move { mailbox.send_proposal(msg).await }
                                         .spawn(&exec)
                                         .result()
@@ -95,13 +94,13 @@ impl Handler for HookHandler {
                         log::warn!("HookHandler, Message::SessionTerminated, message encode error, {e:?}");
                     }
                     Ok(msg) => {
-                        let raft_mailbox = self.raft_mailbox.clone();
+                        let router = self.router.clone();
                         let exec = self.exec.clone();
                         let backoff_strategy = self.backoff_strategy.clone();
                         tokio::spawn(async move {
                             if let Err(e) = retry(backoff_strategy, || async {
                                 let msg = msg.clone();
-                                let mailbox = raft_mailbox.clone();
+                                let mailbox = router.raft_mailbox().await;
                                 let res = async move { mailbox.send_proposal(msg).await }
                                     .spawn(&exec)
                                     .result()

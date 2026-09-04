@@ -3,8 +3,9 @@
 
 use std::collections::HashSet;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -14,8 +15,8 @@ use config::PluginConfig;
 use handler::HookHandler;
 use rust_box::task_exec_queue::TaskExecQueue;
 use serde_json::{self, json};
-use tokio::sync::oneshot;
-use tokio::time::sleep;
+use tokio::sync::{oneshot, Mutex};
+use tokio::time::{sleep, timeout};
 
 use nodes::ClusterNodeManager;
 use rmqtt::{
@@ -67,6 +68,17 @@ impl OrphanedRouterReconcile {
 
 register!(ClusterPlugin::new);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RaftStartMode {
+    Configured,
+    ForceLeader,
+}
+
+struct RaftRuntime {
+    mailbox: Mailbox,
+    thread: Option<JoinHandle<()>>,
+}
+
 #[derive(Plugin)]
 struct ClusterPlugin {
     scx: ServerContext,
@@ -75,7 +87,9 @@ struct ClusterPlugin {
     nodes: ClusterNodeManager,
     shared: ClusterShared,
     router: ClusterRouter,
-    raft_mailbox: Option<Mailbox>,
+    raft_runtime: Arc<Mutex<Option<RaftRuntime>>>,
+    recovery_active: Arc<AtomicBool>,
+    recovery_epoch: Arc<AtomicU64>,
     draining: Arc<AtomicBool>,
     disconnecting: Arc<AtomicBool>,
     force_drain_finalized: Arc<AtomicBool>,
@@ -124,7 +138,9 @@ impl ClusterPlugin {
             cfg.task_exec_queue_workers,
             cfg.node_grpc_client_timeout,
         );
-        let raft_mailbox = None;
+        let raft_runtime = Arc::new(Mutex::new(None));
+        let recovery_active = Arc::new(AtomicBool::new(false));
+        let recovery_epoch = Arc::new(AtomicU64::new(0));
         let disconnecting = Arc::new(AtomicBool::new(false));
         let force_drain_finalized = Arc::new(AtomicBool::new(false));
         let drain_message_queue_drops_start = Arc::new(AtomicIsize::new(0));
@@ -137,7 +153,9 @@ impl ClusterPlugin {
             nodes,
             shared,
             router,
-            raft_mailbox,
+            raft_runtime,
+            recovery_active,
+            recovery_epoch,
             draining,
             disconnecting,
             force_drain_finalized,
@@ -153,7 +171,8 @@ impl ClusterPlugin {
         scx: &ServerContext,
         cfg: Arc<PluginConfig>,
         router: ClusterRouter,
-    ) -> Result<Mailbox> {
+        mode: RaftStartMode,
+    ) -> Result<RaftRuntime> {
         // let logger = Runtime::instance().logger.clone();
         let raft_peer_addrs = cfg.raft_peer_addrs.clone();
 
@@ -193,76 +212,82 @@ impl ClusterPlugin {
         }
         log::info!("peer_addrs: {peer_addrs:?}");
 
-        let leader_info = match cfg.bootstrap {
-            Some(true) => {
-                let bootstrap_node = cfg
-                    .leader()?
-                    .ok_or_else(|| anyhow!("controlled bootstrap requires a non-zero leader_id"))?;
-                if id != bootstrap_node.id {
-                    return Err(anyhow!(
+        let leader_info = if mode == RaftStartMode::ForceLeader {
+            log::warn!("forcing node {id} to bootstrap a new singleton raft configuration");
+            None
+        } else {
+            match cfg.bootstrap {
+                Some(true) => {
+                    let bootstrap_node = cfg
+                        .leader()?
+                        .ok_or_else(|| anyhow!("controlled bootstrap requires a non-zero leader_id"))?;
+                    if id != bootstrap_node.id {
+                        return Err(anyhow!(
                         "node {id} is not the configured bootstrap node {}; refusing to create a new raft cluster",
                         bootstrap_node.id
                     ));
-                }
-
-                // An explicitly authorized bootstrap node still checks for an
-                // already-running leader before creating a new cluster. The
-                // operator only enables this mode while the StatefulSet has a
-                // single initial pod.
-                let actual_leader_info = find_actual_leader_retry(&raft, peer_addrs, 3).await?;
-                if actual_leader_info.is_some() {
-                    log::info!("Leader already exists, {actual_leader_info:?}");
-                } else {
-                    log::info!("No existing leader found; controlled bootstrap is enabled for node {id}");
-                }
-                actual_leader_info
-            }
-            Some(false) => {
-                // Existing-cluster mode is deliberately fail-closed: DNS,
-                // networking, and leader discovery failures must never be
-                // interpreted as permission to create another raft cluster.
-                log::info!("Controlled bootstrap is disabled; waiting for an existing leader ...");
-                let actual_leader_info = find_actual_leader_retry(&raft, peer_addrs, 60).await?;
-                Some(
-                    actual_leader_info
-                        .ok_or_else(|| anyhow!("Leader does not exist; controlled bootstrap is disabled"))?,
-                )
-            }
-            None => match cfg.leader()? {
-                Some(leader_info) => {
-                    log::info!("Specify a leader: {leader_info:?}");
-                    if id == leader_info.id {
-                        //First, check if the Leader exists.
-                        let actual_leader_info = find_actual_leader(&raft, peer_addrs, 3).await?;
-                        if actual_leader_info.is_some() {
-                            log::info!("Leader already exists, {actual_leader_info:?}");
-                        }
-                        actual_leader_info
-                    } else {
-                        //The other nodes are leader.
-                        let actual_leader_info = find_actual_leader(&raft, peer_addrs, 60).await?;
-                        let (actual_leader_id, actual_leader_addr) =
-                            actual_leader_info.ok_or_else(|| anyhow!("Leader does not exist"))?;
-                        if actual_leader_id != leader_info.id {
-                            return Err(anyhow!(format!(
-                                "Not the expected Leader, the expected one is {:?}",
-                                leader_info
-                            )));
-                        }
-                        Some((actual_leader_id, actual_leader_addr))
                     }
+
+                    // An explicitly authorized bootstrap node still checks for an
+                    // already-running leader before creating a new cluster. The
+                    // operator only enables this mode while the StatefulSet has a
+                    // single initial pod.
+                    let actual_leader_info = find_actual_leader_retry(&raft, peer_addrs, 3).await?;
+                    if actual_leader_info.is_some() {
+                        log::info!("Leader already exists, {actual_leader_info:?}");
+                    } else {
+                        log::info!("No existing leader found; controlled bootstrap is enabled for node {id}");
+                    }
+                    actual_leader_info
                 }
-                None => {
-                    log::info!("Search for the existing leader ... ");
-                    let leader_info = raft.find_leader_info(peer_addrs).await.map_err(|e| anyhow!(e))?;
-                    log::info!("The information about the located leader: {leader_info:?}");
-                    leader_info
+                Some(false) => {
+                    // Existing-cluster mode is deliberately fail-closed: DNS,
+                    // networking, and leader discovery failures must never be
+                    // interpreted as permission to create another raft cluster.
+                    log::info!("Controlled bootstrap is disabled; waiting for an existing leader ...");
+                    let actual_leader_info = find_actual_leader_retry(&raft, peer_addrs, 60).await?;
+                    Some(
+                        actual_leader_info.ok_or_else(|| {
+                            anyhow!("Leader does not exist; controlled bootstrap is disabled")
+                        })?,
+                    )
                 }
-            },
+                None => match cfg.leader()? {
+                    Some(leader_info) => {
+                        log::info!("Specify a leader: {leader_info:?}");
+                        if id == leader_info.id {
+                            //First, check if the Leader exists.
+                            let actual_leader_info = find_actual_leader(&raft, peer_addrs, 3).await?;
+                            if actual_leader_info.is_some() {
+                                log::info!("Leader already exists, {actual_leader_info:?}");
+                            }
+                            actual_leader_info
+                        } else {
+                            //The other nodes are leader.
+                            let actual_leader_info = find_actual_leader(&raft, peer_addrs, 60).await?;
+                            let (actual_leader_id, actual_leader_addr) =
+                                actual_leader_info.ok_or_else(|| anyhow!("Leader does not exist"))?;
+                            if actual_leader_id != leader_info.id {
+                                return Err(anyhow!(format!(
+                                    "Not the expected Leader, the expected one is {:?}",
+                                    leader_info
+                                )));
+                            }
+                            Some((actual_leader_id, actual_leader_addr))
+                        }
+                    }
+                    None => {
+                        log::info!("Search for the existing leader ... ");
+                        let leader_info = raft.find_leader_info(peer_addrs).await.map_err(|e| anyhow!(e))?;
+                        log::info!("The information about the located leader: {leader_info:?}");
+                        leader_info
+                    }
+                },
+            }
         };
 
         //let (status_tx, status_rx) = futures::channel::oneshot::channel::<Result<Status>>();
-        let _child = std::thread::Builder::new().name("cluster-raft".to_string()).spawn(move || {
+        let child = std::thread::Builder::new().name("cluster-raft".to_string()).spawn(move || {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .worker_threads(cfg.worker_threads)
@@ -299,14 +324,16 @@ impl ClusterPlugin {
 
                 if let Err(_) | Ok(Err(_)) = raft_handle {
                     log::error!("Raft service startup failed, {raft_handle:?}");
-                    tokio::time::sleep(Duration::from_millis(500)).await;
-                    std::process::exit(-1);
+                    if mode == RaftStartMode::Configured {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        std::process::exit(-1);
+                    }
                 }
             };
 
             rt.block_on(runner);
         })?;
-        Ok(mailbox)
+        Ok(RaftRuntime { mailbox, thread: Some(child) })
     }
 
     #[inline]
@@ -319,19 +346,15 @@ impl ClusterPlugin {
                     self.cfg.clone(),
                     self.backoff_strategy.clone(),
                     self.shared.clone(),
-                    self.raft_mailbox(),
+                    self.router.clone(),
                 )),
             )
             .await;
     }
 
     #[inline]
-    fn raft_mailbox(&self) -> Mailbox {
-        if let Some(raft_mailbox) = &self.raft_mailbox {
-            raft_mailbox.clone()
-        } else {
-            unreachable!()
-        }
+    async fn raft_mailbox(&self) -> Mailbox {
+        self.router.raft_mailbox().await
     }
 
     fn start_check_health(&self) {
@@ -341,10 +364,12 @@ impl ClusterPlugin {
         let max_continuous_unavailable_count = self.cfg.health.max_continuous_unavailable_count;
 
         let mut continuous_unavailable_count = 0;
-        let raft_mailbox = self.raft_mailbox();
+        let router = self.router.clone();
+        let recovery_active = self.recovery_active.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(unavailable_check_interval).await;
+                let raft_mailbox = router.raft_mailbox().await;
                 match raft_mailbox.status().await {
                     Err(e) => {
                         log::error!("Error retrieving cluster status, {e:?}");
@@ -360,6 +385,7 @@ impl ClusterPlugin {
                                 "cluster node unavailable({continuous_unavailable_count}), node status: {s:?}"
                             );
                             if exit_on_node_unavailable
+                                && !recovery_active.load(Ordering::SeqCst)
                                 && continuous_unavailable_count >= max_continuous_unavailable_count
                             {
                                 std::thread::sleep(Duration::from_secs(2));
@@ -371,6 +397,101 @@ impl ClusterPlugin {
             }
         });
     }
+
+    async fn force_rebootstrap(&self, epoch: u64) -> Result<serde_json::Value> {
+        if epoch == 0 {
+            return Err(anyhow!("recoveryEpoch must be greater than zero"));
+        }
+
+        let current_epoch = self.recovery_epoch.load(Ordering::SeqCst);
+        if epoch < current_epoch {
+            return Err(anyhow!("stale quorum recovery epoch {epoch}; current epoch is {current_epoch}"));
+        }
+
+        let local_id = self.scx.node.id();
+        if epoch == current_epoch {
+            let mailbox = self.raft_mailbox().await;
+            if let Ok(status) = mailbox.status().await {
+                if status.is_leader() && status.voters == vec![local_id] {
+                    let local_node = self
+                        .nodes
+                        .local_node_from_config(&self.cfg.node_grpc_addrs, &self.cfg.raft_peer_addrs)?;
+                    let node_up = message::Message::NodeUp { node: local_node }.encode()?;
+                    mailbox.send_proposal(node_up).await.map_err(anyhow::Error::new)?;
+                    self.recovery_active.store(false, Ordering::SeqCst);
+                    return Ok(json!({
+                        "ok": true,
+                        "id": local_id,
+                        "recoveryEpoch": epoch,
+                        "phase": "DegradedServing",
+                        "idempotent": true,
+                    }));
+                }
+            }
+        }
+
+        self.recovery_active.store(true, Ordering::SeqCst);
+        self.recovery_epoch.store(epoch, Ordering::SeqCst);
+
+        let mut runtime_guard = self.raft_runtime.lock().await;
+        let mut old_runtime =
+            runtime_guard.take().ok_or_else(|| anyhow!("local raft runtime is not available"))?;
+
+        if let Err(error) = old_runtime.mailbox.shutdown().await {
+            log::warn!(
+                "raft shutdown acknowledgement failed during quorum recovery epoch {epoch}: {error:?}"
+            );
+        }
+
+        if let Some(thread) = old_runtime.thread.take() {
+            let joined = timeout(Duration::from_secs(15), tokio::task::spawn_blocking(move || thread.join()))
+                .await
+                .map_err(|_| anyhow!("timed out waiting for old raft runtime to stop"))?
+                .map_err(|error| anyhow!("failed to join old raft runtime task: {error}"))?;
+            if joined.is_err() {
+                return Err(anyhow!("old raft runtime panicked while stopping"));
+            }
+        }
+
+        let new_runtime =
+            Self::start_raft(&self.scx, self.cfg.clone(), self.router.clone(), RaftStartMode::ForceLeader)
+                .await?;
+        let new_mailbox = new_runtime.mailbox.clone();
+        self.router.set_raft_mailbox(new_mailbox.clone()).await;
+        runtime_guard.replace(new_runtime);
+
+        let mut ready_status = None;
+        for _ in 0..60 {
+            match new_mailbox.status().await {
+                Ok(status) if status.is_leader() && status.voters == vec![local_id] => {
+                    ready_status = Some(status);
+                    break;
+                }
+                Ok(_) | Err(_) => sleep(Duration::from_millis(500)).await,
+            }
+        }
+        let status = ready_status
+            .ok_or_else(|| anyhow!("new singleton raft did not become ready within 30 seconds"))?;
+
+        let ping = message::Message::Ping.encode()?;
+        new_mailbox.send_proposal(ping).await.map_err(anyhow::Error::new)?;
+        let local_node =
+            self.nodes.local_node_from_config(&self.cfg.node_grpc_addrs, &self.cfg.raft_peer_addrs)?;
+        let node_up = message::Message::NodeUp { node: local_node }.encode()?;
+        new_mailbox.send_proposal(node_up).await.map_err(anyhow::Error::new)?;
+
+        self.recovery_active.store(false, Ordering::SeqCst);
+        Ok(json!({
+            "ok": true,
+            "id": local_id,
+            "recoveryEpoch": epoch,
+            "phase": "DegradedServing",
+            "preservedRouterState": true,
+            "appliedIndex": status.applied_index,
+            "committedIndex": status.committed_index,
+            "voters": status.voters,
+        }))
+    }
 }
 
 #[async_trait]
@@ -379,7 +500,10 @@ impl Plugin for ClusterPlugin {
     async fn init(&mut self) -> Result<()> {
         log::info!("{} init", self.name());
 
-        let raft_mailbox = Self::start_raft(&self.scx, self.cfg.clone(), self.router.clone()).await?;
+        let raft_runtime =
+            Self::start_raft(&self.scx, self.cfg.clone(), self.router.clone(), RaftStartMode::Configured)
+                .await?;
+        let raft_mailbox = raft_runtime.mailbox.clone();
 
         let mut raft_status = None;
         for i in 0..60 {
@@ -401,8 +525,8 @@ impl Plugin for ClusterPlugin {
             return Err(anyhow!("init failed"));
         }
 
-        self.raft_mailbox.replace(raft_mailbox.clone());
         self.router.set_raft_mailbox(raft_mailbox).await;
+        self.raft_runtime.lock().await.replace(raft_runtime);
 
         self.hook_register(Type::ClientDisconnected).await;
         self.hook_register(Type::SessionTerminated).await;
@@ -421,7 +545,7 @@ impl Plugin for ClusterPlugin {
     #[inline]
     async fn start(&mut self) -> Result<()> {
         log::info!("{} start", self.name());
-        let raft_mailbox = self.raft_mailbox();
+        let raft_mailbox = self.raft_mailbox().await;
         *self.scx.extends.router_mut().await = Box::new(self.router.clone());
         *self.scx.extends.shared_mut().await = Box::new(self.shared.clone());
         self.register.start().await;
@@ -488,7 +612,7 @@ impl Plugin for ClusterPlugin {
 
     #[inline]
     async fn attrs(&self) -> serde_json::Value {
-        let raft_mailbox = self.raft_mailbox();
+        let raft_mailbox = self.raft_mailbox().await;
         let raft_status = raft_mailbox.status().await.ok();
 
         let mut pears = HashMap::default();
@@ -528,8 +652,50 @@ impl Plugin for ClusterPlugin {
     #[inline]
     async fn send(&self, msg: serde_json::Value) -> Result<serde_json::Value> {
         let action = msg.get("action").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing action"))?;
-        let raft_mailbox = self.raft_mailbox();
+        let raft_mailbox = self.raft_mailbox().await;
         match action {
+            "prepare_quorum_recovery" => {
+                let epoch = msg
+                    .get("recoveryEpoch")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| anyhow!("missing recoveryEpoch"))?;
+                let current_epoch = self.recovery_epoch.load(Ordering::SeqCst);
+                if epoch < current_epoch {
+                    return Err(anyhow!(
+                        "stale quorum recovery epoch {epoch}; current epoch is {current_epoch}"
+                    ));
+                }
+                self.recovery_epoch.store(epoch, Ordering::SeqCst);
+                self.recovery_active.store(true, Ordering::SeqCst);
+                Ok(json!({
+                    "ok": true,
+                    "id": self.scx.node.id(),
+                    "recoveryEpoch": epoch,
+                    "phase": "QuorumLost",
+                }))
+            }
+            "cancel_quorum_recovery" => {
+                let epoch = msg
+                    .get("recoveryEpoch")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| anyhow!("missing recoveryEpoch"))?;
+                if epoch == self.recovery_epoch.load(Ordering::SeqCst) {
+                    self.recovery_active.store(false, Ordering::SeqCst);
+                }
+                Ok(json!({
+                    "ok": true,
+                    "id": self.scx.node.id(),
+                    "recoveryEpoch": epoch,
+                    "phase": "Cancelled",
+                }))
+            }
+            "force_rebootstrap" => {
+                let epoch = msg
+                    .get("recoveryEpoch")
+                    .and_then(|value| value.as_u64())
+                    .ok_or_else(|| anyhow!("missing recoveryEpoch"))?;
+                self.force_rebootstrap(epoch).await
+            }
             "node_up" => {
                 let node: message::ClusterNode =
                     serde_json::from_value(msg.get("node").cloned().unwrap_or_else(|| {
@@ -587,11 +753,13 @@ impl Plugin for ClusterPlugin {
                             .collect::<Result<Vec<_>>>()
                     })
                     .transpose()?;
-                let reliable_handoff = self.shared.prepare_drain(id, allowed_target_node_ids.clone());
+                let (reliable_handoff, grpc_client_refreshed) =
+                    self.shared.prepare_drain(id, allowed_target_node_ids.clone()).await?;
                 Ok(json!({
                     "ok": true,
                     "id": id,
                     "reliable_handoff": reliable_handoff,
+                    "grpc_client_refreshed": grpc_client_refreshed,
                     "allowedTargetNodeIds": allowed_target_node_ids,
                     "phase": "prepared"
                 }))
@@ -727,7 +895,10 @@ impl ClusterPlugin {
             "appliedIndex": raft_status.as_ref().map(|status| status.applied_index).unwrap_or_default(),
             "committedIndex": raft_status.as_ref().map(|status| status.committed_index).unwrap_or_default(),
             "lastIndex": raft_status.as_ref().map(|status| status.last_index).unwrap_or_default(),
+            "clientStates": self.router.states_count(),
             "draining": self.draining.load(Ordering::SeqCst),
+            "quorumRecoveryActive": self.recovery_active.load(Ordering::SeqCst),
+            "quorumRecoveryEpoch": self.recovery_epoch.load(Ordering::SeqCst),
             "role": raft_status.as_ref().map(|status| format!("{:?}", status.role)),
             "uncommitteds": raft_status.as_ref().map(|status| status.uncommitteds).unwrap_or_default(),
             "mergerProposals": raft_status.as_ref().map(|status| status.merger_proposals).unwrap_or_default(),
@@ -745,7 +916,8 @@ impl ClusterPlugin {
                 "reliableHandoff": self.shared.reliable_handoff_enabled(),
                 "preDisconnectQuiesce": true,
                 "proactiveSessionHandoff": true,
-                "forceDrainFinalize": true
+                "forceDrainFinalize": true,
+                "forceRebootstrap": true
             }
         })
     }
