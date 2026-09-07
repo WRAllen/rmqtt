@@ -91,6 +91,15 @@ pub trait RetainStorage: Sync + Send {
 
     async fn max(&self) -> isize;
 
+    /// Optional monitoring-only counters copied from already maintained state.
+    /// Implementations must not perform I/O, wait for a lock, scan retained
+    /// messages, or start asynchronous work. Preserve the counter's merge mode.
+    /// Return `None` rather than falling back to live storage queries.
+    #[inline]
+    fn metrics_snapshot(&self) -> Option<Counter> {
+        None
+    }
+
     #[inline]
     fn stats_merge_mode(&self) -> StatsMergeMode {
         StatsMergeMode::None
@@ -196,6 +205,11 @@ impl RetainStorage for DefaultRetainStorage {
     #[inline]
     async fn max(&self) -> isize {
         self.retaineds.max()
+    }
+
+    #[inline]
+    fn metrics_snapshot(&self) -> Option<Counter> {
+        Some(self.retaineds.clone())
     }
 }
 
@@ -431,6 +445,21 @@ mod tests {
     use std::str::FromStr;
 
     use super::{RetainTree, Topic};
+
+    #[tokio::test]
+    async fn metrics_snapshot_only_copies_counters_without_reading_the_tree() {
+        use super::{DefaultRetainStorage, RetainStorage};
+        let storage = DefaultRetainStorage::new();
+        storage.retaineds.sets(19);
+        // A tree traversal would block on this write guard. The metrics getter
+        // reads only the separately maintained atomic counter.
+        let _tree = storage.messages.write().await;
+        let snapshot = storage.metrics_snapshot().unwrap();
+        assert_eq!(snapshot.count(), 19);
+        assert_eq!(snapshot.max(), 19);
+        storage.retaineds.sets(23);
+        assert_eq!(snapshot.count(), 19, "snapshot must own a counter copy");
+    }
 
     fn match_one(tree: &RetainTree<i32>, topic_filter: &str, vs: &[i32]) -> bool {
         let mut matcheds = 0;

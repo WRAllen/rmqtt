@@ -172,6 +172,28 @@ pub struct GrpcClient {
 }
 
 impl GrpcClient {
+    /// Send one bounded, low-priority request without entering the business
+    /// transfer queues or starting their reconnect loops. Intended for optional
+    /// monitoring requests whose result can be discarded when the peer is busy.
+    ///
+    /// Dropping a timed-out request does not undo work already accepted by the
+    /// remote server; callers must still bound request frequency and concurrency.
+    pub async fn request_once(
+        server_addr: &str,
+        typ: MessageType,
+        msg: Message,
+        timeout: Duration,
+    ) -> crate::Result<MessageReply> {
+        let request = msg.encode(typ)?;
+        let mut client = Client::new(server_addr.into())
+            .connect_timeout(timeout)
+            .timeout(timeout)
+            .concurrency_limit(1)
+            .connect_lazy()?;
+        let reply = tokio::time::timeout(timeout, client.send(request)).await??;
+        MessageReply::decode(&reply)
+    }
+
     fn connect_lazy(
         server_addr: &str,
         client_timeout: Duration,
@@ -467,5 +489,34 @@ impl MessageBroadcaster {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GrpcClient, Message};
+    use std::time::Duration;
+    use tokio::net::TcpListener;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn request_once_deadline_includes_an_unresponsive_connection() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (accepted_tx, accepted_rx) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            GrpcClient::request_once(&addr, 99, Message::Data(Vec::new()), Duration::from_millis(100)),
+        )
+        .await;
+        peer.abort();
+        assert!(accepted_rx.await.is_ok(), "the request should reach the unresponsive peer");
+        assert!(result.expect("a monitoring request must respect its total deadline").is_err());
     }
 }

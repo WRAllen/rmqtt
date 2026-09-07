@@ -35,6 +35,7 @@
 
 use rust_box::task_exec_queue::{Builder, TaskExecQueue};
 use std::ops::Deref;
+use std::sync::RwLock;
 
 use crate::context::ServerContext;
 use crate::types::{DashMap, ListenerConfig, Port};
@@ -56,12 +57,16 @@ impl Deref for Entry {
 
 pub struct HandshakeExecutor {
     handshake_execs: DashMap<Port, Entry>,
+    // Published once per listener creation, never on the per-message path.
+    // Monitoring must not iterate the business DashMap or call rate(), whose
+    // dependency uses a blocking mutex even though its wrapper is async.
+    monitoring_execs: RwLock<Vec<TaskExecQueue>>,
     busy_limit: BusyLimit,
 }
 
 impl HandshakeExecutor {
     pub fn new(busy_limit: isize) -> Self {
-        Self { handshake_execs: DashMap::default(), busy_limit }
+        Self { handshake_execs: DashMap::default(), monitoring_execs: RwLock::new(Vec::new()), busy_limit }
     }
 
     #[inline]
@@ -84,6 +89,7 @@ impl HandshakeExecutor {
                     self.busy_limit
                 };
 
+                self.monitoring_execs.write().unwrap_or_else(|e| e.into_inner()).push(exec.clone());
                 Entry { exec, busy_limit }
             })
             .exec
@@ -93,6 +99,12 @@ impl HandshakeExecutor {
     #[inline]
     pub fn active_count(&self) -> isize {
         self.handshake_execs.iter().map(|exec| exec.active_count()).sum()
+    }
+
+    /// Only read atomic active counters through a monitoring-only registry.
+    /// A concurrent listener creation makes this sample unavailable, not zero.
+    pub fn metrics_active_count(&self) -> Option<isize> {
+        self.monitoring_execs.try_read().ok().map(|execs| execs.iter().map(|exec| exec.active_count()).sum())
     }
 
     #[inline]
@@ -113,5 +125,26 @@ impl HandshakeExecutor {
             .sum::<u32>()
             > 0;
         _is_busy || scx.extends.shared().await.operation_is_busy()
+    }
+}
+
+#[cfg(test)]
+mod monitoring_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn monitoring_registry_does_not_touch_business_shards_or_duplicate_listeners() {
+        let executor = HandshakeExecutor::new(0);
+        let config = ListenerConfig::default();
+        executor.get(1883, &config);
+        executor.get(1883, &config);
+        executor.get(1884, &config);
+        assert_eq!(executor.monitoring_execs.read().unwrap().len(), 2);
+        assert_eq!(executor.metrics_active_count(), Some(executor.active_count()));
+
+        let _business_writer = executor.handshake_execs.get_mut(&1883).unwrap();
+        assert_eq!(executor.metrics_active_count(), Some(0));
+        let _monitoring_writer = executor.monitoring_execs.write().unwrap();
+        assert_eq!(executor.metrics_active_count(), None);
     }
 }

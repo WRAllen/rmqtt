@@ -14,11 +14,12 @@ use super::{
 pub(crate) struct HookHandler {
     scx: ServerContext,
     pub message_type: MessageType,
+    monitor: crate::prome::Monitor,
 }
 
 impl HookHandler {
-    pub(crate) fn new(scx: ServerContext, message_type: MessageType) -> Self {
-        Self { scx, message_type }
+    pub(crate) fn new(scx: ServerContext, message_type: MessageType, monitor: crate::prome::Monitor) -> Self {
+        Self { scx, message_type, monitor }
     }
 }
 
@@ -37,6 +38,16 @@ impl Handler for HookHandler {
                             Err(e) => {
                                 log::error!("Message::decode, error: {e:?}");
                                 HookResult::GrpcMessageReply(Ok(GrpcMessageReply::Error(e.to_string())))
+                            }
+                            Ok(Message::MetricsSnapshotV1) => HookResult::GrpcMessageReply(Ok(
+                                GrpcMessageReply::Error("metrics snapshot V1 unsupported; use V2".into()),
+                            )),
+                            Ok(Message::MetricsSnapshotV2) => {
+                                let reply = match self.monitor.local_reply() {
+                                    Ok(bytes) => GrpcMessageReply::Data(bytes.to_vec()),
+                                    Err(error) => GrpcMessageReply::Error(error.to_string()),
+                                };
+                                HookResult::GrpcMessageReply(Ok(reply))
                             }
                             Ok(Message::BrokerInfo) => {
                                 let broker_info = self.scx.node.broker_info(&self.scx).await;

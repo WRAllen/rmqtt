@@ -289,6 +289,9 @@ impl ClusterRouter {
 
 #[async_trait]
 impl Router for ClusterRouter {
+    fn metrics_snapshot(&self) -> Option<rmqtt::router::RouterMetricsSnapshot> {
+        self.inner.metrics_snapshot()
+    }
     #[inline]
     async fn add(&self, topic_filter: &str, id: Id, opts: SubscriptionOptions) -> Result<()> {
         log::debug!("[Router.add] topic_filter: {topic_filter:?}, id: {id:?}, opts: {opts:?}");

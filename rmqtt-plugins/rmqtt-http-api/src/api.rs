@@ -150,6 +150,7 @@ pub(crate) async fn listen_and_serve(
     laddr: SocketAddr,
     cfg: PluginConfigType,
     rx: oneshot::Receiver<()>,
+    monitor: prome::Monitor,
 ) -> Result<()> {
     let (reuseaddr, reuseport, http_bearer_token) = {
         let cfg = cfg.read().await;
@@ -166,7 +167,6 @@ pub(crate) async fn listen_and_serve(
         rx.await.ok();
         handler.stop_graceful(None);
     });
-    let monitor = prome::Monitor::new();
     server.try_serve(route(scx, cfg, http_bearer_token, monitor)).await?;
     Ok(())
 }
@@ -2584,7 +2584,7 @@ async fn get_prometheus_metrics(
         {
             Ok(metrics) => {
                 res.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
-                res.write_body(metrics).ok();
+                res.stream(metrics.into_stream());
             }
             Err(e) => res.render(StatusError::service_unavailable().detail(e.to_string())),
         }
@@ -2592,7 +2592,7 @@ async fn get_prometheus_metrics(
         match prome::to_metrics(scx, monitor, message_type, cache_interval, PrometheusDataType::All).await {
             Ok(metrics) => {
                 res.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
-                res.write_body(metrics).ok();
+                res.stream(metrics.into_stream());
             }
             Err(e) => res.render(StatusError::service_unavailable().detail(e.to_string())),
         }
@@ -2614,7 +2614,7 @@ async fn get_prometheus_metrics_sum(
     match prome::to_metrics(scx, monitor, message_type, cache_interval, PrometheusDataType::Sum).await {
         Ok(metrics) => {
             res.headers_mut().insert(CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
-            res.write_body(metrics).ok();
+            res.stream(metrics.into_stream());
         }
         Err(e) => res.render(StatusError::service_unavailable().detail(e.to_string())),
     }

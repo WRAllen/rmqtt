@@ -38,6 +38,12 @@ impl ClusterRouter {
 
 #[async_trait]
 impl Router for ClusterRouter {
+    fn metrics_snapshot(&self) -> Option<rmqtt::router::RouterMetricsSnapshot> {
+        self.inner.metrics_snapshot().map(|mut snapshot| {
+            snapshot.merge = rmqtt::router::MetricsRouteMerge::Sum;
+            snapshot
+        })
+    }
     #[inline]
     async fn add(&self, topic_filter: &str, id: Id, opts: SubscriptionOptions) -> Result<()> {
         self.inner.add(topic_filter, id, opts).await

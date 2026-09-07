@@ -14,9 +14,11 @@ http_request_log = false
 ##Message expiration time, 0 means no expiration
 message_expiry_interval = "5m"
 
-## Prometheus metrics data caching interval.
+## Minimum interval between demand-driven cluster metrics refreshes.
+## Minimum 30s (legacy shorter values are clamped); longer values are honored.
+## HTTP reads cached snapshots; local counters sample every 10s.
+## Cold/older-than-120s cluster snapshots return 503 without blocking MQTT.
 ##
 ## Value: Duration
-## Default: "5s"
-prometheus_metrics_cache_interval = "5s"
-
+## Default: "30s"
+prometheus_metrics_cache_interval = "30s"

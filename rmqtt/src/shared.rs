@@ -163,6 +163,15 @@ pub trait Shared: Sync + Send {
         Arc::new(HashMap::default())
     }
 
+    /// Known monitoring targets, including registered peers without a usable client.
+    /// This read-only view is not a health check or a membership mutation.
+    /// Must not wait for locks or inspect business client tables. None means
+    /// unavailable/unsupported, never an empty or singleton cluster.
+    #[cfg(feature = "grpc")]
+    fn metrics_node_addrs(&self) -> Option<HashMap<NodeId, crate::types::Addr>> {
+        None
+    }
+
     #[inline]
     fn grpc_enable(&self) -> bool {
         #[cfg(feature = "grpc")]
@@ -629,6 +638,10 @@ impl DefaultShared {
 
 #[async_trait]
 impl Shared for DefaultShared {
+    #[cfg(feature = "grpc")]
+    fn metrics_node_addrs(&self) -> Option<HashMap<NodeId, crate::types::Addr>> {
+        Some(HashMap::default())
+    }
     #[inline]
     fn entry(&self, id: Id) -> Box<dyn Entry> {
         Box::new(LockEntry::new(id, self.clone(), None))

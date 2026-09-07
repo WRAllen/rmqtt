@@ -488,6 +488,10 @@ impl ClusterShared {
 
 #[async_trait]
 impl Shared for ClusterShared {
+    fn metrics_node_addrs(&self) -> Option<rmqtt::types::HashMap<NodeId, rmqtt::types::Addr>> {
+        // This plugin's peer map is immutable, not a business DashMap.
+        Some(self.grpc_clients.iter().map(|(id, (addr, _))| (*id, addr.clone())).collect())
+    }
     #[inline]
     fn entry(&self, id: Id) -> Box<dyn Entry> {
         Box::new(ClusterLockEntry::new(self.inner.entry(id), self.clone()))

@@ -23,4 +23,4 @@ futures.workspace = true
 socket2.workspace = true
 prometheus.workspace = true
 bincode.workspace = true
-
+systemstat.workspace = true

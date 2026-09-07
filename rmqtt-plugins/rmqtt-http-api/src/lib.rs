@@ -21,6 +21,7 @@ mod config;
 mod handler;
 mod plugin;
 mod prome;
+mod snapshot;
 mod subs;
 mod types;
 
@@ -35,6 +36,7 @@ struct HttpApiPlugin {
     register: Box<dyn Register>,
     cfg: PluginConfigType,
     shutdown_tx: Option<ShutdownTX>,
+    monitor: prome::Monitor,
 }
 
 impl HttpApiPlugin {
@@ -43,22 +45,32 @@ impl HttpApiPlugin {
         let name = name.into();
         let cfg = scx.plugins.read_config_default::<PluginConfig>(&name);
         log::info!("{name} HttpApiPlugin cfg: {cfg:?}");
-        let cfg = Arc::new(RwLock::new(cfg?));
+        let cfg = cfg?;
+        let monitor =
+            prome::Monitor::new(scx.clone(), cfg.message_type, cfg.prometheus_metrics_cache_interval)?;
+        let cfg = Arc::new(RwLock::new(cfg));
         let register = scx.extends.hook_mgr().register();
-        let shutdown_tx = Some(Self::start(scx.clone(), cfg.clone()).await);
-        Ok(Self { scx, register, cfg, shutdown_tx })
+        let shutdown_tx = Some(Self::start(scx.clone(), cfg.clone(), monitor.clone()).await);
+        Ok(Self { scx, register, cfg, shutdown_tx, monitor })
     }
 
-    async fn start(scx: ServerContext, cfg: PluginConfigType) -> ShutdownTX {
+    async fn start(scx: ServerContext, cfg: PluginConfigType, monitor: prome::Monitor) -> ShutdownTX {
         let (shutdown_tx, shutdown_rx): (oneshot::Sender<()>, oneshot::Receiver<()>) = oneshot::channel();
         let http_laddr = cfg.read().await.http_laddr;
         tokio::spawn(async move {
-            if let Err(e) = api::listen_and_serve(scx, http_laddr, cfg, shutdown_rx).await {
+            if let Err(e) = api::listen_and_serve(scx, http_laddr, cfg, shutdown_rx, monitor).await {
                 log::error!("{e:?}");
             }
             log::info!("Exit HTTP API Server, ..., http://{http_laddr:?}");
         });
         shutdown_tx
+    }
+}
+
+impl Drop for HttpApiPlugin {
+    fn drop(&mut self) {
+        // Signal explicitly; never join a monitoring/OS thread on a MQTT worker.
+        self.monitor.shutdown();
     }
 }
 
@@ -69,7 +81,10 @@ impl Plugin for HttpApiPlugin {
         log::info!("{} init", self.name());
         let mgs_type = self.cfg.read().await.message_type;
         self.register
-            .add(Type::GrpcMessageReceived, Box::new(handler::HookHandler::new(self.scx.clone(), mgs_type)))
+            .add(
+                Type::GrpcMessageReceived,
+                Box::new(handler::HookHandler::new(self.scx.clone(), mgs_type, self.monitor.clone())),
+            )
             .await;
         Ok(())
     }
@@ -93,7 +108,8 @@ impl Plugin for HttpApiPlugin {
                     log::warn!("shutdown_tx send fail, {e:?}");
                 }
             }
-            self.shutdown_tx = Some(Self::start(self.scx.clone(), new_cfg.clone()).await);
+            self.shutdown_tx =
+                Some(Self::start(self.scx.clone(), new_cfg.clone(), self.monitor.clone()).await);
             self.cfg = new_cfg;
         } else {
             *self.cfg.write().await = new_cfg;

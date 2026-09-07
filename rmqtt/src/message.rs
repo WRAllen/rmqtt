@@ -49,6 +49,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::types::{ClientId, From, MsgID, Publish, SharedGroup, TopicFilter};
+use crate::utils::Counter;
 use crate::Result;
 
 #[async_trait]
@@ -101,6 +102,15 @@ pub trait MessageManager: Sync + Send {
     #[inline]
     async fn max(&self) -> isize {
         -1
+    }
+
+    /// Optional monitoring-only counters copied from already maintained state.
+    /// Implementations must not perform I/O, wait for a lock, scan messages, or
+    /// start asynchronous work. Return `None` when no such cheap snapshot exists.
+    /// The monitoring caller never falls back to `count` or `max`.
+    #[inline]
+    fn metrics_snapshot(&self) -> Option<Counter> {
+        None
     }
 
     #[inline]

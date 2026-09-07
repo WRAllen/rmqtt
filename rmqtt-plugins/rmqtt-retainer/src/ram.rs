@@ -9,6 +9,7 @@ use rmqtt::{
     retain::DefaultRetainStorage,
     retain::RetainStorage,
     types::{Retain, TopicFilter, TopicName},
+    utils::Counter,
     Result,
 };
 
@@ -89,5 +90,10 @@ impl RetainStorage for RamRetainer {
     #[inline]
     async fn max(&self) -> isize {
         self.inner.max().await
+    }
+
+    #[inline]
+    fn metrics_snapshot(&self) -> Option<Counter> {
+        self.inner.metrics_snapshot()
     }
 }

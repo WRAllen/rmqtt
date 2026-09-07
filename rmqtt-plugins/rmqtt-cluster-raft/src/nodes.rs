@@ -1,7 +1,7 @@
 //! Runtime cluster node registry for business gRPC peers.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -52,12 +52,36 @@ fn repair_attempt_due(last_attempt_at: Option<i64>, now: i64) -> bool {
 pub(crate) struct ClusterNodeManager {
     scx: ServerContext,
     nodes: Arc<DashMap<NodeId, ClusterNode, ahash::RandomState>>,
+    monitoring: Arc<RwLock<MonitoringRoster>>,
     clients: Arc<DashMap<NodeId, ClientEntry, ahash::RandomState>>,
     options: Arc<ClientOptions>,
     next_generation: Arc<AtomicU64>,
     repair_lock: Arc<Mutex<()>>,
     last_repair_attempts: Arc<DashMap<NodeId, i64, ahash::RandomState>>,
     repairs_in_progress: Arc<DashMap<NodeId, u64, ahash::RandomState>>,
+}
+
+/// Shadow addresses, updated only during control-plane registry mutations.
+/// Sampling never acquires a business DashMap shard. The write guard also
+/// orders shadow updates with their corresponding business registry mutation.
+#[derive(Default)]
+struct MonitoringRoster {
+    addrs: HashMap<NodeId, Addr>,
+    restoring: usize,
+    restore_failed: bool,
+}
+
+struct MonitoringRestore<'a> {
+    roster: &'a RwLock<MonitoringRoster>,
+    complete: bool,
+}
+
+impl Drop for MonitoringRestore<'_> {
+    fn drop(&mut self) {
+        let mut roster = self.roster.write().unwrap_or_else(|e| e.into_inner());
+        roster.restoring -= 1;
+        roster.restore_failed |= !self.complete;
+    }
 }
 
 #[derive(Clone)]
@@ -91,6 +115,7 @@ impl ClusterNodeManager {
         Self {
             scx,
             nodes: Arc::new(DashMap::default()),
+            monitoring: Arc::new(RwLock::new(MonitoringRoster::default())),
             clients: Arc::new(DashMap::default()),
             options: Arc::new(ClientOptions::from_config(cfg)),
             next_generation: Arc::new(AtomicU64::new(0)),
@@ -250,7 +275,7 @@ impl ClusterNodeManager {
     pub(crate) async fn upsert(&self, node: ClusterNode) -> Result<()> {
         let id = node.id;
         let grpc_addr = node.grpc_addr.clone();
-        self.nodes.insert(id, node);
+        self.record_node(node);
 
         if id == self.scx.node.id() {
             self.clients.remove(&id);
@@ -267,8 +292,19 @@ impl ClusterNodeManager {
         Ok(())
     }
 
+    fn record_node(&self, node: ClusterNode) {
+        let mut monitoring = self.monitoring.write().unwrap_or_else(|e| e.into_inner());
+        let (id, addr) = (node.id, node.grpc_addr.clone());
+        self.nodes.insert(id, node);
+        monitoring.addrs.insert(id, addr);
+    }
+
     pub(crate) fn remove(&self, node_id: NodeId) {
-        self.nodes.remove(&node_id);
+        {
+            let mut monitoring = self.monitoring.write().unwrap_or_else(|e| e.into_inner());
+            self.nodes.remove(&node_id);
+            monitoring.addrs.remove(&node_id);
+        }
         self.clients.remove(&node_id);
         self.last_repair_attempts.remove(&node_id);
         self.repairs_in_progress.remove(&node_id);
@@ -396,14 +432,33 @@ impl ClusterNodeManager {
         self.nodes.iter().map(|entry| entry.value().clone()).collect()
     }
 
-    pub(crate) async fn restore_nodes(&self, nodes: Vec<ClusterNode>) -> Result<()> {
+    pub(crate) fn metrics_node_addrs(&self) -> Option<HashMap<NodeId, Addr>> {
+        let monitoring = self.monitoring.try_read().ok()?;
+        (monitoring.restoring == 0 && !monitoring.restore_failed).then(|| monitoring.addrs.clone())
+    }
+
+    fn begin_monitoring_restore(&self) -> MonitoringRestore<'_> {
+        let mut monitoring = self.monitoring.write().unwrap_or_else(|e| e.into_inner());
+        if monitoring.restoring == 0 {
+            monitoring.restore_failed = false;
+        }
+        monitoring.restoring += 1;
         self.nodes.clear();
+        monitoring.addrs.clear();
+        MonitoringRestore { roster: &self.monitoring, complete: false }
+    }
+
+    pub(crate) async fn restore_nodes(&self, nodes: Vec<ClusterNode>) -> Result<()> {
+        let mut restore = self.begin_monitoring_restore();
         self.clients.clear();
         self.last_repair_attempts.clear();
         self.repairs_in_progress.clear();
         for node in nodes {
             self.upsert(node).await?;
         }
+        // Failed/cancelled restores leave the roster unavailable instead of
+        // publishing the partially restored set as a complete small cluster.
+        restore.complete = true;
         Ok(())
     }
 
@@ -441,6 +496,77 @@ mod tests {
     use rmqtt::types::NodeHealthStatus;
 
     use super::*;
+
+    async fn monitoring_manager() -> ClusterNodeManager {
+        let scx = ServerContext::new().node_id(1).busy_check_enable(false).build().await;
+        let config = serde_json::from_value(json!({"node_grpc_addrs": [], "raft_peer_addrs": []})).unwrap();
+        ClusterNodeManager::new(scx, &config)
+    }
+
+    fn registry_node(id: NodeId, port: u16) -> ClusterNode {
+        ClusterNode { id, grpc_addr: format!("127.0.0.1:{port}").into(), raft_addr: String::new().into() }
+    }
+
+    #[tokio::test]
+    async fn monitoring_roster_tracks_registered_nodes_without_business_clients_or_shard_reads() {
+        let manager = monitoring_manager().await;
+        for id in 1..=5 {
+            manager.record_node(registry_node(id, 5363));
+        }
+        assert!(manager.clients.is_empty());
+        assert_eq!(manager.metrics_node_addrs().unwrap().len(), 5);
+        manager.record_node(registry_node(2, 5364));
+        assert_eq!(manager.metrics_node_addrs().unwrap()[&2].to_string(), "127.0.0.1:5364");
+        let _business_writer = manager.nodes.get_mut(&2).unwrap();
+        assert_eq!(manager.metrics_node_addrs().unwrap().len(), 5);
+        drop(_business_writer);
+        manager.remove(2);
+        assert!(!manager.metrics_node_addrs().unwrap().contains_key(&2));
+        let _monitoring_writer = manager.monitoring.write().unwrap();
+        assert!(manager.metrics_node_addrs().is_none(), "busy is not an empty registry");
+    }
+
+    #[tokio::test]
+    async fn monitoring_roster_is_unavailable_during_failed_or_cancelled_restore() {
+        let manager = monitoring_manager().await;
+        manager.record_node(registry_node(2, 5363));
+        {
+            let _cancelled = manager.begin_monitoring_restore();
+            manager.record_node(registry_node(1, 5363));
+            assert!(manager.metrics_node_addrs().is_none());
+        }
+        assert!(manager.metrics_node_addrs().is_none());
+        // A later successful restore repairs availability, without opening a
+        // remote client: node 1 is local in this test.
+        manager.restore_nodes(vec![registry_node(1, 5364)]).await.unwrap();
+        assert_eq!(manager.metrics_node_addrs().unwrap().len(), 1);
+        assert_eq!(manager.metrics_node_addrs().unwrap()[&1].to_string(), "127.0.0.1:5364");
+        assert!(!manager.metrics_node_addrs().unwrap().contains_key(&2));
+        manager.restore_nodes(Vec::new()).await.unwrap();
+        assert!(manager.metrics_node_addrs().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn monitoring_roster_concurrent_updates_do_not_lose_or_resurrect_nodes() {
+        let manager = monitoring_manager().await;
+        std::thread::scope(|scope| {
+            for id in 1..=5 {
+                let manager = &manager;
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        manager.record_node(registry_node(id, 5363));
+                        manager.remove(id);
+                    }
+                    manager.record_node(registry_node(id, 5364));
+                });
+            }
+        });
+        let observed = manager.metrics_node_addrs().unwrap();
+        let business: HashMap<_, _> =
+            manager.snapshot_nodes().into_iter().map(|n| (n.id, n.grpc_addr)).collect();
+        assert_eq!(observed, business);
+        assert_eq!(observed.len(), 5);
+    }
 
     fn health_reply(node_id: NodeId) -> MessageReply {
         health_reply_with_state(node_id, true)

@@ -1694,6 +1694,10 @@ impl Shared for ClusterShared {
         self.nodes.grpc_clients()
     }
 
+    fn metrics_node_addrs(&self) -> Option<rmqtt::types::HashMap<NodeId, rmqtt::types::Addr>> {
+        self.nodes.metrics_node_addrs()
+    }
+
     #[inline]
     fn node_name(&self, id: NodeId) -> String {
         self.nodes.node_name(id)

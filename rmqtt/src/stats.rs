@@ -148,6 +148,112 @@ impl Stats {
         }
     }
 
+    /// Best-effort, read-only counters for the background metrics sampler.
+    ///
+    /// This deliberately does not call `clone`: that API waits for extensions,
+    /// writes back derived counters, and can walk business data in debug builds.
+    /// Storage extensions must opt in through their synchronous, no-I/O metrics
+    /// getters; administrative count/max/len futures are never even polled.
+    /// Busy/unsupported sources are omitted, not zero. Honor `omitted`.
+    pub fn monitoring_snapshot(&self, scx: &ServerContext) -> (Self, Vec<String>) {
+        let (stats, omitted, _) = self.monitoring_snapshot_with_routing(scx);
+        (stats, omitted)
+    }
+
+    pub fn monitoring_snapshot_with_routing(
+        &self,
+        scx: &ServerContext,
+    ) -> (Self, Vec<String>, Option<crate::router::MetricsRouteMerge>) {
+        let mut snapshot = Self {
+            handshakings: scx.handshakings.clone(),
+            handshakings_active: Counter::new(),
+            handshakings_rate: self.handshakings_rate.clone(),
+            connections: scx.connections.clone(),
+            sessions: scx.sessions.clone(),
+            subscriptions: self.subscriptions.clone(),
+            subscriptions_shared: self.subscriptions_shared.clone(),
+            message_queues: self.message_queues.clone(),
+            message_queue_drops: self.message_queue_drops.clone(),
+            out_inflights: self.out_inflights.clone(),
+            out_inflight_drops: self.out_inflight_drops.clone(),
+            in_inflights: self.in_inflights.clone(),
+            forwards: self.forwards.clone(),
+            message_storages: self.message_storages.clone(),
+            retaineds: self.retaineds.clone(),
+            delayed_publishs: self.delayed_publishs.clone(),
+            grpc_server_actives: self.grpc_server_actives.clone(),
+            #[cfg(feature = "debug")]
+            debug_session_channels: self.debug_session_channels.clone(),
+            ..Self::new()
+        };
+        let mut omitted = Vec::new();
+        let mut omit_counter = |name: &str| {
+            omitted.push(format!("{name}.count"));
+            omitted.push(format!("{name}.max"));
+        };
+
+        // now_or_never cannot prevent the synchronous mutex inside rate().
+        // Leave live administrative/limiter semantics alone and omit this input.
+        omit_counter("handshakings_rate");
+
+        let routing = scx.extends.router.try_read().ok().and_then(|router| router.metrics_snapshot());
+        let routing_merge = if let Some(routing) = routing {
+            snapshot.topics_map.insert(scx.node.id, routing.topics);
+            snapshot.routes_map.insert(scx.node.id, routing.routes);
+            Some(routing.merge)
+        } else {
+            omit_counter("topics");
+            omit_counter("routes");
+            None
+        };
+
+        #[cfg(feature = "msgstore")]
+        {
+            let counter =
+                scx.extends.message_mgr.try_read().ok().and_then(|manager| manager.metrics_snapshot());
+            if let Some(counter) = counter {
+                snapshot.message_storages = counter;
+            } else {
+                omit_counter("message_storages");
+            }
+        }
+        #[cfg(not(feature = "msgstore"))]
+        omit_counter("message_storages");
+
+        #[cfg(feature = "retain")]
+        {
+            let counter = scx.extends.retain.try_read().ok().and_then(|retain| retain.metrics_snapshot());
+            if let Some(counter) = counter {
+                snapshot.retaineds = counter;
+            } else {
+                omit_counter("retaineds");
+            }
+        }
+        #[cfg(not(feature = "retain"))]
+        omit_counter("retaineds");
+
+        #[cfg(feature = "delayed")]
+        {
+            let count = scx.extends.delayed_sender.try_read().ok().and_then(|sender| sender.metrics_len());
+            if let Some(count) = count {
+                snapshot.delayed_publishs.current_set(count as isize);
+            } else {
+                omit_counter("delayed_publishs");
+            }
+        }
+        #[cfg(not(feature = "delayed"))]
+        omit_counter("delayed_publishs");
+
+        // Executor/debug maps are not Prometheus inputs. In particular, never
+        // walk clients, subscriptions or topic trees to fill those maps here.
+        if let Some(active) = scx.handshake_exec.metrics_active_count() {
+            snapshot.handshakings_active.current_set(active);
+        } else {
+            omitted.push("handshakings_active.count".into());
+        }
+        (snapshot, omitted, routing_merge)
+    }
+
     #[inline]
     pub async fn clone(&self, scx: &ServerContext) -> Self {
         let node_id = scx.node.id;
@@ -393,5 +499,184 @@ impl Stats {
         }
 
         json_val
+    }
+}
+
+#[cfg(test)]
+mod monitoring_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn monitoring_reads_real_counters_without_writing_back() {
+        let scx = ServerContext::new().busy_check_enable(false).node_id(7).build().await;
+        scx.connections.sets(42);
+        scx.sessions.sets(51);
+        scx.handshakings.sets(3);
+        scx.stats.connections.sets(999);
+        scx.stats.sessions.sets(998);
+        scx.stats.handshakings.sets(997);
+        scx.stats.message_queues.sets(17);
+
+        let (snapshot, _) = scx.stats.monitoring_snapshot(&scx);
+        assert_eq!(snapshot.connections.count(), 42);
+        assert_eq!(snapshot.sessions.count(), 51);
+        assert_eq!(snapshot.handshakings.count(), 3);
+        assert_eq!(snapshot.message_queues.count(), 17);
+        assert_eq!(scx.stats.connections.count(), 999);
+        assert_eq!(scx.stats.sessions.count(), 998);
+        assert_eq!(scx.stats.handshakings.count(), 997);
+        assert_eq!(snapshot.topics_map.len(), 1);
+        assert!(snapshot.topics_map.contains_key(&7));
+        assert!(snapshot.execs_actives.is_empty());
+        #[cfg(feature = "debug")]
+        {
+            assert!(snapshot.debug_client_states_map.is_empty());
+            assert!(snapshot.debug_topics_tree_map.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn monitoring_omits_blocking_rate_without_changing_business_rate_counters() {
+        let scx = ServerContext::new().busy_check_enable(false).build().await;
+        scx.stats.handshakings_rate.sets(123);
+        let (_, omitted) = scx.stats.monitoring_snapshot(&scx);
+        assert!(omitted.iter().any(|item| item == "handshakings_rate.count"));
+        assert!(omitted.iter().any(|item| item == "handshakings_rate.max"));
+        assert!(!omitted.iter().any(|item| item == "handshakings_active.count"));
+        assert_eq!(scx.stats.handshakings_rate.count(), 123);
+    }
+
+    #[tokio::test]
+    async fn monitoring_omits_busy_router_instead_of_waiting_or_faking_zero() {
+        let scx = ServerContext::new().busy_check_enable(false).build().await;
+        let _writer = scx.extends.router.write().await;
+        let (snapshot, omitted) = scx.stats.monitoring_snapshot(&scx);
+        assert!(snapshot.topics_map.is_empty());
+        assert!(snapshot.routes_map.is_empty());
+        for key in ["topics.count", "topics.max", "routes.count", "routes.max"] {
+            assert!(omitted.iter().any(|item| item == key));
+        }
+    }
+
+    #[cfg(feature = "msgstore")]
+    #[tokio::test]
+    async fn monitoring_never_polls_storage_futures() {
+        struct UnsupportedStorage;
+
+        #[async_trait::async_trait]
+        impl crate::message::MessageManager for UnsupportedStorage {
+            async fn count(&self) -> isize {
+                panic!("monitoring must not start a live storage count query")
+            }
+
+            async fn max(&self) -> isize {
+                panic!("monitoring must not start a live storage max query")
+            }
+        }
+
+        let scx = ServerContext::new().busy_check_enable(false).build().await;
+        *scx.extends.message_mgr.write().await = Box::new(UnsupportedStorage);
+        scx.stats.message_storages.sets(777);
+        for _ in 0..100 {
+            let (_, omitted) = scx.stats.monitoring_snapshot(&scx);
+            assert!(omitted.iter().any(|item| item == "message_storages.count"));
+            assert!(omitted.iter().any(|item| item == "message_storages.max"));
+            assert!(scx.extends.message_mgr.try_write().is_ok(), "must release extension guard");
+            assert_eq!(scx.stats.message_storages.count(), 777);
+        }
+    }
+
+    #[cfg(feature = "msgstore")]
+    #[tokio::test]
+    async fn monitoring_uses_opt_in_storage_snapshot_without_live_queries_or_writes() {
+        struct SnapshotStorage(Counter);
+
+        #[async_trait::async_trait]
+        impl crate::message::MessageManager for SnapshotStorage {
+            async fn count(&self) -> isize {
+                panic!("monitoring must only read the opt-in snapshot")
+            }
+
+            async fn max(&self) -> isize {
+                panic!("monitoring must only read the opt-in snapshot")
+            }
+
+            fn metrics_snapshot(&self) -> Option<Counter> {
+                Some(self.0.clone())
+            }
+        }
+
+        let scx = ServerContext::new().busy_check_enable(false).build().await;
+        *scx.extends.message_mgr.write().await =
+            Box::new(SnapshotStorage(Counter::new_with(12, 37, crate::utils::StatsMergeMode::Sum)));
+        scx.stats.message_storages.sets(777);
+        let (snapshot, omitted) = scx.stats.monitoring_snapshot(&scx);
+        assert_eq!(snapshot.message_storages.count(), 12);
+        assert_eq!(snapshot.message_storages.max(), 37);
+        assert!(!omitted.iter().any(|item| item.starts_with("message_storages.")));
+        assert_eq!(scx.stats.message_storages.count(), 777);
+    }
+
+    #[cfg(feature = "retain")]
+    #[tokio::test]
+    async fn monitoring_never_polls_retained_storage_futures() {
+        struct UnsupportedRetain;
+        #[async_trait::async_trait]
+        impl crate::retain::RetainStorage for UnsupportedRetain {
+            async fn set(
+                &self,
+                _: &crate::types::TopicName,
+                _: crate::types::Retain,
+                _: Option<std::time::Duration>,
+            ) -> crate::Result<()> {
+                panic!("monitoring must not mutate retained messages")
+            }
+            async fn get(
+                &self,
+                _: &crate::types::TopicFilter,
+            ) -> crate::Result<Vec<(crate::types::TopicName, crate::types::Retain)>> {
+                panic!("monitoring must not scan retained messages")
+            }
+            async fn count(&self) -> isize {
+                panic!("monitoring must not start a retained-storage count query")
+            }
+            async fn max(&self) -> isize {
+                panic!("monitoring must not start a retained-storage max query")
+            }
+        }
+        let scx = ServerContext::new().busy_check_enable(false).build().await;
+        *scx.extends.retain.write().await = Box::new(UnsupportedRetain);
+        let (_, omitted) = scx.stats.monitoring_snapshot(&scx);
+        assert!(omitted.iter().any(|item| item == "retaineds.count"));
+        assert!(omitted.iter().any(|item| item == "retaineds.max"));
+    }
+
+    #[cfg(feature = "delayed")]
+    #[tokio::test]
+    async fn monitoring_never_polls_delayed_len_future() {
+        struct UnsupportedDelayed;
+        #[async_trait::async_trait]
+        impl crate::delayed::DelayedSender for UnsupportedDelayed {
+            fn parse(&self, _: crate::types::Publish) -> crate::Result<crate::types::Publish> {
+                panic!("monitoring must not enter the publish path")
+            }
+            async fn delay_publish(
+                &self,
+                _: crate::types::From,
+                _: crate::types::Publish,
+                _: bool,
+                _: Option<std::time::Duration>,
+            ) -> crate::Result<Option<(crate::types::From, crate::types::Publish)>> {
+                panic!("monitoring must not enter the publish path")
+            }
+            async fn len(&self) -> usize {
+                panic!("monitoring must not poll the delayed length query")
+            }
+        }
+        let scx = ServerContext::new().busy_check_enable(false).build().await;
+        *scx.extends.delayed_sender.write().await = Box::new(UnsupportedDelayed);
+        let (_, omitted) = scx.stats.monitoring_snapshot(&scx);
+        assert!(omitted.iter().any(|item| item == "delayed_publishs.count"));
+        assert!(omitted.iter().any(|item| item == "delayed_publishs.max"));
     }
 }

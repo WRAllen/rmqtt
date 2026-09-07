@@ -20,6 +20,7 @@ The operator owns the Kubernetes reconciliation flow for an RMQTT raft cluster:
 - checks both raft voters and business-layer gRPC peers before completing a scale step
 - drains and removes one voter before reducing StatefulSet replicas
 - optionally turns an RMQTT image change into a Raft-aware, one-pod-at-a-time update
+- accepts `rmqtt.io/delete-requested=true` on an individual Pod for a graceful single-Pod restart
 - keeps verified in-memory survivors available for best-effort MQTT traffic after lost Raft quorum
 - automatically restores a writable Raft quorum from the best surviving state
 
@@ -126,6 +127,80 @@ persisted in `status.operation.targetRestartAt`.
 Image-specific orchestration only selects the pod, deletes it after membership
 removal, verifies the target template, and enforces the per-pod stability
 window.
+
+## Restart One Pod Gracefully
+
+After deploying an operator version containing this feature, request a safe
+replacement of one existing Pod by annotating that Pod:
+
+```bash
+kubectl --kubeconfig ~/.kube/a800-local.yaml \
+  -n studio-ams-system \
+  annotate pod ams-rmqtt-2 rmqtt.io/delete-requested=true --overwrite
+```
+
+Replace `ams-rmqtt-2` with the Pod you want to restart. The command only submits
+the request; it returns before the restart finishes. This is a **single-Pod
+restart**, not scale-in: the StatefulSet recreates a Pod with the same name.
+Ordinary `kubectl delete pod` does not invoke this workflow.
+
+The operator waits for a healthy cluster, transfers leadership if needed,
+quiesces client traffic, drains messages/sessions through the existing reliable
+handoff barriers, and removes the target from Raft and business membership.
+Only then does it delete the original Pod. The replacement rejoins as a learner,
+catches up, becomes a voter, resumes serving, and passes the stability window.
+Clients may disconnect and need to reconnect. The replacement uses the
+StatefulSet template, with the image pinned for this operation. If
+`autoRollout=false`, this can also apply a previously pending image/template
+update to that one Pod.
+
+Requests share the existing operation lock with image rollouts, full rolling
+restarts, membership repair, and scaling. Those operations take precedence over
+pending Pod requests. Multiple Pod annotations are processed one at a time in
+ascending Pod ordinal order. Repeating `true` on the same original Pod while
+its request is pending/running coalesces into one request. If another rollout or
+external deletion already replaces a queued Pod, its request disappears with
+that old Pod. Requests must be placed on individual Pods, never on
+`spec.pod.annotations` or the StatefulSet template.
+
+Progress and the most recent result are available on the cluster:
+
+```bash
+kubectl --kubeconfig ~/.kube/a800-local.yaml -n studio-ams-system \
+  get rmqttcluster ams-rmqtt \
+  -o jsonpath='{.status.phase}{"\n"}{.status.message}{"\n"}{.status.operation}{"\n"}{.status.lastPodRestart}{"\n"}'
+```
+
+While active, `status.operation.type` is `PodRestart`; `targetPodName` and
+`targetPodUid` identify the original Pod. The operator persists the target and
+phase so a controller restart resumes the same operation. Deletion uses a UID
+precondition, protecting a replacement that already has the same name. After
+completion, `status.operation` is cleared and `status.lastPodRestart` records
+`Succeeded` or `Failed`, the original UID, the time, and an explanation.
+
+This explicit graceful restart always rolls back on a drain timeout or unsafe
+handoff, even if `spec.raft.drainTimeoutAction` is `ForceContinue` for other
+operations. After rollback succeeds, the original Pod remains, the request
+annotation is removed, and the failed result is recorded. Resolve the reported
+cause and run the annotation command again to retry. If rollback itself or
+membership removal cannot be confirmed, the operation stays blocked and reports
+the error; other requests remain queued. The drain timeout uses
+`spec.raft.drainTimeoutSeconds`; stabilization uses
+`spec.imageUpdate.stabilizationSeconds` with a minimum of 10 seconds.
+
+To withdraw a request **before the operator accepts it**, remove its annotation:
+
+```bash
+kubectl --kubeconfig ~/.kube/a800-local.yaml -n studio-ams-system \
+  annotate pod ams-rmqtt-2 rmqtt.io/delete-requested-
+```
+
+Removing the annotation after `status.operation` records the request does not
+cancel an in-progress drain/replacement. No CRD schema or RBAC changes are
+needed; users need permission to annotate the Pod and the operator uses its
+existing Pod read/patch/delete permissions.
+
+## Drain Safety for Image Rollouts and Scale-in
 
 The operator refuses scale-in or image replacement unless every current
 broker acknowledges reliable handoff support. `endpointRemovalStableSeconds`
@@ -251,6 +326,10 @@ learner promotion, pod readiness, drain, leadership transfer, scale-in,
 Running, blocked states and errors only when their status signature changes.
 Changing progress text alone does not emit a new line, so the five-second
 reconcile interval does not create repeated INFO logs.
+
+Status-transition logs include the leader's Pod name next to its Raft ID, for
+example `leader_id=2 leader_pod_name=ams-rmqtt-1`. Raft IDs start at 1 while Pod
+ordinals start at 0. An unknown or invalid leader ID produces `leader_pod_name=-`.
 
 Set `RUST_LOG=debug` only while diagnosing a problem. DEBUG includes every
 cluster reconcile cycle and is intentionally more verbose.

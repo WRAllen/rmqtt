@@ -64,6 +64,14 @@ pub trait DelayedSender: Sync + Send {
     ///Delayed message count
     async fn len(&self) -> usize;
 
+    /// Optional monitoring-only length from already maintained state. Never
+    /// perform I/O, wait for a lock, scan messages, or start asynchronous work.
+    /// A busy/unsupported source returns `None`; metrics must not call `len`.
+    #[inline]
+    fn metrics_len(&self) -> Option<usize> {
+        None
+    }
+
     #[inline]
     async fn is_empty(&self) -> bool {
         self.len().await == 0
@@ -179,5 +187,26 @@ impl DelayedSender for DefaultDelayedSender {
     #[inline]
     async fn len(&self) -> usize {
         self.msgs.read().await.len()
+    }
+
+    #[inline]
+    fn metrics_len(&self) -> Option<usize> {
+        self.msgs.try_read().ok().map(|messages| messages.len())
+    }
+}
+
+#[cfg(test)]
+mod metrics_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn metrics_len_skips_a_busy_heap_instead_of_waiting() {
+        // Construct directly to avoid starting the business expiration loop.
+        let sender = DefaultDelayedSender { scx: None, msgs: Arc::new(RwLock::new(BinaryHeap::new())) };
+        assert_eq!(sender.metrics_len(), Some(0));
+        let writer = sender.msgs.write().await;
+        assert_eq!(sender.metrics_len(), None);
+        drop(writer);
+        assert_eq!(sender.metrics_len(), Some(0));
     }
 }

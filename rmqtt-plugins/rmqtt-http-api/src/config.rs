@@ -93,7 +93,7 @@ impl PluginConfig {
 
     #[inline]
     fn prometheus_metrics_cache_interval_default() -> Duration {
-        Duration::from_secs(5)
+        Duration::from_secs(30)
     }
 
     #[inline]

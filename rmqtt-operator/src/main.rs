@@ -13,6 +13,9 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::time::sleep;
 
+mod pod_restart;
+use pod_restart::{PodRestartTarget, POD_DELETE_REQUESTED_ANNOTATION};
+
 const GROUP: &str = "rmqtt.io";
 const VERSION: &str = "v1alpha1";
 const PLURAL: &str = "rmqttclusters";
@@ -200,6 +203,8 @@ struct ClusterSpec {
     // This is never read from or written to RmqttCluster.spec.
     #[serde(skip)]
     rollout_restart_at: Option<String>,
+    #[serde(skip)]
+    pod_restart: Option<PodRestartTarget>,
 }
 
 impl Default for ClusterSpec {
@@ -216,6 +221,7 @@ impl Default for ClusterSpec {
             pod: BrokerPodSpec::default(),
             monitoring: MonitoringSpec::default(),
             rollout_restart_at: None,
+            pod_restart: None,
         }
     }
 }
@@ -417,8 +423,19 @@ struct PodMetadata {
     labels: BTreeMap<String, String>,
     #[serde(default)]
     annotations: BTreeMap<String, String>,
+    #[serde(rename = "ownerReferences", default)]
+    owner_references: Vec<PodOwnerReference>,
     #[serde(rename = "deletionTimestamp", default)]
     deletion_timestamp: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PodOwnerReference {
+    kind: String,
+    name: String,
+    uid: String,
+    #[serde(default)]
+    controller: bool,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -463,6 +480,8 @@ struct StatefulSet {
 
 #[derive(Debug, Deserialize, Default)]
 struct StatefulSetMetadata {
+    #[serde(default)]
+    uid: String,
     #[serde(default)]
     annotations: BTreeMap<String, String>,
 }
@@ -1130,6 +1149,10 @@ struct OperationStatus {
     #[serde(default)]
     target_restart_at: Option<String>,
     #[serde(default)]
+    target_pod_name: Option<String>,
+    #[serde(default)]
+    target_pod_uid: Option<String>,
+    #[serde(default)]
     started_at: Option<String>,
     #[serde(default)]
     stable_since: Option<String>,
@@ -1162,11 +1185,11 @@ impl OperationStatus {
 }
 
 fn is_rollout_operation_kind(kind: &str) -> bool {
-    matches!(kind, "RollingImageUpdate" | "RollingRestart")
+    matches!(kind, "RollingImageUpdate" | "RollingRestart" | "PodRestart")
 }
 
 fn rollout_is_restart(spec: &ClusterSpec) -> bool {
-    spec.rollout_restart_at.is_some()
+    spec.rollout_restart_at.is_some() || spec.pod_restart.is_some()
 }
 
 fn operator_managed_rollout_enabled(spec: &ClusterSpec) -> bool {
@@ -1182,7 +1205,9 @@ fn rollout_phase<'a>(spec: &ClusterSpec, image_phase: &'a str, restart_phase: &'
 }
 
 fn rollout_action(spec: &ClusterSpec) -> &'static str {
-    if rollout_is_restart(spec) {
+    if spec.pod_restart.is_some() {
+        "single-pod restart"
+    } else if rollout_is_restart(spec) {
         "rolling restart"
     } else {
         "image rollout"
@@ -1660,6 +1685,25 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, mut cluster: Rmqt
         .filter(|operation| is_rollout_operation_kind(&operation.kind))
         .cloned();
     if let Some(operation) = image_rollout_operation {
+        if operation.kind == "PodRestart" {
+            let restart_cluster = pod_restart::resume_cluster(&cluster, &operation)?;
+            if !stateful_set.broker_template_matches(&restart_cluster.spec) {
+                apply_stateful_set(kube, namespace, &restart_cluster, current_replicas, false).await?;
+            }
+            if operation.phase == "RolledBack" {
+                return pod_restart::finish(
+                    kube,
+                    namespace,
+                    &restart_cluster,
+                    current_replicas,
+                    None,
+                    operation.last_error.as_deref(),
+                )
+                .await;
+            }
+            continue_image_rollout(kube, namespace, &restart_cluster, current_replicas, &operation).await?;
+            return Ok(());
+        }
         let mut requested_cluster = cluster.clone();
         requested_cluster.spec.rollout_restart_at.clone_from(&pending_restart_at);
         if image_rollout_terminal_target_superseded(&operation, &requested_cluster.spec) {
@@ -1967,6 +2011,12 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, mut cluster: Rmqt
         }
     }
 
+    if membership_ready_for_replicas(&membership, current_replicas)
+        && pod_restart::start_pending(kube, namespace, &cluster, &stateful_set, &membership).await?
+    {
+        return Ok(());
+    }
+
     let leader_id = membership.leader_id;
     let members = membership.business_peers.clone();
     let raft_ready = membership_ready_for_replicas(&membership, current_replicas);
@@ -2128,6 +2178,9 @@ fn validate_spec(spec: &ClusterSpec) -> Result<()> {
         bail!(
             "spec.pod.annotations must not set reserved annotation {KUBECTL_RESTARTED_AT_ANNOTATION}; use kubectl rollout restart on the StatefulSet"
         );
+    }
+    if spec.pod.annotations.contains_key(POD_DELETE_REQUESTED_ANNOTATION) {
+        bail!("spec.pod.annotations must not set {POD_DELETE_REQUESTED_ANNOTATION}; annotate an individual Pod instead");
     }
     if spec.raft.endpoint_removal_stable_seconds < 1 {
         bail!("spec.raft.endpointRemovalStableSeconds must be >= 1");
@@ -2842,6 +2895,10 @@ async fn patch_image_rollout_status(
         "confChange": null,
         "observedGeneration": cluster.metadata.generation,
     });
+    if cluster.spec.pod_restart.is_some() {
+        // A single replacement is not progress toward updating every image.
+        status["updatedReplicas"] = Value::Null;
+    }
     if let Some(membership) = membership {
         status["leaderId"] = json!(membership.leader_id);
         status["members"] = json!(membership.business_peers);
@@ -2904,7 +2961,11 @@ fn rollout_leadership_target(
         .filter(|candidate| {
             pod_for_node(pods, cluster_name, *candidate).is_some_and(|pod| {
                 pod_is_ready(pod)
-                    && if rollout_is_restart(spec) {
+                    && if spec.pod_restart.is_some() {
+                        // These voters already belong to the same live cluster.
+                        // A single-pod request must also work with autoRollout disabled.
+                        true
+                    } else if rollout_is_restart(spec) {
                         // A restart does not change the binary compatibility
                         // boundary. Any ready voter already using the target
                         // image can safely receive leadership, including when
@@ -3326,6 +3387,11 @@ async fn continue_image_rollout_recovery(
         return Ok(());
     }
 
+    if cluster.spec.pod_restart.is_some() {
+        return pod_restart::finish(kube, namespace, cluster, current_replicas, Some(&membership), None)
+            .await;
+    }
+
     if current_replicas != cluster.spec.replicas {
         clear_reliable_handoff(namespace, cluster, current_replicas, node_id).await;
         patch_status(
@@ -3461,6 +3527,13 @@ async fn continue_image_rollout_before_recreation(
         )
         .await?;
         return Ok(());
+    }
+    if let Some(target) = cluster.spec.pod_restart.as_ref() {
+        if pod.is_none_or(|pod| pod.metadata.uid != target.pod_uid) {
+            // A replacement appeared between the caller's list and this one.
+            // Let the next reconciliation observe its recovery, never drain it.
+            return Ok(());
+        }
     }
 
     let remaining = rollout_remaining_node_ids(current_replicas, node_id);
@@ -3601,7 +3674,7 @@ async fn continue_image_rollout_before_recreation(
             false,
         )
         .await?;
-        kube.delete(&format!("/api/v1/namespaces/{namespace}/pods/{}", pod_name(name, node_id))).await?;
+        pod_restart::delete_rollout_pod(kube, namespace, cluster, node_id).await?;
         return Ok(());
     }
 
@@ -3807,6 +3880,27 @@ async fn continue_image_rollout_before_recreation(
     let leave_message = forced_drain_description.unwrap_or_else(|| {
         format!("node {node_id} drain barriers are stable; requesting graceful leave before recreation")
     });
+    if cluster.spec.pod_restart.is_some() {
+        // Draining may take minutes. A leader change or a failed sibling during
+        // that interval must prevent this explicit graceful deletion request.
+        let blocker = match leader_membership(kube, namespace, cluster, current_replicas).await {
+            Ok(fresh) => scale_in_removal_blocker(&fresh, current_replicas, node_id),
+            Err(error) => Some(format!("cannot verify membership immediately before leave: {error}")),
+        };
+        if let Some(reason) = blocker {
+            rollback_image_rollout_drain(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                node_id,
+                Some(&membership),
+                &reason,
+            )
+            .await?;
+            return Ok(());
+        }
+    }
     patch_image_rollout_status(
         kube,
         namespace,
@@ -3822,6 +3916,9 @@ async fn continue_image_rollout_before_recreation(
         false,
     )
     .await?;
+    if !pod_restart::original_still_present(kube, namespace, cluster).await? {
+        return Ok(());
+    }
     if let Err(error) = request_node_leave(namespace, cluster, node_id).await {
         patch_image_rollout_status(
             kube,
@@ -3892,7 +3989,7 @@ async fn continue_image_rollout_before_recreation(
         false,
     )
     .await?;
-    kube.delete(&format!("/api/v1/namespaces/{namespace}/pods/{}", pod_name(name, node_id))).await
+    pod_restart::delete_rollout_pod(kube, namespace, cluster, node_id).await
 }
 
 async fn continue_image_rollout(
@@ -5073,6 +5170,9 @@ fn pod_uses_target_image(pod: &Pod, spec: &ClusterSpec) -> bool {
 }
 
 fn pod_uses_rollout_target(pod: &Pod, spec: &ClusterSpec) -> bool {
+    if let Some(target) = spec.pod_restart.as_ref() {
+        return target.is_replacement(pod);
+    }
     pod_uses_target_image(pod, spec)
         && spec.rollout_restart_at.as_ref().is_none_or(|target| {
             pod.metadata.annotations.get(KUBECTL_RESTARTED_AT_ANNOTATION) == Some(target)
@@ -8931,6 +9031,13 @@ fn log_status_transition(namespace: &str, name: &str, status: &Value) {
     let target_restart_at = status_field(status, "/targetRestartAt");
     let updated_replicas = status_field(status, "/updatedReplicas");
     let leader_id = status_field(status, "/leaderId");
+    let leader_pod_name = status
+        .get("leaderId")
+        .and_then(Value::as_i64)
+        .and_then(|id| i32::try_from(id).ok())
+        .filter(|id| *id > 0)
+        .map(|id| pod_name(name, id))
+        .unwrap_or_else(|| "-".to_string());
     let members_ready = status_field(status, "/raftStatus/membersReady");
     let draining_node_id = status_field(status, "/drainingNodeId");
     let operation_type = status_field(status, "/operation/type");
@@ -8952,8 +9059,8 @@ fn log_status_transition(namespace: &str, name: &str, status: &Value) {
         "cluster status changed generation={generation} phase={phase} \
          operation_node_id={operation_node_id} replicas={replicas} ready_replicas={ready_replicas} \
          desired_replicas={desired_replicas} \
-         target_image={target_image} target_restart_at={target_restart_at} updated_replicas={updated_replicas} \
-         leader_id={leader_id} members_ready={members_ready} draining_node_id={draining_node_id} \
+         target_restart_at={target_restart_at} updated_replicas={updated_replicas} \
+         leader_id={leader_id} leader_pod_name={leader_pod_name} members_ready={members_ready} draining_node_id={draining_node_id} \
          operation_type={operation_type} operation_phase={operation_phase} operation_mode={operation_mode} \
          operation_retry_count={operation_retry_count} quorum_recovery_epoch={quorum_recovery_epoch} \
          quorum_recovery_phase={quorum_recovery_phase} quorum_recovery_seed_node_id={quorum_recovery_seed_node_id} \
@@ -8962,7 +9069,7 @@ fn log_status_transition(namespace: &str, name: &str, status: &Value) {
          quorum_recovery_unhealthy_node_id={quorum_recovery_unhealthy_node_id} \
          quorum_recovery_recycling_node_id={quorum_recovery_recycling_node_id} \
          quorum_recovery_recycle_attempts={quorum_recovery_recycle_attempts} message={message:?} \
-         namespace={namespace} cluster={name}"
+         namespace={namespace} cluster={name} target_image={target_image}"
     );
     if matches!(
         phase.as_str(),
@@ -8971,6 +9078,7 @@ fn log_status_transition(namespace: &str, name: &str, status: &Value) {
             | "ScaleInBlocked"
             | "ImageRolloutBlocked"
             | "RollingRestartBlocked"
+            | "PodRestartFailed"
             | "QuorumLost"
             | "RecoveryBlocked"
     ) {
@@ -9127,7 +9235,9 @@ fn image_rollout_operation_status_json(
             .and_then(|operation| operation.stable_since.clone())
     });
     let operation_kind = previous.map(|operation| operation.kind.as_str()).unwrap_or_else(|| {
-        if rollout_is_restart(&cluster.spec) {
+        if cluster.spec.pod_restart.is_some() {
+            "PodRestart"
+        } else if rollout_is_restart(&cluster.spec) {
             "RollingRestart"
         } else {
             "RollingImageUpdate"
@@ -9135,9 +9245,13 @@ fn image_rollout_operation_status_json(
     });
     let operation_mode =
         if rollout_is_restart(&cluster.spec) { "OperatorManagedRestart" } else { "OperatorManagedOnDelete" };
+    let operation_id = cluster.spec.pod_restart.as_ref().map_or_else(
+        || format!("{operation_kind}-{}-{node_id}", cluster.metadata.generation.unwrap_or_default()),
+        |target| format!("PodRestart-{}", target.pod_uid),
+    );
 
     json!({
-        "id": format!("{operation_kind}-{}-{node_id}", cluster.metadata.generation.unwrap_or_default()),
+        "id": operation_id,
         "type": operation_kind,
         "phase": phase,
         "nodeId": node_id,
@@ -9148,6 +9262,8 @@ fn image_rollout_operation_status_json(
         "targetImage": cluster.spec.image,
         "targetImagePullPolicy": cluster.spec.image_pull_policy,
         "targetRestartAt": cluster.spec.rollout_restart_at,
+        "targetPodName": cluster.spec.pod_restart.as_ref().map(|target| &target.pod_name),
+        "targetPodUid": cluster.spec.pod_restart.as_ref().map(|target| &target.pod_uid),
         "stabilizationSeconds": cluster.spec.image_update.stabilization_seconds,
         "startedAt": started_at,
         "stableSince": stable_since,
@@ -9168,7 +9284,8 @@ fn operation_stabilization_complete(operation: &OperationStatus, seconds: u64) -
 }
 
 fn image_rollout_terminal_target_superseded(operation: &OperationStatus, spec: &ClusterSpec) -> bool {
-    matches!(operation.phase.as_str(), "RolledBack" | "Blocked")
+    operation.kind != "PodRestart"
+        && matches!(operation.phase.as_str(), "RolledBack" | "Blocked")
         && (operation.target_image.as_deref() != Some(spec.image.as_str())
             || operation.target_image_pull_policy.as_deref() != Some(spec.image_pull_policy.as_str())
             || operation.target_restart_at != spec.rollout_restart_at)

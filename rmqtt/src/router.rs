@@ -56,8 +56,50 @@ use crate::types::*;
 use crate::utils::Counter;
 use crate::Result;
 
+/// Explicit monitoring semantics, separate from live router callbacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum MetricsRouteMerge {
+    /// Replicated routes: minimum current count, maximum high-water mark.
+    Replicated,
+    /// Independent routes: sum both current counts and high-water marks.
+    Sum,
+}
+
+impl MetricsRouteMerge {
+    pub fn merge(self, counters: &HashMap<NodeId, Counter>) -> Counter {
+        let merged = Counter::new();
+        for (i, counter) in counters.values().enumerate() {
+            if i == 0 {
+                merged.set(counter);
+            } else {
+                match self {
+                    Self::Replicated => {
+                        merged.count_min(counter.count());
+                        merged.max_max(counter.max());
+                    }
+                    Self::Sum => {
+                        merged.add(counter);
+                    }
+                }
+            }
+        }
+        merged
+    }
+}
+
+pub struct RouterMetricsSnapshot {
+    pub topics: Counter,
+    pub routes: Counter,
+    pub merge: MetricsRouteMerge,
+}
+
 #[async_trait]
 pub trait Router: Sync + Send {
+    /// Opt-in monitoring read: no I/O, scans, waiting, or business mutation.
+    /// Unknown extensions are omitted instead of calling live methods.
+    fn metrics_snapshot(&self) -> Option<RouterMetricsSnapshot> {
+        None
+    }
     /// Id add with topic filter
     async fn add(&self, topic_filter: &str, id: Id, opts: SubscriptionOptions) -> Result<()>;
 
@@ -562,6 +604,14 @@ impl Router for DefaultRouter {
     #[inline]
     fn topics(&self) -> Counter {
         self.topics_count.as_ref().clone()
+    }
+
+    fn metrics_snapshot(&self) -> Option<RouterMetricsSnapshot> {
+        Some(RouterMetricsSnapshot {
+            topics: self.topics_count.as_ref().clone(),
+            routes: self.relations_count.as_ref().clone(),
+            merge: MetricsRouteMerge::Replicated,
+        })
     }
 
     #[inline]

@@ -49,6 +49,10 @@ pub enum Message<'a> {
         #[serde(serialize_with = "serialize_json_value", deserialize_with = "deserialize_json_value")]
         msg: serde_json::Value,
     },
+    // Append only: existing bincode enum discriminants must not change.
+    MetricsSnapshotV1,
+    // V2 carries the router's monitoring merge policy. Never reinterpret V1.
+    MetricsSnapshotV2,
 }
 
 impl Message<'_> {
@@ -83,6 +87,9 @@ pub enum MessageReply {
         #[serde(serialize_with = "serialize_json_value", deserialize_with = "deserialize_json_value")]
         serde_json::Value,
     ),
+    // Pre-encoded local snapshot; receiving this request must never collect data.
+    MetricsSnapshotV1(Vec<u8>),
+    MetricsSnapshotV2(Vec<u8>),
 }
 
 impl MessageReply {
@@ -368,6 +375,57 @@ mod tests {
     use serde_json::json;
 
     use super::{Message, MessageReply};
+
+    #[test]
+    fn metrics_snapshot_request_keeps_existing_bincode_discriminants() {
+        let messages = [
+            (0u32, Message::BrokerInfo),
+            (1, Message::NodeInfo),
+            (3, Message::StatsInfo),
+            (4, Message::MetricsInfo),
+            (15, Message::SendPluginMessage { name: "raft", msg: json!({}) }),
+            (16, Message::MetricsSnapshotV1),
+            (17, Message::MetricsSnapshotV2),
+        ];
+        for (expected, message) in messages {
+            assert_eq!(&message.encode().unwrap()[..4], &expected.to_le_bytes());
+        }
+        assert_eq!(Message::MetricsSnapshotV1.encode().unwrap(), vec![16, 0, 0, 0]);
+        assert_eq!(Message::MetricsSnapshotV2.encode().unwrap(), vec![17, 0, 0, 0]);
+    }
+
+    #[test]
+    fn metrics_snapshot_reply_keeps_existing_bincode_discriminants() {
+        use rmqtt::node::{BrokerInfo, NodeInfo, NodeStatus};
+        use rmqtt::{metrics::Metrics, stats::Stats};
+
+        let broker = BrokerInfo {
+            version: String::new(),
+            rustc_version: String::new(),
+            uptime: String::new(),
+            sysdescr: String::new(),
+            node_status: NodeStatus::default(),
+            node_id: 1,
+            node_name: String::new(),
+            datetime: String::new(),
+        };
+        let replies = [
+            (0u32, MessageReply::BrokerInfo(broker)),
+            (1, MessageReply::NodeInfo(NodeInfo::default())),
+            (3, MessageReply::StatsInfo(NodeStatus::default(), Box::new(Stats::new()))),
+            (4, MessageReply::MetricsInfo(Box::new(Metrics::default()))),
+            (15, MessageReply::SendPluginMessage(json!({}))),
+            (16, MessageReply::MetricsSnapshotV1(Vec::new())),
+            (17, MessageReply::MetricsSnapshotV2(Vec::new())),
+        ];
+        for (expected, reply) in replies {
+            assert_eq!(&reply.encode().unwrap()[..4], &expected.to_le_bytes());
+        }
+        assert_eq!(
+            MessageReply::MetricsSnapshotV1(Vec::new()).encode().unwrap(),
+            vec![16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
 
     #[test]
     fn send_plugin_message_bincode_round_trip() {
