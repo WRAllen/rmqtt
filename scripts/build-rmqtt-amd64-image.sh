@@ -34,7 +34,7 @@ docker run --rm --platform linux/amd64 \
   -v "${CARGO_GIT_CACHE}:/usr/local/cargo/git" \
   -w /src \
   "${RMQTT_AMD64_BUILD_BASE_IMAGE}" \
-  sh -lc '. /usr/local/cargo/env && cargo build --release --target x86_64-unknown-linux-musl -p rmqttd'
+  sh -lc 'unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy; . /usr/local/cargo/env && cargo build --release --target x86_64-unknown-linux-musl -p rmqttd'
 
 if [[ ! -x "${BINARY}" ]]; then
   echo "错误：没有生成 ${BINARY}" >&2

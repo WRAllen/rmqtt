@@ -84,12 +84,19 @@ struct QueuedHandoff {
     pending: PendingHandoff,
     pinned_node_id: Option<NodeId>,
     remotely_completed: bool,
+    transport_uncertain: bool,
     rejected: bool,
 }
 
 impl QueuedHandoff {
     fn new(pending: PendingHandoff) -> Self {
-        Self { pending, pinned_node_id: None, remotely_completed: false, rejected: false }
+        Self {
+            pending,
+            pinned_node_id: None,
+            remotely_completed: false,
+            transport_uncertain: false,
+            rejected: false,
+        }
     }
 }
 
@@ -592,19 +599,69 @@ impl HandoffManager {
         applied
     }
 
-    /// Finish queued deliveries after the replicated router confirms that the
-    /// target session no longer exists. At that point the subscription has
-    /// terminated, so retaining these messages cannot lead to a future
-    /// delivery and would only keep a broker drain blocked forever.
-    pub(crate) fn retire_unowned_batch(&self, client_id: &str, batch: &[PendingHandoff]) -> usize {
-        let completed = batch
-            .iter()
-            .map(|pending| HandoffResult {
-                delivery_id: pending.delivery_id,
-                status: ReliableForwardStatus::Delivered,
+    /// Receiver queues and accepted remote pins cannot be retired by an
+    /// absence probe. They must finish the existing delivery acknowledgement.
+    pub(crate) fn has_protected_delivery(&self, client_id: &str, local_id: NodeId) -> bool {
+        self.queues.get(client_id).is_some_and(|entry| {
+            entry.lock().messages.iter().any(|item| {
+                item.pinned_node_id.is_some()
+                    || item.transport_uncertain
+                    || item.pending.delivery_id.origin_node_id != local_id
             })
-            .collect::<Vec<_>>();
-        self.apply_batch(client_id, 0, &completed).completed
+        })
+    }
+
+    pub(crate) fn mark_transport_uncertain(&self, client_id: &str, batch: &[PendingHandoff]) {
+        if let Some(entry) = self.queues.get(client_id) {
+            for item in &mut entry.lock().messages {
+                if batch.iter().any(|pending| pending.delivery_id == item.pending.delivery_id) {
+                    item.transport_uncertain = true;
+                }
+            }
+        }
+    }
+
+    /// Called only after cluster-wide absence verification. Recheck ownership
+    /// and pins under the queue lock, and retire only the captured DeliveryIds:
+    /// a concurrent enqueue for a new session must remain untouched.
+    pub(crate) fn retire_unowned_batch(
+        &self,
+        client_id: &str,
+        batch: &[PendingHandoff],
+        local_id: NodeId,
+    ) -> usize {
+        let Some(queue_ref) = self.queues.get(client_id).map(|entry| entry.clone()) else {
+            return 0;
+        };
+        let mut queue = queue_ref.lock();
+        let mut retired = 0;
+        for item in &mut queue.messages {
+            if item.pinned_node_id.is_none()
+                && !item.transport_uncertain
+                && item.pending.delivery_id.origin_node_id == local_id
+                && !item.remotely_completed
+                && batch.iter().any(|pending| pending.delivery_id == item.pending.delivery_id)
+            {
+                item.remotely_completed = true;
+                if item.rejected {
+                    item.rejected = false;
+                    self.failed_messages.fetch_sub(1, Ordering::SeqCst);
+                }
+                retired += 1;
+            }
+        }
+        let mut finished = Vec::new();
+        while queue.messages.front().is_some_and(|item| item.remotely_completed) {
+            finished.push(queue.messages.pop_front().expect("queue front exists"));
+        }
+        drop(queue);
+        for item in finished {
+            self.finish_item(item);
+        }
+        if retired > 0 {
+            self.progress_sequence.fetch_add(1, Ordering::Release);
+        }
+        retired
     }
 
     pub(crate) fn stop_worker(&self, client_id: &str) {
@@ -1335,7 +1392,7 @@ mod tests {
         manager.enqueue(live).await.unwrap();
 
         let batch = manager.next_batch("terminated-client").unwrap();
-        assert_eq!(manager.retire_unowned_batch("terminated-client", &batch.messages), 2);
+        assert_eq!(manager.retire_unowned_batch("terminated-client", &batch.messages, 1), 2);
         assert!(manager.next_batch("terminated-client").is_none());
 
         let stats = manager.stats();
@@ -1343,6 +1400,81 @@ mod tests {
         assert_eq!(stats.clients, 1);
         assert_eq!(manager.pending_for_node(2), 1);
         assert!(manager.next_batch("live-client").is_some());
+    }
+
+    #[tokio::test]
+    async fn retirement_rechecks_remote_pin_and_preserves_concurrent_enqueue() {
+        let manager = manager(10);
+        let old = pending(&manager, "client");
+        manager.enqueue(old.clone()).await.unwrap();
+        let captured = manager.next_batch("client").unwrap();
+        let new = pending(&manager, "client");
+        manager.enqueue(new.clone()).await.unwrap();
+        manager.apply_batch(
+            "client",
+            3,
+            &[HandoffResult { delivery_id: old.delivery_id, status: ReliableForwardStatus::Accepted }],
+        );
+        assert!(manager.has_protected_delivery("client", 1));
+        assert_eq!(manager.retire_unowned_batch("client", &captured.messages, 1), 0);
+        assert_eq!(manager.stats().pending_messages, 2);
+        manager.apply_batch(
+            "client",
+            3,
+            &[HandoffResult { delivery_id: old.delivery_id, status: ReliableForwardStatus::Delivered }],
+        );
+        assert_eq!(manager.next_batch("client").unwrap().messages[0].delivery_id, new.delivery_id);
+    }
+
+    #[tokio::test]
+    async fn receiver_queue_cannot_be_retired_by_an_absence_check() {
+        let manager = manager(10);
+        let inbound = pending(&manager, "client"); // Origin node 1, receiver node 2.
+        manager.enqueue(inbound).await.unwrap();
+        let captured = manager.next_batch("client").unwrap();
+        assert!(manager.has_protected_delivery("client", 2));
+        assert_eq!(manager.retire_unowned_batch("client", &captured.messages, 2), 0);
+        assert_eq!(manager.stats().pending_messages, 1);
+    }
+
+    #[tokio::test]
+    async fn uncertain_transport_requires_final_delivery_confirmation() {
+        let manager = manager(10);
+        let pending = pending(&manager, "client");
+        manager.enqueue(pending.clone()).await.unwrap();
+        let batch = manager.next_batch("client").unwrap();
+        manager.mark_transport_uncertain("client", &batch.messages);
+        assert!(manager.has_protected_delivery("client", 1));
+        manager.apply_batch(
+            "client",
+            2,
+            &[HandoffResult {
+                delivery_id: pending.delivery_id,
+                status: ReliableForwardStatus::Retryable("no session".into()),
+            }],
+        );
+        assert_eq!(manager.retire_unowned_batch("client", &batch.messages, 1), 0);
+        manager.apply_batch(
+            "client",
+            2,
+            &[HandoffResult { delivery_id: pending.delivery_id, status: ReliableForwardStatus::Duplicate }],
+        );
+        assert_eq!(manager.stats().pending_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn verified_retirement_during_drain_only_releases_captured_deliveries() {
+        let manager = manager(10);
+        manager.activate_drain(2);
+        manager.enqueue(pending(&manager, "client")).await.unwrap();
+        let captured = manager.next_batch("client").unwrap();
+        let new = pending(&manager, "client");
+        manager.enqueue(new.clone()).await.unwrap();
+        assert_eq!(manager.retire_unowned_batch("client", &captured.messages, 1), 1);
+        assert_eq!(manager.next_batch("client").unwrap().messages[0].delivery_id, new.delivery_id);
+        assert_eq!(manager.stats().pending_messages, 1);
+        assert_eq!(manager.pending_for_node(2), 1);
+        assert!(!manager.data_loss_detected());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

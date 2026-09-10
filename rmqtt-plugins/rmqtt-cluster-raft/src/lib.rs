@@ -42,6 +42,9 @@ mod raft_admin;
 mod router;
 mod shared;
 
+#[cfg(test)]
+mod reconcile_integration_tests;
+
 type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 
 #[derive(Default)]
@@ -914,6 +917,7 @@ impl ClusterPlugin {
                 "directAddVoter": true,
                 "selfLeave": true,
                 "reliableHandoff": self.shared.reliable_handoff_enabled(),
+                "sessionReconciliation": true,
                 "preDisconnectQuiesce": true,
                 "proactiveSessionHandoff": true,
                 "forceDrainFinalize": true,
@@ -928,16 +932,22 @@ impl ClusterPlugin {
     ) -> Result<OrphanedRouterReconcile> {
         let node_id = self.scx.node.id();
         let live_session_ids = self.shared.inner().iter().map(|entry| entry.id()).collect::<HashSet<_>>();
-        let orphaned_state_ids = self
+        let candidates = self
             .router
             .node_state_ids(node_id)
             .into_iter()
             .filter(|id| !live_session_ids.contains(id))
             .collect::<Vec<_>>();
 
-        for id in &orphaned_state_ids {
-            let proposal = message::Message::SessionTerminated { id: id.clone() }.encode()?;
-            raft_mailbox.send_proposal(proposal).await.map_err(anyhow::Error::new)?;
+        let mut orphaned_state_ids = Vec::new();
+        for id in candidates {
+            match self.shared.reconcile_handoff_session(&id.client_id, Some(&id)).await {
+                Ok(true) => orphaned_state_ids.push(id),
+                Ok(false) => {}
+                Err(error) => {
+                    log::debug!("orphaned session reconciliation deferred, id={id:?}, error={error:#}")
+                }
+            }
         }
         if !orphaned_state_ids.is_empty() {
             log::warn!(
@@ -951,7 +961,12 @@ impl ClusterPlugin {
         // SessionTerminated removes routes owned by the reconciled states.
         // Anything left without an exact state or live session is a route-only
         // orphan and must be removed through Raft so every replica converges.
-        let orphaned_routes = self.router.orphaned_node_routes(node_id, &live_session_ids);
+        let orphaned_routes = self
+            .router
+            .orphaned_node_routes(node_id, &live_session_ids)
+            .into_iter()
+            .filter(|(_, id)| !self.shared.local_session_busy(&id.client_id))
+            .collect::<Vec<_>>();
         for (topic_filter, id) in &orphaned_routes {
             let proposal = message::Message::Remove { topic_filter, id: id.clone() }.encode()?;
             raft_mailbox.send_proposal(proposal).await.map_err(anyhow::Error::new)?;

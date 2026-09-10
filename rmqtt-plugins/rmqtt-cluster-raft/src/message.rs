@@ -49,6 +49,9 @@ pub enum MessageReply {
     Error(String),
     HandshakeTryLock(Option<Id>),
     Ping,
+    // Appended to preserve existing bincode discriminants. No new Raft log
+    // command is needed: older leaders simply cannot certify this cleanup.
+    SessionTerminated { removed: bool },
 }
 
 impl MessageReply {
@@ -94,6 +97,13 @@ pub enum RaftGrpcMessage {
     /// so rolling upgrades never ask an older state machine to decode a new
     /// replicated command.
     SessionHandoff(SessionHandoff),
+    ProbeHandoffSession {
+        client_id: ClientId,
+    },
+    ReconcileHandoffSession {
+        client_id: ClientId,
+        expected_owner: Option<Id>,
+    },
 }
 
 impl RaftGrpcMessage {
@@ -112,6 +122,8 @@ pub enum RaftGrpcMessageReply {
     GetNodeHealthStatus(NodeHealthStatus),
     ReliableForwardBatch(Vec<ReliableForwardReply>),
     SessionHandoff(SessionHandoffReply),
+    HandoffSessionProbe { node_id: NodeId, busy: bool },
+    HandoffSessionReconciled { client_id: ClientId, expected_owner: Option<Id>, gone: bool },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -170,4 +182,42 @@ pub enum ReliableForwardStatus {
     Duplicate,
     Retryable(String),
     Rejected(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_rpc_and_raft_discriminants_remain_wire_compatible() {
+        assert_eq!(Message::GetClientNodeId { client_id: "x" }.encode().unwrap()[..4], 6u32.to_le_bytes());
+        assert_eq!(MessageReply::Ping.encode().unwrap(), 2u32.to_le_bytes());
+        assert_eq!(RaftGrpcMessage::GetNodeHealthStatus.encode().unwrap(), 0u32.to_le_bytes());
+        let batch = RaftGrpcMessage::ReliableForwardBatch(Vec::new()).encode().unwrap();
+        assert_eq!(&batch[..4], &1u32.to_le_bytes());
+        assert_eq!(&batch[4..], &0u64.to_le_bytes());
+        let ack = MessageReply::SessionTerminated { removed: true }.encode().unwrap();
+        assert!(matches!(
+            MessageReply::decode(&ack).unwrap(),
+            MessageReply::SessionTerminated { removed: true }
+        ));
+    }
+
+    #[test]
+    fn reconciliation_roundtrip_preserves_the_exact_expected_owner() {
+        let id = Id::new(4, 0, None, None, ClientId::from_static("old-client"), None);
+        let encoded = RaftGrpcMessage::ReconcileHandoffSession {
+            client_id: id.client_id.clone(),
+            expected_owner: Some(id.clone()),
+        }
+        .encode()
+        .unwrap();
+        match RaftGrpcMessage::decode(&encoded).unwrap() {
+            RaftGrpcMessage::ReconcileHandoffSession { client_id, expected_owner } => {
+                assert_eq!(client_id, id.client_id);
+                assert_eq!(expected_owner, Some(id));
+            }
+            _ => panic!("unexpected reconciliation message"),
+        }
+    }
 }

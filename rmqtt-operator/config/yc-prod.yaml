@@ -65,7 +65,7 @@ spec:
       scrapeTimeout: 10s
   raft:
     minReplicas: 3
-    drainTimeoutSeconds: 300
+    drainTimeoutSeconds: 1200
     endpointRemovalStableSeconds: 5
     scaleInStabilizationSeconds: 60
     handoffRollbackThresholdPercent: 80

@@ -44,6 +44,10 @@ fn is_orphaned_node_route(
         && !current_owner.is_some_and(|owner| owner == route_id)
 }
 
+fn remove_terminated_owner(states: &DashMap<ClientId, ClientStatus>, id: &Id) -> bool {
+    states.remove_if(&id.client_id, |_, status| status.id == *id).is_some()
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub(crate) struct ClientStatus {
     pub id: Id,
@@ -487,19 +491,13 @@ impl Store for ClusterRouter {
             }
             Message::SessionTerminated { id } => {
                 log::debug!("[Router.SessionTerminated] id: {id:?}",);
-                self.client_states.remove_if(&id.client_id, |_, status| {
-                    if status.id != id {
-                        log::debug!("[Router.SessionTerminated] id not the same, input id: {id:?}, current status: {status:?}");
-                        false
-                    } else {
-                        true
-                    }
-                });
+                let removed = remove_terminated_owner(&self.client_states, &id);
                 // Route removals normally arrive before SessionTerminated, but
                 // a transient proposal failure must not leave a route pointing
                 // at a session which no longer exists. The exact connection Id
                 // check keeps a newer connection with the same client id intact.
                 self.remove_client_routes(&id).await;
+                return MessageReply::SessionTerminated { removed }.encode().map_err(|_e| Error::Unknown);
             }
             Message::Add { topic_filter, id, opts } => {
                 log::debug!("[Router.add] topic_filter: {topic_filter:?}, id: {id:?}, opts: {opts:?}");
@@ -810,5 +808,18 @@ mod tests {
         let live_session_ids = HashSet::from([old_route_id.clone()]);
 
         assert!(!is_orphaned_node_route(1, &old_route_id, Some(&new_owner_id), &live_session_ids,));
+    }
+
+    #[test]
+    fn termination_ack_distinguishes_removed_missing_and_reconnected_owner() {
+        let states = DashMap::default();
+        let old = id(1, "client-a");
+        states.insert(old.client_id.clone(), ClientStatus::new(old.clone(), false, false));
+        assert!(remove_terminated_owner(&states, &old));
+        assert!(!remove_terminated_owner(&states, &old));
+        let new = Id::new(1, 0, None, Some("127.0.0.1:30001".parse().unwrap()), old.client_id.clone(), None);
+        states.insert(new.client_id.clone(), ClientStatus::new(new.clone(), true, false));
+        assert!(!remove_terminated_owner(&states, &old));
+        assert_eq!(states.get(&old.client_id).unwrap().id, new);
     }
 }

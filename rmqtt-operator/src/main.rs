@@ -14,7 +14,7 @@ use tokio::fs;
 use tokio::time::sleep;
 
 mod pod_restart;
-use pod_restart::{PodRestartTarget, POD_DELETE_REQUESTED_ANNOTATION};
+use pod_restart::{PodRestartTarget, POD_MANUAL_RESTART_ANNOTATION};
 
 const GROUP: &str = "rmqtt.io";
 const VERSION: &str = "v1alpha1";
@@ -41,6 +41,11 @@ const RECOVERY_SCAN_LOG_HEARTBEAT_SECONDS: u64 = 30;
 const QUORUM_RECOVERY_NODE_STABILIZATION_SECONDS: u64 = 15;
 const QUORUM_RECOVERY_NODE_UNHEALTHY_GRACE_SECONDS: u64 = 30;
 const QUORUM_RECOVERY_NODE_MAX_RECYCLE_ATTEMPTS: u32 = 2;
+// The Raft library accepts a transfer request before the target has actually
+// won an election. Give that election ample time to finish, then retry with
+// another eligible voter instead of waiting forever on a request Raft has
+// already abandoned.
+const LEADER_TRANSFER_RETRY_SECONDS: i64 = 30;
 
 const RENDER_SCRIPT: &str = r###"#!/bin/sh
 set -eu
@@ -983,6 +988,13 @@ enum VictimPodState {
     Absent,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ForcedPodRestartLeaveDecision {
+    DeletePod,
+    Wait(String),
+    RequestLeave,
+}
+
 impl fmt::Display for VictimPodState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -1153,7 +1165,13 @@ struct OperationStatus {
     #[serde(default)]
     target_pod_uid: Option<String>,
     #[serde(default)]
+    manual_restart: Option<String>,
+    #[serde(default)]
     started_at: Option<String>,
+    #[serde(default)]
+    leader_transfer_attempted_at: Option<String>,
+    #[serde(default)]
+    leader_transfer_retry_count: u32,
     #[serde(default)]
     stable_since: Option<String>,
     #[serde(default)]
@@ -1273,7 +1291,7 @@ fn default_raft_port() -> i32 {
 }
 
 fn default_drain_timeout_seconds() -> u64 {
-    300
+    1200
 }
 
 fn default_endpoint_removal_stable_seconds() -> u64 {
@@ -2179,8 +2197,8 @@ fn validate_spec(spec: &ClusterSpec) -> Result<()> {
             "spec.pod.annotations must not set reserved annotation {KUBECTL_RESTARTED_AT_ANNOTATION}; use kubectl rollout restart on the StatefulSet"
         );
     }
-    if spec.pod.annotations.contains_key(POD_DELETE_REQUESTED_ANNOTATION) {
-        bail!("spec.pod.annotations must not set {POD_DELETE_REQUESTED_ANNOTATION}; annotate an individual Pod instead");
+    if spec.pod.annotations.contains_key(POD_MANUAL_RESTART_ANNOTATION) {
+        bail!("spec.pod.annotations must not set {POD_MANUAL_RESTART_ANNOTATION}; annotate an individual Pod instead");
     }
     if spec.raft.endpoint_removal_stable_seconds < 1 {
         bail!("spec.raft.endpointRemovalStableSeconds must be >= 1");
@@ -2952,7 +2970,17 @@ fn rollout_leadership_target(
     spec: &ClusterSpec,
     victim_id: i32,
 ) -> Option<i32> {
-    membership
+    rollout_leadership_targets(membership, pods, cluster_name, spec, victim_id).into_iter().next()
+}
+
+fn rollout_leadership_targets(
+    membership: &MembershipStatus,
+    pods: &[Pod],
+    cluster_name: &str,
+    spec: &ClusterSpec,
+    victim_id: i32,
+) -> Vec<i32> {
+    let mut candidates = membership
         .voters
         .iter()
         .copied()
@@ -2976,7 +3004,32 @@ fn rollout_leadership_target(
                     }
             })
         })
-        .min()
+        .collect::<Vec<_>>();
+    candidates.sort_unstable();
+    candidates
+}
+
+fn rollout_leadership_target_for_retry(
+    membership: &MembershipStatus,
+    pods: &[Pod],
+    cluster_name: &str,
+    spec: &ClusterSpec,
+    victim_id: i32,
+    retry_count: u32,
+) -> Option<i32> {
+    let candidates = rollout_leadership_targets(membership, pods, cluster_name, spec, victim_id);
+    (!candidates.is_empty()).then(|| candidates[(retry_count as usize + 1) % candidates.len()])
+}
+
+fn leader_transfer_retry_due(operation: &OperationStatus, now: DateTime<Utc>) -> bool {
+    let Some(last_attempt_at) = operation.leader_transfer_attempted_at.as_deref() else {
+        return true;
+    };
+    let Ok(last_attempt_at) = DateTime::parse_from_rfc3339(last_attempt_at) else {
+        return true;
+    };
+    now.signed_duration_since(last_attempt_at.with_timezone(&Utc)).num_seconds()
+        >= LEADER_TRANSFER_RETRY_SECONDS
 }
 
 async fn wait_node_removed_from_membership(
@@ -3591,6 +3644,161 @@ async fn continue_image_rollout_before_recreation(
         )
         .await;
     }
+    if operation.phase == "ForceFinalizing" && cluster.spec.pod_restart.is_some() {
+        let blockers = operation
+            .last_error
+            .as_deref()
+            .unwrap_or("single-Pod drain timed out before all safety barriers converged");
+        if let Err(error) = ensure_force_drain_finalize_supported(namespace, cluster, current_replicas).await
+        {
+            // The intent is already persisted and an earlier attempt may have
+            // reached some brokers. Wait for a uniformly capable cluster; do
+            // not roll back state which may already have been discarded.
+            patch_image_rollout_status(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                "ForceFinalizingPodRestart",
+                format!(
+                    "manualRestart=force-on-timeout cleanup for node {node_id} is waiting for every broker to advertise support: {error}"
+                ),
+                node_id,
+                "ForceFinalizing",
+                Some(&membership),
+                None,
+                Some(blockers),
+                true,
+            )
+            .await?;
+            return Ok(());
+        }
+        match force_finalize_node_drain(
+            namespace,
+            cluster,
+            current_replicas,
+            node_id,
+            "pod_restart_drain_timeout",
+            blockers,
+        )
+        .await
+        {
+            Ok(summary) => {
+                record_forced_pod_restart_drain_status(kube, namespace, cluster, &summary).await?;
+            }
+            Err(error) => {
+                // Force finalization may already have completed on a subset of
+                // brokers. It is idempotent, so persist and retry instead of
+                // attempting to restore a state which may have been discarded.
+                patch_image_rollout_status(
+                    kube,
+                    namespace,
+                    cluster,
+                    current_replicas,
+                    "ForceFinalizingPodRestart",
+                    format!(
+                        "manualRestart=force-on-timeout cleanup for node {node_id} is incomplete and will retry: {error}"
+                    ),
+                    node_id,
+                    "ForceFinalizing",
+                    Some(&membership),
+                    None,
+                    Some(blockers),
+                    true,
+                )
+                .await?;
+            }
+        }
+        return Ok(());
+    }
+    if operation.phase == "ForceFinalized" && cluster.spec.pod_restart.is_some() {
+        match forced_pod_restart_leave_decision(&membership, current_replicas, node_id) {
+            ForcedPodRestartLeaveDecision::DeletePod => {
+                // The leave request may have completed immediately before an
+                // operator crash. Membership is the durable completion proof,
+                // so resume with the UID-protected Pod deletion.
+                patch_image_rollout_status(
+                    kube,
+                    namespace,
+                    cluster,
+                    current_replicas,
+                    "RestartingBroker",
+                    format!(
+                        "manualRestart=force-on-timeout cleanup completed and node {node_id} is absent from membership; deleting {}",
+                        pod_name(name, node_id)
+                    ),
+                    node_id,
+                    "DeletingPod",
+                    Some(&membership),
+                    None,
+                    None,
+                    false,
+                )
+                .await?;
+                pod_restart::delete_rollout_pod(kube, namespace, cluster, node_id).await?;
+                return Ok(());
+            }
+            ForcedPodRestartLeaveDecision::Wait(reason) => {
+                patch_image_rollout_status(
+                    kube,
+                    namespace,
+                    cluster,
+                    current_replicas,
+                    "WaitingForcedPodRestartPreconditions",
+                    format!(
+                        "manualRestart=force-on-timeout cleanup for node {node_id} completed; waiting to safely remove its membership: {reason}"
+                    ),
+                    node_id,
+                    "ForceFinalized",
+                    Some(&membership),
+                    None,
+                    Some(&reason),
+                    false,
+                )
+                .await?;
+                return Ok(());
+            }
+            ForcedPodRestartLeaveDecision::RequestLeave => {}
+        }
+        if let Err(error) = request_node_leave(namespace, cluster, node_id).await {
+            patch_image_rollout_status(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                "RollingRestartBlocked",
+                format!(
+                    "manualRestart=force-on-timeout cleanup for node {node_id} completed, but controlled membership removal failed: {error}"
+                ),
+                node_id,
+                "Blocked",
+                Some(&membership),
+                None,
+                Some(&error.to_string()),
+                true,
+            )
+            .await?;
+            return Ok(());
+        }
+        patch_image_rollout_status(
+            kube,
+            namespace,
+            cluster,
+            current_replicas,
+            "RestartingBroker",
+            format!(
+                "manualRestart=force-on-timeout cleanup for node {node_id} completed; waiting for controlled membership removal"
+            ),
+            node_id,
+            "WaitingMembershipRemoval",
+            Some(&membership),
+            None,
+            None,
+            false,
+        )
+        .await?;
+        return Ok(());
+    }
     if operation.phase == "Blocked" {
         patch_image_rollout_status(
             kube,
@@ -3678,25 +3886,6 @@ async fn continue_image_rollout_before_recreation(
         return Ok(());
     }
 
-    if operation.phase == "TransferringLeader" && membership.leader_id == Some(node_id) {
-        patch_image_rollout_status(
-            kube,
-            namespace,
-            cluster,
-            current_replicas,
-            "TransferringRaftLeader",
-            format!("waiting for node {node_id} to hand leadership to another caught-up voter"),
-            node_id,
-            "TransferringLeader",
-            Some(&membership),
-            None,
-            None,
-            false,
-        )
-        .await?;
-        return Ok(());
-    }
-
     if !membership_ready_for_replicas(&membership, current_replicas) {
         patch_image_rollout_status(
             kube,
@@ -3720,32 +3909,77 @@ async fn continue_image_rollout_before_recreation(
         return Ok(());
     }
     if membership.leader_id == Some(node_id) {
-        let transfer_target = rollout_leadership_target(&membership, &pods, name, &cluster.spec, node_id)
-            .ok_or_else(|| {
-                anyhow!("no already-updated caught-up voter is available for {action} leadership transfer")
-            })?;
-        rmqtt_action_value_with_payload(
+        let retrying = operation.phase == "TransferringLeader";
+        if retrying && !leader_transfer_retry_due(operation, Utc::now()) {
+            patch_image_rollout_status(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                "TransferringRaftLeader",
+                format!(
+                    "waiting for node {node_id} to hand leadership to another caught-up voter; the request will be retried if the leader does not change within {LEADER_TRANSFER_RETRY_SECONDS} seconds"
+                ),
+                node_id,
+                "TransferringLeader",
+                Some(&membership),
+                None,
+                operation.last_error.as_deref(),
+                false,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let transfer_target = if retrying {
+            rollout_leadership_target_for_retry(
+                &membership,
+                &pods,
+                name,
+                &cluster.spec,
+                node_id,
+                operation.leader_transfer_retry_count,
+            )
+        } else {
+            rollout_leadership_target(&membership, &pods, name, &cluster.spec, node_id)
+        }
+        .ok_or_else(|| {
+            anyhow!("no already-updated caught-up voter is available for {action} leadership transfer")
+        })?;
+        let transfer_result = rmqtt_action_value_with_payload(
             namespace,
             cluster,
             node_id,
             json!({"action": "transfer_leader", "id": transfer_target}),
         )
-        .await?;
+        .await;
+        let transfer_error = transfer_result.as_ref().err().map(ToString::to_string);
+        let message = if let Some(error) = transfer_error.as_deref() {
+            format!(
+                "leadership transfer request from node {node_id} to caught-up voter {transfer_target} failed and will retry: {error}"
+            )
+        } else if retrying {
+            format!(
+                "retried leadership transfer from node {node_id} to caught-up voter {transfer_target} because the previous request did not change the leader"
+            )
+        } else {
+            format!(
+                "requested leadership transfer from node {node_id} to updated caught-up voter {transfer_target} before {action}"
+            )
+        };
         patch_image_rollout_status(
             kube,
             namespace,
             cluster,
             current_replicas,
             "TransferringRaftLeader",
-            format!(
-                "requested leadership transfer from node {node_id} to updated caught-up voter {transfer_target} before {action}"
-            ),
+            message,
             node_id,
             "TransferringLeader",
             Some(&membership),
             None,
-            None,
-            false,
+            transfer_error.as_deref(),
+            retrying,
         )
         .await?;
         return Ok(());
@@ -3817,6 +4051,47 @@ async fn continue_image_rollout_before_recreation(
         }
         Ok(NodeDrainOutcome::TimedOut(blockers)) => {
             if cluster.spec.raft.drain_timeout_action == DrainTimeoutAction::ForceContinue {
+                if cluster.spec.pod_restart.is_some() {
+                    if let Err(error) =
+                        ensure_force_drain_finalize_supported(namespace, cluster, current_replicas).await
+                    {
+                        rollback_image_rollout_drain(
+                            kube,
+                            namespace,
+                            cluster,
+                            current_replicas,
+                            node_id,
+                            Some(&membership),
+                            &format!(
+                                "manualRestart=force-on-timeout capability check failed before destructive cleanup: {error}"
+                            ),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                    // Persist intent before the first destructive request. A
+                    // controller restart resumes idempotent force finalization
+                    // instead of returning to the rollback path.
+                    patch_image_rollout_status(
+                        kube,
+                        namespace,
+                        cluster,
+                        current_replicas,
+                        "ForceFinalizingPodRestart",
+                        format!(
+                            "node {node_id} drain exceeded {} seconds; manualRestart=force-on-timeout cleanup is authorized",
+                            cluster.spec.raft.drain_timeout_seconds
+                        ),
+                        node_id,
+                        "ForceFinalizing",
+                        Some(&membership),
+                        None,
+                        Some(&blockers),
+                        false,
+                    )
+                    .await?;
+                    return Ok(());
+                }
                 match force_finalize_node_drain(
                     namespace,
                     cluster,
@@ -4324,10 +4599,11 @@ async fn recover_scale_in_after_target_error(
     let name = cluster.metadata.name.as_str();
     let victim_id = conf_change.node_id;
     log::warn!(
-        "scale-in target request failed; verifying cluster facts namespace={} cluster={} node_id={} phase={} error={}",
+        "scale-in target request failed; verifying cluster facts namespace={} cluster={} node_id={} pod_name={} phase={} error={}",
         namespace,
         name,
         victim_id,
+        pod_name(name, victim_id),
         failed_phase,
         error
     );
@@ -4373,10 +4649,11 @@ async fn recover_scale_in_after_target_error(
         observation.business_member,
     );
     log::warn!(
-        "scale-in facts after target request failure namespace={} cluster={} node_id={} pod_state={} stateful_set_replicas={} raft_member={} business_member={} decision={:?}",
+        "scale-in facts after target request failure namespace={} cluster={} node_id={} pod_name={} pod_state={} stateful_set_replicas={} raft_member={} business_member={} decision={:?}",
         namespace,
         name,
         victim_id,
+        pod_name(name, victim_id),
         observation.pod_state,
         observation.stateful_set_replicas,
         observation.raft_member,
@@ -4527,10 +4804,11 @@ async fn block_scale_in_after_non_transient_target_error(
     let name = cluster.metadata.name.as_str();
     let victim_id = conf_change.node_id;
     log::warn!(
-        "scale-in target request returned a non-transient error namespace={} cluster={} node_id={} phase={} error={}",
+        "scale-in target request returned a non-transient error namespace={} cluster={} node_id={} pod_name={} phase={} error={}",
         namespace,
         name,
         victim_id,
+        pod_name(name, victim_id),
         failed_phase,
         error
     );
@@ -5254,13 +5532,14 @@ async fn local_membership_observations(
                 let kind = error.kind.label();
                 scan.failure_kinds.entry(kind.to_string()).or_default().push(node_id);
                 scan.failures.insert(node_id, error.to_string());
+                let target_pod = pod_name(&cluster.metadata.name, node_id);
                 if error.is_transient() {
                     log::debug!(
-                        "RMQTT membership query failed and will be included in the recovery scan summary node_id={node_id} kind={kind} error={error}"
+                        "RMQTT membership query failed and will be included in the recovery scan summary node_id={node_id} pod_name={target_pod} kind={kind} error={error}"
                     );
                 } else {
                     log::warn!(
-                        "non-transient RMQTT membership query failure node_id={node_id} kind={kind} error={error}"
+                        "non-transient RMQTT membership query failure node_id={node_id} pod_name={target_pod} kind={kind} error={error}"
                     );
                 }
             }
@@ -5484,21 +5763,22 @@ async fn fresh_recovery_node_signals(
 
     let pod_ready = pod_is_ready(pod);
     let payload = json!({"action": "membership"});
-    let local_membership_healthy =
-        match try_rmqtt_action_value_once(namespace, cluster, node_id, payload).await {
-            Ok(value) => serde_json::from_value::<MembershipStatus>(value).ok().is_some_and(|membership| {
-                recovery_membership_locally_healthy(&membership, node_id, leader_id)
-            }),
-            Err(error) => {
-                log::debug!(
-                    "fresh recovery node membership recheck failed node_id={} error_kind={} error={}",
-                    node_id,
-                    error.kind.label(),
-                    error
-                );
-                false
-            }
-        };
+    let result = try_rmqtt_action_value_once(namespace, cluster, node_id, payload).await;
+    let local_membership_healthy = match result {
+        Ok(value) => serde_json::from_value::<MembershipStatus>(value)
+            .ok()
+            .is_some_and(|membership| recovery_membership_locally_healthy(&membership, node_id, leader_id)),
+        Err(error) => {
+            log::debug!(
+                "fresh recovery node membership recheck failed node_id={} pod_name={} error_kind={} error={}",
+                node_id,
+                pod_name(&cluster.metadata.name, node_id),
+                error.kind.label(),
+                error
+            );
+            false
+        }
+    };
     Ok(Some((pod_ready, local_membership_healthy)))
 }
 
@@ -5851,8 +6131,9 @@ async fn begin_quorum_recovery(
         .await
         {
             log::warn!(
-                "failed to prepare quorum recovery on survivor node_id={} epoch={} error={error:#}",
+                "failed to prepare quorum recovery on survivor node_id={} pod_name={} epoch={} error={error:#}",
                 node_id,
+                pod_name(&cluster.metadata.name, node_id),
                 epoch
             );
         }
@@ -7118,8 +7399,9 @@ async fn handle_unhealthy_recovery_voter(
             recovery.recycle_attempts.insert(node_id.to_string(), attempts);
         }
         log::warn!(
-            "recovery Pod delete UID precondition was rejected; cancelled the pending recycle without consuming an attempt node_id={} expected_pod_uid={} namespace={} cluster={}",
+            "recovery Pod delete UID precondition was rejected; cancelled the pending recycle without consuming an attempt node_id={} pod_name={} expected_pod_uid={} namespace={} cluster={}",
             node_id,
+            pod_name,
             pod_uid,
             namespace,
             cluster.metadata.name,
@@ -7147,9 +7429,10 @@ async fn handle_unhealthy_recovery_voter(
         .await;
     }
     log::warn!(
-        "event=QUORUM_RECOVERY_NODE_RECYCLE epoch={} node_id={} pod_uid={} attempt={}/{} namespace={} cluster={}",
+        "event=QUORUM_RECOVERY_NODE_RECYCLE epoch={} node_id={} pod_name={} pod_uid={} attempt={}/{} namespace={} cluster={}",
         recovery.epoch,
         node_id,
+        pod_name,
         pod_uid,
         attempt,
         QUORUM_RECOVERY_NODE_MAX_RECYCLE_ATTEMPTS,
@@ -7723,6 +8006,33 @@ async fn leader_membership_from_nodes(
     bail!("no authoritative raft leader returned membership; {}", observations.join("; "));
 }
 
+async fn ensure_force_drain_finalize_supported(
+    namespace: &str,
+    cluster: &RmqttCluster,
+    replicas: i32,
+) -> Result<()> {
+    for node_id in 1..=replicas {
+        let status = rmqtt_action::<MembershipStatus>(namespace, cluster, node_id, "membership")
+            .await
+            .with_context(|| format!("query force-finalize capability from node {node_id}"))?;
+        validate_force_drain_finalize_support(node_id, &status)?;
+    }
+    Ok(())
+}
+
+fn validate_force_drain_finalize_support(expected_node_id: i32, status: &MembershipStatus) -> Result<()> {
+    if status.id != expected_node_id
+        || status.supports.get("forceDrainFinalize").and_then(Value::as_bool) != Some(true)
+    {
+        bail!(
+            "node {expected_node_id} did not advertise supports.forceDrainFinalize=true (reported id={}, supports={})",
+            status.id,
+            status.supports
+        );
+    }
+    Ok(())
+}
+
 async fn observe_scale_in_state(
     kube: &KubeClient,
     namespace: &str,
@@ -7832,16 +8142,18 @@ async fn try_rmqtt_action_value_with_payload(
             Err(error) if retry_safe && error.is_transient() && attempt < 3 => {
                 if action == Some("membership") {
                     log::debug!(
-                        "transient RMQTT membership request failed, retrying node_id={} attempt={}/3 error_kind={} error={}",
+                        "transient RMQTT membership request failed, retrying node_id={} pod_name={} attempt={}/3 error_kind={} error={}",
                         node_id,
+                        pod_name(&cluster.metadata.name, node_id),
                         attempt,
                         error.kind.label(),
                         error
                     );
                 } else {
                     log::warn!(
-                        "transient RMQTT control request failed, retrying node_id={} payload={} attempt={}/3 error={}",
+                        "transient RMQTT control request failed, retrying node_id={} pod_name={} payload={} attempt={}/3 error={}",
                         node_id,
+                        pod_name(&cluster.metadata.name, node_id),
                         payload,
                         attempt,
                         error
@@ -8051,10 +8363,11 @@ async fn force_finalize_node_drain(
         bail!("target node {target_id} did not confirm force-finalized local drain state");
     }
     log::warn!(
-        "forced drain finalized namespace={} cluster={} target_id={} reason={} nodes_acknowledged={} handoff_messages_discarded={} handoff_bytes_discarded={} handoff_clients_affected={} local_sessions_requested={} local_session_acks={} session_handoffs_discarded={} router_states_removed={} routes_removed={} blockers={}",
+        "forced drain finalized namespace={} cluster={} target_id={} pod_name={} reason={} nodes_acknowledged={} handoff_messages_discarded={} handoff_bytes_discarded={} handoff_clients_affected={} local_sessions_requested={} local_session_acks={} session_handoffs_discarded={} router_states_removed={} routes_removed={} blockers={}",
         namespace,
         cluster.metadata.name,
         target_id,
+        pod_name(&cluster.metadata.name, target_id),
         reason,
         summary.nodes_acknowledged,
         summary.handoff_messages_discarded,
@@ -8079,6 +8392,33 @@ async fn record_forced_drain_status(
     kube.merge_patch(
         &format!("/apis/{GROUP}/{VERSION}/namespaces/{namespace}/{PLURAL}/{}/status", cluster.metadata.name),
         &json!({"status": {"lastForcedDrain": summary.to_status_json()}}),
+    )
+    .await
+}
+
+async fn record_forced_pod_restart_drain_status(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    summary: &ForceDrainFinalizeSummary,
+) -> Result<()> {
+    let description = summary.description();
+    // Record the lossy result and the resumable phase atomically. Once this
+    // patch lands, a controller restart must proceed toward membership removal
+    // and must not execute force finalization a second time merely to recover
+    // the discarded counters.
+    kube.merge_patch(
+        &format!("/apis/{GROUP}/{VERSION}/namespaces/{namespace}/{PLURAL}/{}/status", cluster.metadata.name),
+        &json!({"status": {
+            "phase": "ForceFinalizingPodRestart",
+            "message": description,
+            "lastForcedDrain": summary.to_status_json(),
+            "operation": {
+                "phase": "ForceFinalized",
+                "lastAttemptAt": utc_now_rfc3339(),
+                "lastError": null,
+            },
+        }}),
     )
     .await
 }
@@ -8145,10 +8485,11 @@ async fn clear_reliable_handoff(namespace: &str, cluster: &RmqttCluster, replica
         broadcast_handoff_action(namespace, cluster, replicas, "clear_drain", target_id, None).await
     {
         log::warn!(
-            "failed to clear reliable handoff marker namespace={} cluster={} target_id={} error={:#}",
+            "failed to clear reliable handoff marker namespace={} cluster={} target_id={} pod_name={} error={:#}",
             namespace,
             cluster.metadata.name,
             target_id,
+            pod_name(&cluster.metadata.name, target_id),
             error
         );
     }
@@ -8328,10 +8669,11 @@ async fn wait_node_drain_barriers(
         let blockers = drain_blockers(&status, &routing);
         if last_progress_log.elapsed() >= Duration::from_secs(30) {
             log::info!(
-                "node drain progress namespace={} cluster={} node_id={} local_ready={} routing_ready={} stable_rounds={} blockers={}",
+                "node drain progress namespace={} cluster={} node_id={} pod_name={} local_ready={} routing_ready={} stable_rounds={} blockers={}",
                 namespace,
                 cluster.metadata.name,
                 node_id,
+                pod_name(&cluster.metadata.name, node_id),
                 local_ready,
                 routing_ready,
                 stable_rounds,
@@ -9005,6 +9347,30 @@ fn status_field(status: &Value, pointer: &str) -> String {
     }
 }
 
+fn status_log_target(status: &Value) -> Option<(&'static str, i32)> {
+    // Recovery can pause a pending join to repair an earlier voter. Show that
+    // foreground target, not every referenced node or the next queued join.
+    [
+        ("recycling", "/quorumRecovery/recyclingNodeId"),
+        ("unhealthy", "/quorumRecovery/unhealthyNodeId"),
+        ("stabilizing", "/quorumRecovery/stabilizingNodeId"),
+        ("restarting", "/quorumRecovery/restartingNodeId"),
+        ("operation", "/operation/nodeId"),
+        ("draining", "/drainingNodeId"),
+        ("conf_change", "/confChange/nodeId"),
+        ("seed", "/quorumRecovery/seedNodeId"),
+    ]
+    .into_iter()
+    .find_map(|(role, pointer)| {
+        status
+            .pointer(pointer)
+            .and_then(Value::as_i64)
+            .and_then(|id| i32::try_from(id).ok())
+            .filter(|id| *id > 0)
+            .map(|id| (role, id))
+    })
+}
+
 fn log_status_transition(namespace: &str, name: &str, status: &Value) {
     let signature = status_log_signature(status);
     let cache = LAST_LOGGED_STATUS.get_or_init(|| Mutex::new(HashMap::new()));
@@ -9022,6 +9388,25 @@ fn log_status_transition(namespace: &str, name: &str, status: &Value) {
         return;
     }
 
+    let details = status_transition_details(namespace, name, status);
+    if matches!(
+        status_field(status, "/phase").as_str(),
+        "Degraded"
+            | "DegradedServing"
+            | "ScaleInBlocked"
+            | "ImageRolloutBlocked"
+            | "RollingRestartBlocked"
+            | "PodRestartFailed"
+            | "QuorumLost"
+            | "RecoveryBlocked"
+    ) {
+        log::warn!("{details}");
+    } else {
+        log::info!("{details}");
+    }
+}
+
+fn status_transition_details(namespace: &str, name: &str, status: &Value) -> String {
     let phase = status_field(status, "/phase");
     let generation = status_field(status, "/observedGeneration");
     let replicas = status_field(status, "/replicas");
@@ -9054,9 +9439,13 @@ fn log_status_transition(namespace: &str, name: &str, status: &Value) {
     let quorum_recovery_recycling_node_id = status_field(status, "/quorumRecovery/recyclingNodeId");
     let quorum_recovery_recycle_attempts = status_field(status, "/quorumRecovery/recycleAttempts");
     let message = status_field(status, "/message");
+    let (target_role, target_node_id, target_pod_name) = status_log_target(status)
+        .map(|(role, id)| (role, id.to_string(), pod_name(name, id)))
+        .unwrap_or_else(|| ("-", "-".to_string(), "-".to_string()));
 
-    let details = format!(
+    format!(
         "cluster status changed generation={generation} phase={phase} \
+         target_role={target_role} target_node_id={target_node_id} target_pod_name={target_pod_name} \
          operation_node_id={operation_node_id} replicas={replicas} ready_replicas={ready_replicas} \
          desired_replicas={desired_replicas} \
          target_restart_at={target_restart_at} updated_replicas={updated_replicas} \
@@ -9070,22 +9459,7 @@ fn log_status_transition(namespace: &str, name: &str, status: &Value) {
          quorum_recovery_recycling_node_id={quorum_recovery_recycling_node_id} \
          quorum_recovery_recycle_attempts={quorum_recovery_recycle_attempts} message={message:?} \
          namespace={namespace} cluster={name} target_image={target_image}"
-    );
-    if matches!(
-        phase.as_str(),
-        "Degraded"
-            | "DegradedServing"
-            | "ScaleInBlocked"
-            | "ImageRolloutBlocked"
-            | "RollingRestartBlocked"
-            | "PodRestartFailed"
-            | "QuorumLost"
-            | "RecoveryBlocked"
-    ) {
-        log::warn!("{details}");
-    } else {
-        log::info!("{details}");
-    }
+    )
 }
 
 fn labels(name: &str) -> BTreeMap<String, String> {
@@ -9229,6 +9603,20 @@ fn image_rollout_operation_status_json(
         previous.and_then(|operation| operation.started_at.clone()).unwrap_or_else(|| now.clone());
     let retry_count =
         previous.map(|operation| operation.retry_count).unwrap_or(0) + u32::from(increment_retry);
+    let previous_transfer =
+        previous.filter(|operation| operation.node_id == node_id && operation.phase == "TransferringLeader");
+    let leader_transfer_attempted_at = (phase == "TransferringLeader").then(|| {
+        previous_transfer
+            .filter(|_| !increment_retry)
+            .and_then(|operation| operation.leader_transfer_attempted_at.clone())
+            .unwrap_or_else(|| now.clone())
+    });
+    let leader_transfer_retry_count = if phase == "TransferringLeader" {
+        previous_transfer.map(|operation| operation.leader_transfer_retry_count).unwrap_or(0)
+            + u32::from(increment_retry)
+    } else {
+        0
+    };
     let stable_since = stable_since.or_else(|| {
         previous
             .filter(|operation| operation.node_id == node_id && operation.phase == phase)
@@ -9264,10 +9652,13 @@ fn image_rollout_operation_status_json(
         "targetRestartAt": cluster.spec.rollout_restart_at,
         "targetPodName": cluster.spec.pod_restart.as_ref().map(|target| &target.pod_name),
         "targetPodUid": cluster.spec.pod_restart.as_ref().map(|target| &target.pod_uid),
+        "manualRestart": cluster.spec.pod_restart.as_ref().map(|target| target.manual_restart.as_str()),
         "stabilizationSeconds": cluster.spec.image_update.stabilization_seconds,
         "startedAt": started_at,
         "stableSince": stable_since,
         "lastAttemptAt": now,
+        "leaderTransferAttemptedAt": leader_transfer_attempted_at,
+        "leaderTransferRetryCount": leader_transfer_retry_count,
         "retryCount": retry_count,
         "lastError": last_error
     })
@@ -9423,6 +9814,23 @@ fn scale_in_removal_blocker(
         ));
     }
     None
+}
+
+fn forced_pod_restart_leave_decision(
+    membership: &MembershipStatus,
+    current_replicas: i32,
+    victim_id: i32,
+) -> ForcedPodRestartLeaveDecision {
+    let still_in_membership = voter_exists(membership, victim_id)
+        || membership.learners.contains(&victim_id)
+        || member_exists(&membership.business_peers, victim_id);
+    if !still_in_membership {
+        return ForcedPodRestartLeaveDecision::DeletePod;
+    }
+    match scale_in_removal_blocker(membership, current_replicas, victim_id) {
+        Some(reason) => ForcedPodRestartLeaveDecision::Wait(reason),
+        None => ForcedPodRestartLeaveDecision::RequestLeave,
+    }
 }
 
 struct KubeClient {
@@ -10057,6 +10465,81 @@ mod tests {
         let mut with_target = pods;
         with_target.push(recovery_ready_pod(4));
         assert_eq!(missing_recovery_target_blockers(&with_target, "rmqtt", 4), None);
+    }
+
+    #[test]
+    fn status_log_names_only_the_primary_target_and_existing_leader() {
+        let routing = [RoutingStatus { id: 3, target_id: 5, handoff_pending: 1, ..Default::default() }];
+        let blockers = drain_blockers(&DrainStatus::default(), &routing);
+        assert!(blockers.contains("node 3 still sees target 5"));
+        assert!(!blockers.contains("pod_name"));
+        let status = json!({
+            "phase": "DrainingNode",
+            "leaderId": 2,
+            "operation": {"nodeId": 5},
+            "drainingNodeId": 5,
+            "message": blockers,
+        });
+        let details = status_transition_details("studio-ams-system", "ams-rmqtt", &status);
+        assert!(details.contains("target_role=operation target_node_id=5 target_pod_name=ams-rmqtt-4"));
+        assert!(details.contains("leader_id=2 leader_pod_name=ams-rmqtt-1"));
+        assert!(details.contains("node 3 still sees target 5"));
+        assert!(!details.contains("ams-rmqtt-2"));
+        assert_eq!(details.matches("pod_name=").count(), 2);
+    }
+
+    #[test]
+    fn status_log_target_prefers_foreground_recovery_over_pending_join() {
+        let mut status = json!({
+            "operation": {"nodeId": 5},
+            "quorumRecovery": {
+                "seedNodeId": 1,
+                "restartingNodeId": 5,
+                "stabilizingNodeId": 4,
+                "unhealthyNodeId": 3,
+                "recyclingNodeId": 2,
+            },
+        });
+        for (role, id, key) in [
+            ("recycling", 2, "recyclingNodeId"),
+            ("unhealthy", 3, "unhealthyNodeId"),
+            ("stabilizing", 4, "stabilizingNodeId"),
+            ("restarting", 5, "restartingNodeId"),
+        ] {
+            assert_eq!(status_log_target(&status), Some((role, id)));
+            let details = status_transition_details("ns", "rmqtt", &status);
+            assert_eq!(details.matches("target_pod_name=").count(), 1);
+            assert!(details.contains(&format!("target_pod_name=rmqtt-{}", id - 1)));
+            status["quorumRecovery"][key] = Value::Null;
+        }
+        assert_eq!(status_log_target(&status), Some(("operation", 5)));
+        status["operation"] = Value::Null;
+        assert_eq!(status_log_target(&status), Some(("seed", 1)));
+    }
+
+    #[test]
+    fn status_log_target_handles_drain_and_membership_change_without_an_operation() {
+        let mut status = json!({"drainingNodeId": 5, "confChange": {"nodeId": 4}});
+        assert_eq!(status_log_target(&status), Some(("draining", 5)));
+        status["drainingNodeId"] = Value::Null;
+        assert_eq!(status_log_target(&status), Some(("conf_change", 4)));
+    }
+
+    #[test]
+    fn status_log_target_never_maps_invalid_ids_or_member_lists_to_pods() {
+        for invalid_id in [Value::Null, json!(0), json!(-1), json!(2147483648i64), json!("5")] {
+            let status = json!({
+                "leaderId": invalid_id,
+                "operation": {"nodeId": invalid_id},
+                "quorumRecovery": {"survivorNodeIds": [1, 2, 3]},
+            });
+            assert_eq!(status_log_target(&status), None);
+            let details = status_transition_details("ns", "rmqtt", &status);
+            assert!(details.contains("target_role=- target_node_id=- target_pod_name=-"));
+            assert!(details.contains("leader_pod_name=-"));
+        }
+        assert_eq!(status_log_target(&json!({"leaderId": 2})), None);
+        assert_eq!(status_log_target(&json!({})), None);
     }
 
     #[test]
@@ -11306,7 +11789,7 @@ mod tests {
             },
             {
                 "metadata": {"name": "rmqtt-2"},
-                "spec": {"containers": [{"name": "rmqtt", "image": "example/rmqtt:old", "imagePullPolicy": "IfNotPresent"}]},
+                "spec": {"containers": [{"name": "rmqtt", "image": "example/rmqtt:new", "imagePullPolicy": "IfNotPresent"}]},
                 "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]}
             }
         ]))
@@ -11341,6 +11824,65 @@ mod tests {
         };
 
         assert_eq!(rollout_leadership_target(&membership, &pods, "rmqtt", &spec, 1), Some(2));
+        assert_eq!(rollout_leadership_target_for_retry(&membership, &pods, "rmqtt", &spec, 1, 0), Some(3));
+        assert_eq!(rollout_leadership_target_for_retry(&membership, &pods, "rmqtt", &spec, 1, 1), Some(2));
+    }
+
+    #[test]
+    fn leader_transfer_retry_waits_for_its_deadline_and_recovers_from_bad_status_time() {
+        let operation: OperationStatus = serde_json::from_value(json!({
+            "type": "RollingImageUpdate",
+            "phase": "TransferringLeader",
+            "leaderTransferAttemptedAt": "2026-09-12T08:00:00Z"
+        }))
+        .unwrap();
+        let before_deadline =
+            DateTime::parse_from_rfc3339("2026-09-12T08:00:29Z").unwrap().with_timezone(&Utc);
+        let at_deadline = DateTime::parse_from_rfc3339("2026-09-12T08:00:30Z").unwrap().with_timezone(&Utc);
+        assert!(!leader_transfer_retry_due(&operation, before_deadline));
+        assert!(leader_transfer_retry_due(&operation, at_deadline));
+
+        let missing_time: OperationStatus = serde_json::from_value(json!({
+            "type": "RollingImageUpdate",
+            "phase": "TransferringLeader"
+        }))
+        .unwrap();
+        assert!(leader_transfer_retry_due(&missing_time, at_deadline));
+    }
+
+    #[test]
+    fn waiting_for_leader_transfer_preserves_the_attempt_timestamp() {
+        let cluster: RmqttCluster = serde_json::from_value(json!({
+            "metadata": {"name": "rmqtt", "generation": 4},
+            "spec": {"replicas": 3, "image": "example/rmqtt:v2"},
+            "status": {
+                "operation": {
+                    "type": "RollingImageUpdate",
+                    "phase": "TransferringLeader",
+                    "nodeId": 1,
+                    "leaderTransferAttemptedAt": "2026-09-12T08:00:00Z",
+                    "leaderTransferRetryCount": 2
+                }
+            }
+        }))
+        .unwrap();
+
+        let waiting =
+            image_rollout_operation_status_json(&cluster, 1, 3, "TransferringLeader", None, None, false);
+        assert_eq!(waiting["leaderTransferAttemptedAt"], "2026-09-12T08:00:00Z");
+        assert_eq!(waiting["leaderTransferRetryCount"], 2);
+
+        let retrying = image_rollout_operation_status_json(
+            &cluster,
+            1,
+            3,
+            "TransferringLeader",
+            None,
+            Some("previous transfer did not complete"),
+            true,
+        );
+        assert_ne!(retrying["leaderTransferAttemptedAt"], "2026-09-12T08:00:00Z");
+        assert_eq!(retrying["leaderTransferRetryCount"], 3);
     }
 
     #[test]

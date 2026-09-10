@@ -174,7 +174,7 @@ spec:
                     drainTimeoutSeconds:
                       type: integer
                       minimum: 1
-                      default: 300
+                      default: 1200
                     endpointRemovalStableSeconds:
                       type: integer
                       minimum: 1

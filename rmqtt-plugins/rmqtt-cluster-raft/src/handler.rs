@@ -147,7 +147,11 @@ impl Handler for HookHandler {
                         return (false, Some(HookResult::GrpcMessageReply(Ok(MessageReply::Success))));
                     }
                     GrpcMessage::Kick(id, clean_start, clear_subscriptions, is_admin) => {
-                        let mut entry = self.shared.inner().entry(id.clone());
+                        let _transition = self.shared.begin_session_transition(id.client_id.clone());
+                        let mut entry = match self.shared.lock_session_for_takeover(id.clone()).await {
+                            Ok(entry) => entry,
+                            Err(error) => return (false, Some(HookResult::GrpcMessageReply(Err(error)))),
+                        };
                         let source_draining = self.shared.is_draining();
                         let source_session_id = entry.session().map(|session| session.id.clone());
                         let preserve_relocated = source_session_id
@@ -271,6 +275,38 @@ impl Handler for HookHandler {
                                         HookResult::GrpcMessageReply(Ok(MessageReply::Error(e.to_string())))
                                     }
                                 }
+                            }
+                            Ok(RaftGrpcMessage::ProbeHandoffSession { client_id }) => {
+                                let result =
+                                    self.shared.probe_handoff_session(&client_id).await.and_then(|busy| {
+                                        RaftGrpcMessageReply::HandoffSessionProbe {
+                                            node_id: self.scx.node.id(),
+                                            busy,
+                                        }
+                                        .encode()
+                                    });
+                                HookResult::GrpcMessageReply(Ok(match result {
+                                    Ok(data) => MessageReply::Data(data),
+                                    Err(error) => MessageReply::Error(error.to_string()),
+                                }))
+                            }
+                            Ok(RaftGrpcMessage::ReconcileHandoffSession { client_id, expected_owner }) => {
+                                let result = self
+                                    .shared
+                                    .reconcile_handoff_session(&client_id, expected_owner.as_ref())
+                                    .await
+                                    .and_then(|gone| {
+                                        RaftGrpcMessageReply::HandoffSessionReconciled {
+                                            client_id,
+                                            expected_owner,
+                                            gone,
+                                        }
+                                        .encode()
+                                    });
+                                HookResult::GrpcMessageReply(Ok(match result {
+                                    Ok(data) => MessageReply::Data(data),
+                                    Err(error) => MessageReply::Error(error.to_string()),
+                                }))
                             }
                         };
                         return (false, Some(new_acc));

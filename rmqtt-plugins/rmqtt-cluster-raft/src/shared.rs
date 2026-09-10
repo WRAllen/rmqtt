@@ -41,6 +41,9 @@ use super::message::{
 use super::nodes::ClusterNodeManager;
 use super::ClusterRouter;
 
+mod reconcile;
+use reconcile::{SessionReconcileLimits, SessionTransition, SessionTransitions};
+
 #[inline]
 pub(crate) fn effective_source_session_policy(
     clean_start: bool,
@@ -66,6 +69,7 @@ pub struct ClusterLockEntry {
     inner: Box<dyn Entry>,
     cluster_shared: ClusterShared,
     prev_node_id: Option<NodeId>,
+    _transition: Option<SessionTransition>,
 }
 
 impl ClusterLockEntry {
@@ -77,7 +81,7 @@ impl ClusterLockEntry {
         cluster_shared: ClusterShared,
         prev_node_id: Option<NodeId>,
     ) -> Self {
-        Self { scx, exec, inner, cluster_shared, prev_node_id }
+        Self { scx, exec, inner, cluster_shared, prev_node_id, _transition: None }
     }
 }
 
@@ -85,6 +89,7 @@ impl ClusterLockEntry {
 impl Entry for ClusterLockEntry {
     #[inline]
     async fn try_lock(&self) -> Result<Box<dyn Entry>> {
+        let transition = self.cluster_shared.session_transitions.begin(self.id().client_id.clone());
         if self.cluster_shared.is_draining() || self.cluster_shared.local_handoff_prepared() {
             return Err(anyhow!(
                 "node {} is preparing to drain and is not accepting new MQTT sessions",
@@ -118,13 +123,15 @@ impl Entry for ClusterLockEntry {
                 }
             }
         }
-        Ok(Box::new(ClusterLockEntry::new(
+        let mut locked = ClusterLockEntry::new(
             self.scx.clone(),
             self.exec.clone(),
             self.inner.try_lock().await?,
             self.cluster_shared.clone(),
             prev_node_id,
-        )))
+        );
+        locked._transition = Some(transition);
+        Ok(Box::new(locked))
     }
 
     #[inline]
@@ -381,6 +388,8 @@ pub struct ClusterShared {
     nodes: ClusterNodeManager,
     draining: Arc<AtomicBool>,
     handoff: Arc<HandoffManager>,
+    session_transitions: SessionTransitions,
+    reconcile_limits: SessionReconcileLimits,
     // Operator-provided destinations for proactive session relocation. This
     // map is populated only during planned maintenance, so normal forwarding
     // and session setup do not pay for membership filtering.
@@ -430,6 +439,8 @@ impl ClusterShared {
             nodes,
             draining,
             handoff: Arc::new(HandoffManager::new(handoff_cfg)),
+            session_transitions: SessionTransitions::default(),
+            reconcile_limits: SessionReconcileLimits::default(),
             drain_allowed_targets: Arc::new(DashMap::new()),
             drain_session_handoffs: Arc::new(DashMap::new()),
             proactive_session_handoffs: Arc::new(DashMap::new()),
@@ -667,20 +678,23 @@ impl ClusterShared {
     /// reconnect (which has a newer epoch) always wins.
     pub(crate) async fn accept_session_handoff(
         &self,
-        handoff: SessionHandoff,
+        mut handoff: SessionHandoff,
     ) -> Result<SessionHandoffReply> {
         let source_id = handoff.offline.id.clone();
+        let _transition = self.session_transitions.begin(source_id.client_id.clone());
         let destination_id = source_id.relocated_to(self.scx.node.id());
 
         if let Some(existing) = self.inner.entry(destination_id.clone()).session() {
-            return Ok(SessionHandoffReply {
-                installed: existing.id == destination_id,
-                destination_id: existing.id.clone(),
-            });
+            if existing.id != destination_id {
+                return Ok(SessionHandoffReply { installed: false, destination_id: existing.id.clone() });
+            }
         }
 
         if let Some(status) = self.router.status(&source_id.client_id) {
             if status.id != source_id && status.id != destination_id {
+                if status.handshaking {
+                    return Err(anyhow!("session reconnect is still in progress"));
+                }
                 // A normal client reconnect has already established a newer
                 // owner.  Never replace it with the older standby snapshot.
                 return Ok(SessionHandoffReply { destination_id: status.id, installed: false });
@@ -689,16 +703,18 @@ impl ClusterShared {
 
         let mut local_entry = self.inner.entry(destination_id.clone()).try_lock().await?;
         if let Some(existing) = local_entry.session() {
+            if existing.id == destination_id {
+                // A prior request may have installed the snapshot but lost a
+                // Raft acknowledgement or failed to register all routes. Do
+                // not acknowledge a partial install or re-enqueue its data.
+                self.relocated_sessions.insert(destination_id.client_id.clone(), destination_id.clone());
+                self.finish_relocated_session(&destination_id, &handoff.offline.subscriptions).await?;
+            }
             return Ok(SessionHandoffReply {
                 installed: existing.id == destination_id,
                 destination_id: existing.id.clone(),
             });
         }
-
-        // Claim the replicated owner before installing routes. Connected uses
-        // the preserved epoch and is rejected if a newer reconnect won the
-        // race after the status check above.
-        self.propose_session_state(RaftMessage::Connected { id: destination_id.clone() }).await?;
 
         let Some(listen_cfg) = self.scx.listen_cfgs.get(&source_id.lid()).map(|entry| entry.clone()) else {
             let _ = self
@@ -742,6 +758,13 @@ impl ClusterShared {
                 return Err(error);
             }
         };
+        // Install the complete local snapshot BEFORE advertising ownership.
+        // Otherwise a concurrent Clean Start reconnect can query this node
+        // while its entry is still absent, get NotExist, and lose the snapshot.
+        // Routes must follow Connected, so restore local subscriptions now
+        // and postpone their Raft proposals until after the entry is visible.
+        let subscriptions = std::mem::take(&mut handoff.offline.subscriptions);
+        session.subscriptions_extend(subscriptions.clone()).await?;
         let expiry = Duration::from_millis(handoff.session_expiry_millis.max(1));
         let tx =
             match SessionState::offline_restart_with_state(session.clone(), handoff.offline, expiry).await {
@@ -753,18 +776,22 @@ impl ClusterShared {
                     return Err(error);
                 }
             };
-        if self.router.status(&destination_id.client_id).is_some_and(|status| status.id != destination_id) {
+        if self
+            .router
+            .status(&destination_id.client_id)
+            .is_some_and(|status| status.id != source_id && status.id != destination_id)
+        {
             let (ack_tx, _ack_rx) = tokio::sync::oneshot::channel();
             let _ =
                 tx.unbounded_send(rmqtt::types::Message::Kick(ack_tx, destination_id.clone(), false, false));
             let _ = self
                 .propose_session_state(RaftMessage::SessionTerminated { id: destination_id.clone() })
                 .await;
-            let current_id = self
-                .router
-                .status(&destination_id.client_id)
-                .map(|status| status.id)
-                .unwrap_or_else(|| destination_id.clone());
+            let current = self.router.status(&destination_id.client_id);
+            if current.as_ref().is_some_and(|status| status.handshaking) {
+                return Err(anyhow!("session reconnect is still in progress"));
+            }
+            let current_id = current.map(|status| status.id).unwrap_or_else(|| destination_id.clone());
             return Ok(SessionHandoffReply { destination_id: current_id, installed: false });
         }
         if let Err(error) = local_entry.set(session, tx).await {
@@ -774,8 +801,26 @@ impl ClusterShared {
             return Err(error);
         }
         self.relocated_sessions.insert(destination_id.client_id.clone(), destination_id.clone());
-        self.propose_session_state(RaftMessage::Disconnected { id: destination_id.clone() }).await?;
+        self.finish_relocated_session(&destination_id, &subscriptions).await?;
         Ok(SessionHandoffReply { destination_id, installed: true })
+    }
+
+    async fn finish_relocated_session(
+        &self,
+        destination_id: &Id,
+        subscriptions: &rmqtt::types::Subscriptions,
+    ) -> Result<()> {
+        // Connected preserves the old epoch and cannot replace a newer
+        // connection that won the race. Keep the entry lock through route
+        // installation so a takeover receives the complete subscription set.
+        // On failure preserve the local copy: the proposal may have applied
+        // despite a lost response. A retry completes metadata without replay.
+        self.propose_session_state(RaftMessage::Connected { id: destination_id.clone() }).await?;
+        for (topic_filter, opts) in subscriptions {
+            self.router.add(topic_filter, destination_id.clone(), opts.clone()).await?;
+        }
+        self.propose_session_state(RaftMessage::Disconnected { id: destination_id.clone() }).await?;
+        Ok(())
     }
 
     fn session_handoff_targets(&self, client_id: &ClientId) -> Vec<NodeId> {
@@ -865,6 +910,7 @@ impl ClusterShared {
                 .max(Duration::from_secs(600))
                 .as_millis()
                 .min(u64::MAX as u128) as u64;
+            let _transition = self.session_transitions.begin(client_id.clone());
             let mut locked = match entry.try_lock().await {
                 Ok(locked) => locked,
                 Err(_) => continue,
@@ -886,6 +932,9 @@ impl ClusterShared {
         let mut migrated = 0usize;
         let mut failures = 0usize;
         for client_id in pending {
+            // Mark the transfer before taking its snapshot: rollback can
+            // clear the cache even while this RPC still owns a live copy.
+            let _transition = self.session_transitions.begin(client_id.clone());
             let Some(handoff) = self.proactive_session_handoffs.get(&client_id).map(|entry| entry.clone())
             else {
                 continue;
@@ -987,6 +1036,8 @@ impl ClusterShared {
     async fn run_handoff_worker(self, client_id: ClientId) {
         let mut timeout_reported_for = None;
         let mut retry_delay = self.handoff.retry_interval();
+        let reconcile_interval = Duration::from_millis(5_000 + (self.scx.node.id() % 17) * 37);
+        let mut next_reconcile = tokio::time::Instant::now() + reconcile_interval;
         loop {
             let Some(batch) = self.handoff.next_batch(&client_id) else {
                 return;
@@ -996,23 +1047,34 @@ impl ClusterShared {
                 return;
             };
 
-            // A SessionTerminated proposal removes both the client state and
-            // its routes. Messages which entered handoff during that cleanup
-            // race no longer have an MQTT session to receive them. Only retire
-            // an unpinned batch: once a receiver accepts a delivery, the source
-            // must keep polling that receiver for the idempotent completion.
-            if !self.handoff.operation_active()
-                && batch.pinned_node_id.is_none()
-                && self.router.status(&front.target_client_id).is_none()
+            // Reconcile only maintenance-queue deliveries owned by this
+            // sender. Absence in a local router snapshot is not proof of
+            // termination: another node may still hold a session snapshot.
+            if batch.pinned_node_id.is_none()
+                && front.delivery_id.origin_node_id == self.scx.node.id()
+                && tokio::time::Instant::now() >= next_reconcile
             {
-                let retired = self.handoff.retire_unowned_batch(&client_id, &batch.messages);
-                if retired > 0 {
-                    log::info!(
-                        "retired {retired} obsolete reliable handoff deliveries after session termination, client_id={client_id}"
-                    );
-                    retry_delay = self.handoff.retry_interval();
+                let result = self.reconcile_queued_session(&client_id).await;
+                next_reconcile = tokio::time::Instant::now() + reconcile_interval;
+                match result {
+                    Ok(true) if self.router.id(&client_id).is_none() => {
+                        let retired = self.handoff.retire_unowned_batch(
+                            &client_id, &batch.messages, self.scx.node.id(),
+                        );
+                        if retired > 0 {
+                            log::warn!(
+                                "retired obsolete reliable handoff deliveries, client_id={client_id}, origin_node_id={}, messages={retired}, reason=confirmed_session_absent; these deliveries were not acknowledged as delivered to the MQTT client",
+                                self.scx.node.id(),
+                            );
+                            retry_delay = self.handoff.retry_interval();
+                        }
+                        continue;
+                    }
+                    Err(error) => log::debug!(
+                        "reliable handoff session reconciliation deferred, client_id={client_id}, error={error:#}"
+                    ),
+                    _ => {}
                 }
-                continue;
             }
             if front.created_at.elapsed() >= self.handoff.retry_timeout()
                 && timeout_reported_for != Some(front.delivery_id)
@@ -1097,6 +1159,10 @@ impl ClusterShared {
                     }
                 }
                 Err(e) => {
+                    // A timeout cannot establish whether a receiver accepted
+                    // this batch. Keep it ineligible for absence retirement
+                    // until the existing delivery protocol finishes it.
+                    self.handoff.mark_transport_uncertain(&client_id, &batch.messages);
                     log::debug!(
                         "reliable handoff batch transport retry, first_delivery_id={:?}, batch_messages={}, client_id={}, target_node_id={}, error={:?}",
                         front.delivery_id,

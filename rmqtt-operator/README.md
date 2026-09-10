@@ -20,7 +20,7 @@ The operator owns the Kubernetes reconciliation flow for an RMQTT raft cluster:
 - checks both raft voters and business-layer gRPC peers before completing a scale step
 - drains and removes one voter before reducing StatefulSet replicas
 - optionally turns an RMQTT image change into a Raft-aware, one-pod-at-a-time update
-- accepts `rmqtt.io/delete-requested=true` on an individual Pod for a graceful single-Pod restart
+- accepts `rmqtt.io/manual-restart` on an individual Pod for a controlled single-Pod restart with an explicit timeout policy
 - keeps verified in-memory survivors available for best-effort MQTT traffic after lost Raft quorum
 - automatically restores a writable Raft quorum from the best surviving state
 
@@ -99,6 +99,12 @@ prepare reliable handoff on every broker (new forwards receive delivery IDs)
 
 Image replacement composes the same node-drain executor used by scale-in and
 the same learner catch-up classifier used by scale-out/restart recovery.
+Before replacing a current Leader, the operator confirms the transfer by
+observing a different authoritative Leader. An accepted Raft transfer request
+is not treated as completion. If the Leader is unchanged after 30 seconds, the
+operator revalidates full membership health and retries the request, rotating
+through the eligible ready and caught-up voters. It never starts draining or
+deletes the current Leader while the transfer is still pending.
 
 ## Rolling Restart
 
@@ -128,21 +134,40 @@ Image-specific orchestration only selects the pod, deletes it after membership
 removal, verifies the target template, and enforces the per-pod stability
 window.
 
-## Restart One Pod Gracefully
+## Restart One Pod
 
-After deploying an operator version containing this feature, request a safe
-replacement of one existing Pod by annotating that Pod:
+After deploying an operator version containing this feature, choose how a drain
+timeout should be handled and annotate the existing Pod:
 
 ```bash
 kubectl --kubeconfig ~/.kube/a800-local.yaml \
   -n studio-ams-system \
-  annotate pod ams-rmqtt-2 rmqtt.io/delete-requested=true --overwrite
+  annotate pod ams-rmqtt-2 rmqtt.io/manual-restart=rollback-on-timeout --overwrite
 ```
 
-Replace `ams-rmqtt-2` with the Pod you want to restart. The command only submits
-the request; it returns before the restart finishes. This is a **single-Pod
-restart**, not scale-in: the StatefulSet recreates a Pod with the same name.
-Ordinary `kubectl delete pod` does not invoke this workflow.
+Use `rollback-on-timeout` when the original Pod must be retained if the drain
+does not finish in time. Use `force-on-timeout` when the operator may perform
+controlled force cleanup and continue the replacement after that timeout:
+
+```bash
+kubectl --kubeconfig ~/.kube/a800-local.yaml \
+  -n studio-ams-system \
+  annotate pod ams-rmqtt-2 rmqtt.io/manual-restart=force-on-timeout --overwrite
+```
+
+Both types first run the same graceful drain. `force-on-timeout` does not force
+an immediate deletion. Replace `ams-rmqtt-2` with the Pod you want to restart.
+The command only submits the request; it returns before the restart finishes.
+This is a **single-Pod restart**, not scale-in: the StatefulSet recreates a Pod
+with the same name. Ordinary `kubectl delete pod` does not invoke this workflow.
+
+The annotation itself submits the restart request and selects its timeout
+policy. `manual-restart=rollback-on-timeout` corresponds to `Rollback`, and
+`manual-restart=force-on-timeout` corresponds to `ForceContinue`. For this single-Pod
+request the annotation takes precedence over `spec.raft.drainTimeoutAction`;
+image upgrades, full rolling restarts, and scale-in continue to use that
+cluster-wide setting. Both use `spec.raft.drainTimeoutSeconds` (default: 1200 seconds).
+Existing clusters with an explicit value retain that value until it is patched.
 
 The operator waits for a healthy cluster, transfers leadership if needed,
 quiesces client traffic, drains messages/sessions through the existing reliable
@@ -157,11 +182,15 @@ update to that one Pod.
 Requests share the existing operation lock with image rollouts, full rolling
 restarts, membership repair, and scaling. Those operations take precedence over
 pending Pod requests. Multiple Pod annotations are processed one at a time in
-ascending Pod ordinal order. Repeating `true` on the same original Pod while
-its request is pending/running coalesces into one request. If another rollout or
-external deletion already replaces a queued Pod, its request disappears with
-that old Pod. Requests must be placed on individual Pods, never on
-`spec.pod.annotations` or the StatefulSet template.
+ascending Pod ordinal order. Repeating the annotation on the same original Pod
+while its request is pending or running coalesces into one request. Once
+accepted, the operator freezes the Pod name, original UID, and restart timeout policy in
+status, so overwriting the annotation cannot change an in-progress operation.
+If another rollout or external deletion already replaces a queued Pod, its
+request disappears with that old Pod. Requests must be placed on individual
+Pods, never on `spec.pod.annotations` or the StatefulSet template. Any value
+other than `rollback-on-timeout` or `force-on-timeout` is rejected and reported
+as `InvalidPodRestartRequest`.
 
 Progress and the most recent result are available on the cluster:
 
@@ -171,20 +200,24 @@ kubectl --kubeconfig ~/.kube/a800-local.yaml -n studio-ams-system \
   -o jsonpath='{.status.phase}{"\n"}{.status.message}{"\n"}{.status.operation}{"\n"}{.status.lastPodRestart}{"\n"}'
 ```
 
-While active, `status.operation.type` is `PodRestart`; `targetPodName` and
-`targetPodUid` identify the original Pod. The operator persists the target and
-phase so a controller restart resumes the same operation. Deletion uses a UID
-precondition, protecting a replacement that already has the same name. After
-completion, `status.operation` is cleared and `status.lastPodRestart` records
-`Succeeded` or `Failed`, the original UID, the time, and an explanation.
+While active, `status.operation.type` is `PodRestart`; `targetPodName`,
+`targetPodUid`, and `manualRestart` identify the immutable request. The operator
+persists the target and phase so a controller restart resumes the same
+operation. Deletion uses a UID precondition, protecting a replacement that
+already has the same name. After completion, `status.operation` is cleared and
+`status.lastPodRestart` records `Succeeded` or `Failed`, the restart timeout policy,
+original UID, time, and explanation.
 
-This explicit graceful restart always rolls back on a drain timeout or unsafe
-handoff, even if `spec.raft.drainTimeoutAction` is `ForceContinue` for other
-operations. After rollback succeeds, the original Pod remains, the request
-annotation is removed, and the failed result is recorded. Resolve the reported
-cause and run the annotation command again to retry. If rollback itself or
-membership removal cannot be confirmed, the operation stays blocked and reports
-the error; other requests remain queued. The drain timeout uses
+With `rollback-on-timeout`, a drain timeout restores serving and retains the
+original Pod. With `force-on-timeout`, only a timeout authorizes the existing
+force-finalize protocol: every broker must first advertise support, the
+operator records the force intent before sending destructive requests, and it
+records discarded counts in `status.lastForcedDrain` before membership removal.
+Unsafe handoff, detected data loss, health/quorum failure, and other drain errors
+do not enter this force branch. After rollback succeeds, the annotation is
+removed and the failed result is recorded. If a destructive cleanup has already
+started and a later step cannot be confirmed, the operation stays blocked or
+retries instead of pretending the old state was restored. The drain timeout uses
 `spec.raft.drainTimeoutSeconds`; stabilization uses
 `spec.imageUpdate.stabilizationSeconds` with a minimum of 10 seconds.
 
@@ -192,7 +225,7 @@ To withdraw a request **before the operator accepts it**, remove its annotation:
 
 ```bash
 kubectl --kubeconfig ~/.kube/a800-local.yaml -n studio-ams-system \
-  annotate pod ams-rmqtt-2 rmqtt.io/delete-requested-
+  annotate pod ams-rmqtt-2 rmqtt.io/manual-restart-
 ```
 
 Removing the annotation after `status.operation` records the request does not
@@ -243,6 +276,42 @@ A plain request already in flight at that boundary is included in the final
 routing barrier, while a transport failure aborts the rollout. This keeps
 normal delivery active throughout preparation without weakening deletion
 safety.
+
+Stalled handoff deliveries also trigger bounded session reconciliation in the
+broker, including queues left after a rollback. The broker checks all known
+Raft/business peers for a live or offline session, a connection/install in
+progress, a retained migration snapshot, an accepted delivery, or a delivery
+whose transport result is uncertain. Only after
+every peer confirms absence may it conditionally remove the exact stale owner
+through Raft and retire the captured, unaccepted deliveries. A newer connection
+is protected by its full connection Id. Retirement is logged with
+`reason=confirmed_session_absent`; it is not a claim of delivery to a client.
+
+This requires broker support on every participating node, reported as
+`supports.sessionReconciliation` by the membership API. An unavailable or older
+peer, an ownership/membership change, or an uncertain acknowledgement defers
+cleanup and preserves the existing drain timeout/rollback behavior. No new
+Raft log command or normal publish-path check is introduced. Connection and
+session-transfer operations maintain a small in-memory activity marker; full
+checks run only for maintenance reconciliation, with one queue-initiated
+reconciliation and one coordinated peer check per broker at a time.
+
+Session relocation installs the local offline session and its subscriptions
+before publishing the destination owner in Raft. A reconnect taking the
+snapshot shares the per-client entry lock with installation/extraction, so it
+cannot receive `NotExist` during their temporary entry gap. Interrupted
+installation retries finish ownership and route registration without replaying
+the snapshot's messages. A failed or uncertain metadata update preserves the
+installed copy for retry.
+
+The opt-in loopback regression starts three actual brokers and checks orphan
+queues, concurrent QoS 1/2 traffic, offline delivery, Clean Start gateway
+reconnect, and interrupted installation retries:
+
+```bash
+cargo test -p rmqtt-cluster-raft --lib --offline \
+  three_node_orphan_reconciliation -- --ignored --nocapture
+```
 
 The queue is not durable storage. Simultaneous failure of the source broker and
 its in-memory queue, QoS 0 delivery, or an application deadline expiring while

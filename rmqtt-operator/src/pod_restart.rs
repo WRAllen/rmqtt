@@ -1,14 +1,52 @@
-//! A Pod annotation requests one safe replacement. The persisted original UID
-//! is the completion token: the replacement must never be drained/deleted again.
+//! A Pod annotation requests one controlled replacement. The persisted original
+//! UID and timeout policy are immutable operation inputs: a replacement must
+//! never be drained/deleted again and an in-flight request cannot be escalated.
 use super::*;
 
-pub(super) const POD_DELETE_REQUESTED_ANNOTATION: &str = "rmqtt.io/delete-requested";
+pub(super) const POD_MANUAL_RESTART_ANNOTATION: &str = "rmqtt.io/manual-restart";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PodManualRestart {
+    Rollback,
+    Force,
+}
+
+impl PodManualRestart {
+    pub(super) fn parse(value: &str) -> Result<Self> {
+        match value {
+            "rollback-on-timeout" => Ok(Self::Rollback),
+            "force-on-timeout" => Ok(Self::Force),
+            _ => bail!(
+                "invalid {POD_MANUAL_RESTART_ANNOTATION} value {value:?}; expected rollback-on-timeout or force-on-timeout"
+            ),
+        }
+    }
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Rollback => "rollback-on-timeout",
+            Self::Force => "force-on-timeout",
+        }
+    }
+
+    fn drain_timeout_action(self) -> DrainTimeoutAction {
+        match self {
+            Self::Rollback => DrainTimeoutAction::Rollback,
+            Self::Force => DrainTimeoutAction::ForceContinue,
+        }
+    }
+
+    pub(super) fn force_on_timeout(self) -> bool {
+        self == Self::Force
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct PodRestartTarget {
     pub pod_name: String,
     pub pod_uid: String,
     pub node_id: i32,
+    pub manual_restart: PodManualRestart,
 }
 
 impl PodRestartTarget {
@@ -25,38 +63,49 @@ fn pending_target(
     cluster_name: &str,
     replicas: i32,
     stateful_set_uid: &str,
-) -> Option<PodRestartTarget> {
+) -> Result<Option<PodRestartTarget>> {
     if stateful_set_uid.is_empty() {
-        return None;
+        return Ok(None);
     }
     // Deterministic ordering, independent of API list order. An active operation
     // is reconciled before this queue, so only one request can run at a time.
-    (1..=replicas).find_map(|node_id| {
-        let pod = pod_for_node(pods, cluster_name, node_id)?;
-        (pod.metadata.deletion_timestamp.is_none()
-            && !pod.metadata.uid.is_empty()
-            && pod.metadata.annotations.get(POD_DELETE_REQUESTED_ANNOTATION).map(String::as_str)
-                == Some("true")
-            && pod.metadata.owner_references.iter().any(|owner| {
+    for node_id in 1..=replicas {
+        let Some(pod) = pod_for_node(pods, cluster_name, node_id) else {
+            continue;
+        };
+        let Some(value) = pod.metadata.annotations.get(POD_MANUAL_RESTART_ANNOTATION) else {
+            continue;
+        };
+        if pod.metadata.deletion_timestamp.is_some()
+            || pod.metadata.uid.is_empty()
+            || !pod.metadata.owner_references.iter().any(|owner| {
                 owner.controller
                     && owner.kind == "StatefulSet"
                     && owner.name == cluster_name
                     && owner.uid == stateful_set_uid
-            }))
-        .then(|| PodRestartTarget {
+            })
+        {
+            continue;
+        }
+        let manual_restart = PodManualRestart::parse(value)
+            .with_context(|| format!("invalid restart request on Pod {}", pod.metadata.name))?;
+        return Ok(Some(PodRestartTarget {
             pod_name: pod.metadata.name.clone(),
             pod_uid: pod.metadata.uid.clone(),
             node_id,
-        })
-    })
+            manual_restart,
+        }));
+    }
+    Ok(None)
 }
 
 fn configure(cluster: &mut RmqttCluster, target: PodRestartTarget) {
+    let drain_timeout_action = target.manual_restart.drain_timeout_action();
     cluster.spec.pod_restart = Some(target);
     cluster.spec.rollout_restart_at = None;
-    // This user-facing graceful deletion request never opts into lossy forced
-    // continuation, even if image upgrades/scale-in have that policy configured.
-    cluster.spec.raft.drain_timeout_action = DrainTimeoutAction::Rollback;
+    // Freeze this one-shot Pod policy independently from the cluster-wide
+    // image rollout/scale-in policy.
+    cluster.spec.raft.drain_timeout_action = drain_timeout_action;
     cluster.spec.image_update.stabilization_seconds = cluster.spec.image_update.stabilization_seconds.max(10);
 }
 
@@ -65,6 +114,9 @@ pub(super) fn resume_cluster(cluster: &RmqttCluster, operation: &OperationStatus
         pod_name: operation.target_pod_name.clone().context("PodRestart is missing targetPodName")?,
         pod_uid: operation.target_pod_uid.clone().context("PodRestart is missing targetPodUid")?,
         node_id: operation.node_id,
+        manual_restart: PodManualRestart::parse(
+            operation.manual_restart.as_deref().context("PodRestart is missing manualRestart")?,
+        )?,
     };
     if operation.kind != "PodRestart"
         || target.pod_uid.is_empty()
@@ -72,6 +124,15 @@ pub(super) fn resume_cluster(cluster: &RmqttCluster, operation: &OperationStatus
         || target.pod_name != pod_name(&cluster.metadata.name, target.node_id)
     {
         bail!("invalid PodRestart identity; refusing to restart another Pod");
+    }
+    if matches!(operation.phase.as_str(), "ForceFinalizing" | "ForceFinalized")
+        && !target.manual_restart.force_on_timeout()
+    {
+        bail!(
+            "invalid persisted PodRestart phase {} for manualRestart={}",
+            operation.phase,
+            target.manual_restart.as_str()
+        );
     }
     let mut resumed = cluster.clone();
     resumed.spec.image = operation.target_image.clone().context("PodRestart is missing targetImage")?;
@@ -100,11 +161,27 @@ pub(super) async fn start_pending(
     }
     let name = &cluster.metadata.name;
     let replicas = stateful_set.replicas();
-    if stateful_set.spec.template.metadata.annotations.contains_key(POD_DELETE_REQUESTED_ANNOTATION) {
-        bail!("remove {POD_DELETE_REQUESTED_ANNOTATION} from the StatefulSet template; requests must target individual Pods to avoid repeated restarts");
+    if stateful_set.spec.template.metadata.annotations.contains_key(POD_MANUAL_RESTART_ANNOTATION) {
+        bail!("remove {POD_MANUAL_RESTART_ANNOTATION} from the StatefulSet template; requests must target individual Pods to avoid repeated restarts");
     }
     let pods = cluster_pods(kube, namespace, name).await?;
-    let Some(target) = pending_target(&pods, name, replicas, &stateful_set.metadata.uid) else {
+    let target = match pending_target(&pods, name, replicas, &stateful_set.metadata.uid) {
+        Ok(target) => target,
+        Err(error) => {
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "InvalidPodRestartRequest",
+                    "message": format!("{error:#}"),
+                }),
+            )
+            .await?;
+            return Ok(true);
+        }
+    };
+    let Some(target) = target else {
         return Ok(false);
     };
     if replicas < 2
@@ -116,14 +193,34 @@ pub(super) async fn start_pending(
     {
         patch_status(kube, namespace, name, json!({
             "phase": "WaitingPodRestartPreconditions",
-            "message": format!("{} is queued for graceful restart; waiting for a healthy cluster with at least two Pods", target.pod_name),
+            "message": format!("{} is queued for a controlled restart with manualRestart={}; waiting for a healthy cluster with at least two Pods", target.pod_name, target.manual_restart.as_str()),
         })).await?;
         return Ok(true);
     }
+    if target.manual_restart.force_on_timeout() {
+        if let Err(error) = ensure_force_drain_finalize_supported(namespace, cluster, replicas).await {
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "WaitingPodRestartPreconditions",
+                    "message": format!(
+                        "{} requested manualRestart=force-on-timeout, but not every broker can safely execute it: {error}",
+                        target.pod_name
+                    ),
+                }),
+            )
+            .await?;
+            return Ok(true);
+        }
+    }
     let node_id = target.node_id;
     let message = format!(
-        "accepted graceful restart of {} (UID {}); other Pod requests remain queued",
-        target.pod_name, target.pod_uid
+        "accepted controlled restart of {} (UID {}) with manualRestart={}; other Pod requests remain queued",
+        target.pod_name,
+        target.pod_uid,
+        target.manual_restart.as_str()
     );
     let mut restart_cluster = cluster.clone();
     configure(&mut restart_cluster, target);
@@ -214,7 +311,7 @@ async fn record_completion(
                 &path,
                 &json!({"metadata": {
                     "uid": target.pod_uid,
-                    "annotations": {POD_DELETE_REQUESTED_ANNOTATION: null},
+                    "annotations": {POD_MANUAL_RESTART_ANNOTATION: null},
                 }}),
             )
             .await?;
@@ -222,13 +319,15 @@ async fn record_completion(
     }
     let message = if succeeded {
         format!(
-            "{} was gracefully restarted and its replacement passed the stability window",
-            target.pod_name
+            "{} completed its controlled restart with manualRestart={} and its replacement passed the stability window",
+            target.pod_name,
+            target.manual_restart.as_str()
         )
     } else {
         format!(
-            "graceful restart of {} was rolled back; Pod retained: {}",
+            "controlled restart of {} with manualRestart={} was rolled back; Pod retained: {}",
             target.pod_name,
+            target.manual_restart.as_str(),
             error.unwrap_or("drain failed")
         )
     };
@@ -245,6 +344,7 @@ async fn record_completion(
         "lastPodRestart": {
             "podName": target.pod_name,
             "originalPodUid": target.pod_uid,
+            "manualRestart": target.manual_restart.as_str(),
             "result": if succeeded { "Succeeded" } else { "Failed" },
             "message": message,
             "completedAt": utc_now_rfc3339(),

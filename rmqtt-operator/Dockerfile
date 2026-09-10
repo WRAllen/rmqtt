@@ -6,7 +6,8 @@ ENV PATH="/usr/local/cargo/bin:${PATH}"
 
 WORKDIR /src
 COPY . .
-RUN test -n "${RMQTT_OPERATOR_BUILD_ID}" \
+RUN unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy \
+    && test -n "${RMQTT_OPERATOR_BUILD_ID}" \
     && RMQTT_OPERATOR_BUILD_ID="${RMQTT_OPERATOR_BUILD_ID}" cargo build --release -p rmqtt-operator
 
 FROM alpine:3.24.1

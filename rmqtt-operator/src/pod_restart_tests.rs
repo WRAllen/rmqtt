@@ -12,22 +12,32 @@ fn cluster() -> RmqttCluster {
 }
 
 fn pod_json(id: i32, requested: bool) -> Value {
-    json!({
+    let mut pod = json!({
         "metadata": {
             "name": format!("rmqtt-{}", id - 1), "uid": format!("uid-{id}"),
-            "annotations": {POD_DELETE_REQUESTED_ANNOTATION: requested.to_string()},
+            "annotations": {},
             "ownerReferences": [{"kind": "StatefulSet", "name": "rmqtt", "uid": "sts-uid", "controller": true}],
         },
         "spec": {"containers": [{"name": "rmqtt", "image": "rmqtt:v1", "imagePullPolicy": "IfNotPresent"}]},
         "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
-    })
+    });
+    if requested {
+        pod["metadata"]["annotations"][POD_MANUAL_RESTART_ANNOTATION] =
+            json!(PodManualRestart::Rollback.as_str());
+    }
+    pod
 }
 
 fn target_cluster() -> RmqttCluster {
     let mut cluster = cluster();
     configure(
         &mut cluster,
-        PodRestartTarget { pod_name: "rmqtt-1".into(), pod_uid: "uid-2".into(), node_id: 2 },
+        PodRestartTarget {
+            pod_name: "rmqtt-1".into(),
+            pod_uid: "uid-2".into(),
+            node_id: 2,
+            manual_restart: PodManualRestart::Rollback,
+        },
     );
     cluster
 }
@@ -65,15 +75,15 @@ fn stateful_set() -> StatefulSet {
 fn requests_are_queued_by_ordinal_and_disappear_with_the_original_pod() {
     let mut pods: Vec<Pod> =
         serde_json::from_value(json!([pod_json(3, true), pod_json(2, true), pod_json(1, false),])).unwrap();
-    let target = pending_target(&pods, "rmqtt", 3, "sts-uid").unwrap();
+    let target = pending_target(&pods, "rmqtt", 3, "sts-uid").unwrap().unwrap();
     assert_eq!(target.node_id, 2);
     // Repeating true on this UID coalesces. Once it has been replaced, only the
     // other original Pod remains queued; siblings are not implicitly restarted.
     pods[1].metadata.uid = "replacement-2".into();
     pods[1].metadata.annotations.clear();
-    assert_eq!(pending_target(&pods, "rmqtt", 3, "sts-uid").unwrap().node_id, 3);
+    assert_eq!(pending_target(&pods, "rmqtt", 3, "sts-uid").unwrap().unwrap().node_id, 3);
     pods[0].metadata.annotations.clear();
-    assert!(pending_target(&pods, "rmqtt", 3, "sts-uid").is_none());
+    assert!(pending_target(&pods, "rmqtt", 3, "sts-uid").unwrap().is_none());
 }
 
 #[test]
@@ -82,19 +92,38 @@ fn unrelated_terminating_and_ambiguous_pods_are_not_delete_requests() {
         json!({"name": "another-1"}),
         json!({"uid": ""}),
         json!({"deletionTimestamp": "2026-09-09T00:00:00Z"}),
-        json!({"annotations": {POD_DELETE_REQUESTED_ANNOTATION: "false"}}),
-        json!({"annotations": {POD_DELETE_REQUESTED_ANNOTATION: "True"}}),
+        json!({"annotations": {}}),
         json!({"ownerReferences": []}),
         json!({"ownerReferences": [{"kind": "StatefulSet", "name": "rmqtt", "uid": "previous-sts", "controller": true}]}),
     ] {
         let mut value = pod_json(2, true);
         value["metadata"].as_object_mut().unwrap().extend(change.as_object().unwrap().clone());
         let pods = vec![serde_json::from_value(value).unwrap()];
-        assert!(pending_target(&pods, "rmqtt", 3, "sts-uid").is_none());
+        assert!(pending_target(&pods, "rmqtt", 3, "sts-uid").unwrap().is_none());
     }
     let pods = vec![serde_json::from_value(pod_json(2, true)).unwrap()];
-    assert!(pending_target(&pods, "rmqtt", 1, "sts-uid").is_none());
-    assert!(pending_target(&pods, "rmqtt", 3, "").is_none());
+    assert!(pending_target(&pods, "rmqtt", 1, "sts-uid").unwrap().is_none());
+    assert!(pending_target(&pods, "rmqtt", 3, "").unwrap().is_none());
+}
+
+#[test]
+fn manual_restart_rejects_unknown_values() {
+    for value in ["", "true", "ForceContinue", "Rollback", "force", "rollback"] {
+        let mut invalid: Pod = serde_json::from_value(pod_json(2, false)).unwrap();
+        invalid.metadata.annotations.insert(POD_MANUAL_RESTART_ANNOTATION.into(), value.into());
+        assert!(pending_target(&[invalid], "rmqtt", 3, "sts-uid").is_err());
+    }
+
+    for (value, manual_restart) in
+        [("rollback-on-timeout", PodManualRestart::Rollback), ("force-on-timeout", PodManualRestart::Force)]
+    {
+        let mut requested: Pod = serde_json::from_value(pod_json(2, false)).unwrap();
+        requested.metadata.annotations.insert("rmqtt.io/manual-restart".into(), value.into());
+        assert_eq!(
+            pending_target(&[requested], "rmqtt", 3, "sts-uid").unwrap().unwrap().manual_restart,
+            manual_restart
+        );
+    }
 }
 
 #[test]
@@ -151,6 +180,7 @@ fn every_persisted_phase_resumes_the_same_uid_after_operator_restart() {
         assert_eq!(status["id"], "PodRestart-uid-2");
         assert_eq!(status["targetPodUid"], "uid-2");
         assert_eq!(status["targetPodName"], "rmqtt-1");
+        assert_eq!(status["manualRestart"], "rollback-on-timeout");
         assert_eq!(status["stableSince"], "2026-09-09T00:00:00Z");
         assert!(!image_rollout_terminal_target_superseded(&operation, &latest.spec));
     }
@@ -164,6 +194,8 @@ fn malformed_saved_identity_cannot_fall_back_to_deleting_by_name() {
         ("targetPodUid", json!(null)),
         ("targetPodUid", json!("")),
         ("targetPodName", json!("rmqtt-0")),
+        ("manualRestart", json!(null)),
+        ("manualRestart", json!("force")),
         ("nodeId", json!(0)),
         ("targetImage", json!(null)),
     ] {
@@ -172,19 +204,53 @@ fn malformed_saved_identity_cannot_fall_back_to_deleting_by_name() {
         let saved = serde_json::from_value(malformed).unwrap();
         assert!(resume_cluster(&cluster(), &saved).is_err());
     }
+
+    for phase in ["ForceFinalizing", "ForceFinalized"] {
+        let mut inconsistent = operation.clone();
+        inconsistent["phase"] = json!(phase);
+        let saved = serde_json::from_value(inconsistent).unwrap();
+        assert!(resume_cluster(&cluster(), &saved).is_err());
+    }
 }
 
 #[test]
-fn annotation_restart_is_enabled_without_image_rollout_and_never_force_drains() {
-    let mut cluster = cluster();
-    cluster.spec.raft.drain_timeout_action = DrainTimeoutAction::ForceContinue;
-    cluster.spec.image_update.stabilization_seconds = 0;
+fn annotation_restart_freezes_its_own_timeout_policy() {
+    let mut configured = cluster();
+    configured.spec.raft.drain_timeout_action = DrainTimeoutAction::ForceContinue;
+    configured.spec.image_update.stabilization_seconds = 0;
     let target = target_cluster().spec.pod_restart.unwrap();
-    configure(&mut cluster, target);
-    assert!(!cluster.spec.image_update.auto_rollout);
-    assert!(operator_managed_rollout_enabled(&cluster.spec));
-    assert_eq!(cluster.spec.raft.drain_timeout_action, DrainTimeoutAction::Rollback);
-    assert_eq!(cluster.spec.image_update.stabilization_seconds, 10);
+    configure(&mut configured, target);
+    assert!(!configured.spec.image_update.auto_rollout);
+    assert!(operator_managed_rollout_enabled(&configured.spec));
+    assert_eq!(configured.spec.raft.drain_timeout_action, DrainTimeoutAction::Rollback);
+    assert_eq!(configured.spec.image_update.stabilization_seconds, 10);
+
+    let mut forced = cluster();
+    configure(
+        &mut forced,
+        PodRestartTarget {
+            pod_name: "rmqtt-1".into(),
+            pod_uid: "uid-2".into(),
+            node_id: 2,
+            manual_restart: PodManualRestart::Force,
+        },
+    );
+    assert_eq!(forced.spec.raft.drain_timeout_action, DrainTimeoutAction::ForceContinue);
+    for phase in ["ForceFinalizing", "ForceFinalized"] {
+        let operation: OperationStatus = serde_json::from_value(image_rollout_operation_status_json(
+            &forced,
+            2,
+            3,
+            phase,
+            None,
+            Some("blocked"),
+            false,
+        ))
+        .unwrap();
+        let resumed = resume_cluster(&cluster(), &operation).unwrap();
+        assert_eq!(resumed.spec.raft.drain_timeout_action, DrainTimeoutAction::ForceContinue);
+        assert_eq!(resumed.spec.pod_restart.unwrap().manual_restart, PodManualRestart::Force);
+    }
 }
 
 #[test]
@@ -205,8 +271,49 @@ fn restarting_the_leader_selects_a_ready_caught_up_sibling() {
 #[test]
 fn pod_request_annotation_cannot_be_inherited_by_every_new_pod() {
     let mut cluster = cluster();
-    cluster.spec.pod.annotations.insert(POD_DELETE_REQUESTED_ANNOTATION.into(), "true".into());
+    cluster.spec.pod.annotations.insert(POD_MANUAL_RESTART_ANNOTATION.into(), "force-on-timeout".into());
     assert!(validate_spec(&cluster.spec).is_err());
+}
+
+#[test]
+fn force_on_timeout_requires_an_identity_matched_capability() {
+    let mut supported = membership();
+    supported.supports = json!({"forceDrainFinalize": true});
+    assert!(validate_force_drain_finalize_support(2, &supported).is_ok());
+
+    let mut wrong_identity = supported.clone();
+    wrong_identity.id = 3;
+    assert!(validate_force_drain_finalize_support(2, &wrong_identity).is_err());
+
+    for capability in [Value::Null, json!(false), json!("true")] {
+        let mut unsupported = membership();
+        unsupported.supports = json!({"forceDrainFinalize": capability});
+        assert!(validate_force_drain_finalize_support(2, &unsupported).is_err());
+    }
+}
+
+#[test]
+fn forced_cleanup_revalidates_membership_before_leave_or_delete() {
+    let mut healthy = membership();
+    healthy.id = 1;
+    healthy.leader_id = Some(1);
+    assert_eq!(
+        forced_pod_restart_leave_decision(&healthy, 3, 2),
+        ForcedPodRestartLeaveDecision::RequestLeave
+    );
+
+    let mut unhealthy = healthy.clone();
+    unhealthy.raft_peers.retain(|peer| peer.id != 3);
+    assert!(matches!(
+        forced_pod_restart_leave_decision(&unhealthy, 3, 2),
+        ForcedPodRestartLeaveDecision::Wait(reason) if reason.contains("no longer ready")
+    ));
+
+    let mut removed = healthy;
+    removed.voters.retain(|id| *id != 2);
+    removed.raft_peers.retain(|peer| peer.id != 2);
+    removed.business_peers.retain(|peer| peer["id"] != 2);
+    assert_eq!(forced_pod_restart_leave_decision(&removed, 3, 2), ForcedPodRestartLeaveDecision::DeletePod);
 }
 
 // Minimal local Kubernetes HTTP stub: captures the actual request bodies and
@@ -231,6 +338,7 @@ fn kube_stub(responses: Vec<(u16, Value)>) -> (KubeClient, Requests, std::thread
                     Err(e) => panic!("missing expected Kubernetes request: {e}"),
                 }
             };
+            stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             let mut reader = BufReader::new(stream);
             let mut request_line = String::new();
@@ -282,8 +390,53 @@ async fn accepting_a_request_only_persists_one_operation_and_does_not_delete() {
     assert_eq!(status["operation"]["type"], "PodRestart");
     assert_eq!(status["operation"]["nodeId"], 2);
     assert_eq!(status["operation"]["targetPodUid"], "uid-2");
+    assert_eq!(status["operation"]["manualRestart"], "rollback-on-timeout");
     assert_eq!(status["operation"]["phase"], "PreparingNode");
     assert!(status["updatedReplicas"].is_null());
+}
+
+#[tokio::test]
+async fn invalid_manual_restart_is_reported_without_starting_an_operation() {
+    let mut invalid = pod_json(2, false);
+    invalid["metadata"]["annotations"][POD_MANUAL_RESTART_ANNOTATION] = json!("force");
+    let list = json!({"items": [pod_json(1, false), invalid, pod_json(3, false)]});
+    let (kube, requests, server) = kube_stub(vec![(200, list), (200, json!({}))]);
+    assert!(start_pending(&kube, "test", &cluster(), &stateful_set(), &membership()).await.unwrap());
+    server.join().unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let status = &requests[1].1["status"];
+    assert_eq!(status["phase"], "InvalidPodRestartRequest");
+    assert!(status["message"].as_str().unwrap().contains("rollback-on-timeout or force-on-timeout"));
+    assert!(status.get("operation").is_none());
+    assert!(requests.iter().all(|(line, _)| !line.starts_with("DELETE ")));
+}
+
+#[tokio::test]
+async fn forced_cleanup_result_and_resume_phase_are_recorded_together() {
+    let summary = ForceDrainFinalizeSummary {
+        target_id: 2,
+        reason: "pod_restart_drain_timeout".into(),
+        blockers: "sessions=1".into(),
+        nodes_acknowledged: 3,
+        handoff_messages_discarded: 4,
+        local_sessions_requested: 1,
+        local_session_acks: 1,
+        ..Default::default()
+    };
+    let (kube, requests, server) = kube_stub(vec![(200, json!({}))]);
+    record_forced_pod_restart_drain_status(&kube, "test", &target_cluster(), &summary).await.unwrap();
+    server.join().unwrap();
+
+    let requests = requests.lock().unwrap();
+    let status = &requests[0].1["status"];
+    assert_eq!(status["phase"], "ForceFinalizingPodRestart");
+    assert_eq!(status["operation"]["phase"], "ForceFinalized");
+    assert!(status["operation"]["lastError"].is_null());
+    assert_eq!(status["lastForcedDrain"]["targetId"], 2);
+    assert_eq!(status["lastForcedDrain"]["nodesAcknowledged"], 3);
+    assert_eq!(status["lastForcedDrain"]["handoffMessagesDiscarded"], 4);
 }
 
 #[tokio::test]
@@ -373,7 +526,7 @@ async fn rollback_consumes_the_failed_request_and_reports_the_reason_without_del
     let requests = requests.lock().unwrap();
     assert!(requests[1].0.starts_with("PATCH /api/v1/namespaces/test/pods/rmqtt-1 "));
     assert_eq!(requests[1].1["metadata"]["uid"], "uid-2");
-    assert!(requests[1].1["metadata"]["annotations"][POD_DELETE_REQUESTED_ANNOTATION].is_null());
+    assert!(requests[1].1["metadata"]["annotations"][POD_MANUAL_RESTART_ANNOTATION].is_null());
     assert_eq!(requests[3].1["status"]["lastPodRestart"]["result"], "Failed");
     assert!(requests[3].1["status"]["lastPodRestart"]["message"].as_str().unwrap().contains("300 seconds"));
     assert!(requests[3].1["status"]["operation"].is_null());
