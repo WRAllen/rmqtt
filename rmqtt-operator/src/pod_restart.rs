@@ -270,9 +270,25 @@ pub(super) async fn delete_rollout_pod(
         }
         // A conflict means StatefulSet already replaced the original. Reconcile
         // the new Pod's recovery instead of deleting it by its reused name.
+        external_termination::release_after_planned_drain(
+            kube,
+            namespace,
+            cluster,
+            &target.pod_name,
+            Some(&target.pod_uid),
+        )
+        .await?;
         kube.delete_with_uid_precondition(&path, &target.pod_uid).await?;
         Ok(())
     } else {
+        external_termination::release_after_planned_drain(
+            kube,
+            namespace,
+            cluster,
+            &pod_name(&cluster.metadata.name, node_id),
+            None,
+        )
+        .await?;
         kube.delete(&path).await
     }
 }

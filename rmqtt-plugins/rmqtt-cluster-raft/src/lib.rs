@@ -4,9 +4,9 @@
 use std::collections::HashSet;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::anyhow;
 use async_trait::async_trait;
@@ -82,6 +82,27 @@ struct RaftRuntime {
     thread: Option<JoinHandle<()>>,
 }
 
+#[derive(Debug, Default)]
+struct DrainProgressLogState {
+    last_log: Option<Instant>,
+    last_ready: bool,
+}
+
+#[derive(Debug)]
+struct DrainProgress {
+    message_work_items_remaining: u64,
+    handoff_messages_completed: usize,
+    session_handoffs_completed: usize,
+    connections: isize,
+    sessions: isize,
+    handoff_pending_messages: usize,
+    handoff_pending_bytes: usize,
+    failed_messages: usize,
+    rejected_messages: usize,
+    ready: bool,
+    data_loss_detected: bool,
+}
+
 #[derive(Plugin)]
 struct ClusterPlugin {
     scx: ServerContext,
@@ -98,6 +119,9 @@ struct ClusterPlugin {
     force_drain_finalized: Arc<AtomicBool>,
     drain_message_queue_drops_start: Arc<AtomicIsize>,
     drain_out_inflight_drops_start: Arc<AtomicIsize>,
+    drain_handoff_completed_start: Arc<std::sync::atomic::AtomicUsize>,
+    drain_sessions_relocated: Arc<std::sync::atomic::AtomicUsize>,
+    drain_progress_log: Arc<StdMutex<DrainProgressLogState>>,
     exec: TaskExecQueue,
     backoff_strategy: ExponentialBackoff,
 }
@@ -148,6 +172,9 @@ impl ClusterPlugin {
         let force_drain_finalized = Arc::new(AtomicBool::new(false));
         let drain_message_queue_drops_start = Arc::new(AtomicIsize::new(0));
         let drain_out_inflight_drops_start = Arc::new(AtomicIsize::new(0));
+        let drain_handoff_completed_start = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drain_sessions_relocated = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let drain_progress_log = Arc::new(StdMutex::new(DrainProgressLogState::default()));
         let cfg = Arc::new(cfg);
         Ok(Self {
             scx,
@@ -164,6 +191,9 @@ impl ClusterPlugin {
             force_drain_finalized,
             drain_message_queue_drops_start,
             drain_out_inflight_drops_start,
+            drain_handoff_completed_start,
+            drain_sessions_relocated,
+            drain_progress_log,
             exec,
             backoff_strategy,
         })
@@ -655,6 +685,54 @@ impl Plugin for ClusterPlugin {
     #[inline]
     async fn send(&self, msg: serde_json::Value) -> Result<serde_json::Value> {
         let action = msg.get("action").and_then(|v| v.as_str()).ok_or_else(|| anyhow!("missing action"))?;
+        if msg.get("expectedPodUid").is_some() || msg.get("expectedBootId").is_some() {
+            self.scx.shutdown.verify_identity(
+                msg.get("expectedPodUid").and_then(|value| value.as_str()),
+                msg.get("expectedBootId").and_then(|value| value.as_str()),
+            )?;
+        }
+        match action {
+            "termination_status" => return Ok(self.scx.shutdown.status_json()),
+            "termination_bind" => {
+                let expected_pod_uid = msg.get("expectedPodUid").and_then(|value| value.as_str());
+                let expected_boot_id = msg.get("expectedBootId").and_then(|value| value.as_str());
+                let remaining =
+                    msg.get("remainingMillis").and_then(|value| value.as_u64()).map(Duration::from_millis);
+                let coordinator_epoch =
+                    msg.get("coordinatorEpoch").and_then(|value| value.as_str()).map(str::to_owned);
+                let status = self.scx.shutdown.bind(
+                    expected_pod_uid,
+                    expected_boot_id,
+                    remaining,
+                    coordinator_epoch,
+                )?;
+                log::info!(
+                    "graceful shutdown phase=operator_bound node_id={} pod_name={} status={status}",
+                    self.scx.node.id(),
+                    self.scx.shutdown.pod_name()
+                );
+                return Ok(status);
+            }
+            "termination_complete" => {
+                let expected_pod_uid = msg.get("expectedPodUid").and_then(|value| value.as_str());
+                let expected_boot_id = msg.get("expectedBootId").and_then(|value| value.as_str());
+                let coordinator_epoch = msg.get("coordinatorEpoch").and_then(|value| value.as_str());
+                let outcome = msg.get("outcome").and_then(|value| value.as_str()).unwrap_or("Completed");
+                let status = self.scx.shutdown.complete(
+                    expected_pod_uid,
+                    expected_boot_id,
+                    coordinator_epoch,
+                    outcome,
+                )?;
+                log::info!(
+                    "graceful shutdown phase=completed node_id={} pod_name={} status={status}",
+                    self.scx.node.id(),
+                    self.scx.shutdown.pod_name()
+                );
+                return Ok(status);
+            }
+            _ => {}
+        }
         let raft_mailbox = self.raft_mailbox().await;
         match action {
             "prepare_quorum_recovery" => {
@@ -758,6 +836,15 @@ impl Plugin for ClusterPlugin {
                     .transpose()?;
                 let (reliable_handoff, grpc_client_refreshed) =
                     self.shared.prepare_drain(id, allowed_target_node_ids.clone()).await?;
+                log::info!(
+                    "node drain phase=handoff_prepared observer_node_id={} observer_pod_name={} target_node_id={} reliable_handoff={} grpc_client_refreshed={} allowed_target_node_ids={:?}",
+                    self.scx.node.id(),
+                    self.scx.shutdown.pod_name(),
+                    id,
+                    reliable_handoff,
+                    grpc_client_refreshed,
+                    allowed_target_node_ids
+                );
                 Ok(json!({
                     "ok": true,
                     "id": id,
@@ -770,6 +857,13 @@ impl Plugin for ClusterPlugin {
             "activate_drain" => {
                 let id = msg.get("id").and_then(|v| v.as_u64()).ok_or_else(|| anyhow!("missing id"))?;
                 let reliable_handoff = self.shared.activate_drain(id);
+                log::info!(
+                    "node drain phase=handoff_activated observer_node_id={} observer_pod_name={} target_node_id={} reliable_handoff={}",
+                    self.scx.node.id(),
+                    self.scx.shutdown.pod_name(),
+                    id,
+                    reliable_handoff
+                );
                 Ok(json!({
                     "ok": true,
                     "id": id,
@@ -900,6 +994,7 @@ impl ClusterPlugin {
             "lastIndex": raft_status.as_ref().map(|status| status.last_index).unwrap_or_default(),
             "clientStates": self.router.states_count(),
             "draining": self.draining.load(Ordering::SeqCst),
+            "terminating": self.scx.shutdown.is_terminating(),
             "quorumRecoveryActive": self.recovery_active.load(Ordering::SeqCst),
             "quorumRecoveryEpoch": self.recovery_epoch.load(Ordering::SeqCst),
             "role": raft_status.as_ref().map(|status| format!("{:?}", status.role)),
@@ -921,7 +1016,8 @@ impl ClusterPlugin {
                 "preDisconnectQuiesce": true,
                 "proactiveSessionHandoff": true,
                 "forceDrainFinalize": true,
-                "forceRebootstrap": true
+                "forceRebootstrap": true,
+                "gracefulShutdown": true
             }
         })
     }
@@ -995,7 +1091,31 @@ impl ClusterPlugin {
                 .store(self.scx.stats.message_queue_drops.count(), Ordering::SeqCst);
             self.drain_out_inflight_drops_start
                 .store(self.scx.stats.out_inflight_drops.count(), Ordering::SeqCst);
+            self.drain_handoff_completed_start
+                .store(self.shared.handoff_stats().completed_messages, Ordering::Relaxed);
+            self.drain_sessions_relocated.store(0, Ordering::Relaxed);
+            *self.drain_progress_log.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                DrainProgressLogState::default();
         }
+        if self.scx.shutdown.is_terminating() {
+            self.scx.shutdown.set_phase("quiescing");
+        }
+        let handoff = self.shared.handoff_stats();
+        log::info!(
+            "{} phase=quiescing node_id={} pod_name={} connections={} sessions={} message_queues={} out_inflights={} in_inflights={} active_forwards={} handoff_pending_messages={} handoff_pending_bytes={} session_handoffs_pending={}",
+            if self.scx.shutdown.is_terminating() { "graceful shutdown" } else { "node drain" },
+            id,
+            self.scx.shutdown.pod_name(),
+            self.scx.connections.count(),
+            self.scx.sessions.count(),
+            self.scx.stats.message_queues.count(),
+            self.scx.stats.out_inflights.count(),
+            self.scx.stats.in_inflights.count(),
+            self.scx.stats.forwards.count(),
+            handoff.pending_messages,
+            handoff.pending_bytes,
+            self.shared.session_handoff_pending()
+        );
         Ok(json!({
             "ok": true,
             "id": id,
@@ -1016,12 +1136,24 @@ impl ClusterPlugin {
         let quiesce = self.quiesce_node(raft_mailbox).await?;
         let start_disconnects = !self.disconnecting.swap(true, Ordering::SeqCst);
         let disconnect_requested = self.scx.stats.connections.count();
+        if self.scx.shutdown.is_terminating() {
+            self.scx.shutdown.set_phase("disconnecting");
+        }
+        log::info!(
+            "{} phase=disconnecting node_id={} pod_name={} disconnect_requested={} worker_started={}",
+            if self.scx.shutdown.is_terminating() { "graceful shutdown" } else { "node drain" },
+            id,
+            self.scx.shutdown.pod_name(),
+            disconnect_requested,
+            start_disconnects
+        );
         if start_disconnects {
             let shared = self.shared.clone();
             let draining = self.draining.clone();
             let disconnecting = self.disconnecting.clone();
             let disconnect_batch_size = self.cfg.handoff.disconnect_batch_size.max(1);
             let disconnect_batch_interval = self.cfg.handoff.disconnect_batch_interval;
+            let drain_sessions_relocated = self.drain_sessions_relocated.clone();
             tokio::spawn(async move {
                 while draining.load(Ordering::SeqCst) && disconnecting.load(Ordering::SeqCst) {
                     let entries = shared.inner().iter().collect::<Vec<_>>();
@@ -1068,8 +1200,10 @@ impl ClusterPlugin {
                     }
                     let migrated = shared.migrate_drained_sessions().await;
                     if migrated > 0 {
+                        let relocated_total =
+                            drain_sessions_relocated.fetch_add(migrated, Ordering::Relaxed) + migrated;
                         log::info!(
-                            "drain proactively relocated {migrated} offline MQTT sessions to peer brokers"
+                            "node drain phase=session_handoff relocated_in_round={migrated} relocated_total={relocated_total}"
                         );
                     }
                     sleep(Duration::from_secs(1)).await;
@@ -1102,6 +1236,9 @@ impl ClusterPlugin {
     }
 
     async fn undrain_node(&self, raft_mailbox: &Mailbox) -> Result<serde_json::Value> {
+        if self.scx.shutdown.is_terminating() {
+            return Err(anyhow!("node is terminating and cannot be undrained"));
+        }
         let node = self.nodes.local_node_from_config(&self.cfg.node_grpc_addrs, &self.cfg.raft_peer_addrs)?;
         let id = node.id;
         let proposal = message::Message::NodeUp { node }.encode()?;
@@ -1157,6 +1294,20 @@ impl ClusterPlugin {
         let session_handoff_pending = self.shared.session_handoff_pending();
         let session_handoff_active = self.shared.session_handoff_active();
         let session_handoff_failures = self.shared.session_handoff_failures();
+        let handoff_messages_completed = handoff
+            .completed_messages
+            .saturating_sub(self.drain_handoff_completed_start.load(Ordering::Relaxed));
+        let session_handoffs_completed = self.drain_sessions_relocated.load(Ordering::Relaxed);
+        // This is a count of outstanding work items, not a count of unique
+        // MQTT PUBLISH packets: a QoS message can appear in a queue and an
+        // inflight window during a transition.
+        let message_work_items_remaining = (message_queues.max(0) as u64)
+            .saturating_add(out_inflights.max(0) as u64)
+            .saturating_add(in_inflights.max(0) as u64)
+            .saturating_add(forwards.max(0) as u64)
+            .saturating_add(if message_storage_enabled { message_storages.max(0) as u64 } else { 0 })
+            .saturating_add(delayed_publishs.max(0) as u64)
+            .saturating_add(handoff.pending_messages as u64);
         let handoff_safe_to_leave = handoff.pending_messages == 0
             && handoff.active_workers == 0
             && handoff.retrying_messages == 0
@@ -1288,7 +1439,9 @@ impl ClusterPlugin {
             .unwrap_or_default();
         let disconnecting = self.disconnecting.load(Ordering::SeqCst);
 
-        json!({
+        let data_loss_detected =
+            message_queue_drops > 0 || out_inflight_drops > 0 || self.shared.handoff_data_loss_detected();
+        let status = json!({
             "id": id,
             "draining": self.draining.load(Ordering::SeqCst),
             "quiescing": self.draining.load(Ordering::SeqCst) && !disconnecting,
@@ -1299,9 +1452,7 @@ impl ClusterPlugin {
             "message_safe_to_leave": message_safe_to_leave,
             "strict_safe_to_leave": strict_safe_to_leave,
             "session_handoff_complete": session_handoff_complete,
-            "data_loss_detected": message_queue_drops > 0
-                || out_inflight_drops > 0
-                || self.shared.handoff_data_loss_detected(),
+            "data_loss_detected": data_loss_detected,
             "raft_membership_present": raft_status
                 .as_ref()
                 .map(|status| status.peers.contains_key(&self.scx.node.id()))
@@ -1337,6 +1488,9 @@ impl ClusterPlugin {
                 "session_handoff_pending": session_handoff_pending,
                 "session_handoff_active": session_handoff_active,
                 "session_handoff_failures": session_handoff_failures,
+                "message_work_items_remaining": message_work_items_remaining,
+                "handoff_messages_completed": handoff_messages_completed,
+                "session_handoffs_completed": session_handoffs_completed,
                 "orphaned_router_states_removed": reconciled.state_ids.len(),
                 "orphaned_routes_removed": reconciled.routes.len(),
             },
@@ -1362,7 +1516,70 @@ impl ClusterPlugin {
                 "wait"
             },
             "note": "planned drain first preserves MQTT state, then actively relocates each offline session and its routes to a peer broker; client reconnect is no longer required for the old pod to become safe_to_leave, and any detected queue/inflight loss still blocks pod removal",
-        })
+        });
+        self.log_drain_progress(DrainProgress {
+            message_work_items_remaining,
+            handoff_messages_completed,
+            session_handoffs_completed,
+            connections,
+            sessions,
+            handoff_pending_messages: handoff.pending_messages,
+            handoff_pending_bytes: handoff.pending_bytes,
+            failed_messages: handoff.failed_messages,
+            rejected_messages: handoff.rejected_messages,
+            ready: strict_safe_to_leave,
+            data_loss_detected,
+        });
+        status
+    }
+
+    fn log_drain_progress(&self, progress: DrainProgress) {
+        if !self.draining.load(Ordering::Acquire) {
+            return;
+        }
+        let now = Instant::now();
+        let mut log_state = self.drain_progress_log.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let ready_changed = progress.ready != log_state.last_ready;
+        let due = log_state.last_log.is_none_or(|last| now.duration_since(last) >= Duration::from_secs(10));
+        if !due && !ready_changed {
+            return;
+        }
+        log_state.last_log = Some(now);
+        log_state.last_ready = progress.ready;
+        drop(log_state);
+
+        let force_finalized = self.force_drain_finalized.load(Ordering::Acquire);
+        let phase = if force_finalized {
+            "force_finalized"
+        } else if progress.ready {
+            "ready_to_leave"
+        } else if self.disconnecting.load(Ordering::Acquire) {
+            "draining"
+        } else {
+            "quiescing"
+        };
+        if progress.ready && self.scx.shutdown.is_terminating() {
+            self.scx.shutdown.set_phase("ready_to_leave");
+        }
+        let remaining_millis = self.scx.shutdown.status_json()["remainingMillis"].as_u64();
+        log::info!(
+            "{} phase={} node_id={} pod_name={} remaining_millis={:?} message_work_items_remaining={} handoff_messages_completed={} session_handoffs_completed={} connections={} sessions={} handoff_pending_messages={} handoff_pending_bytes={} handoff_failed_messages={} handoff_rejected_messages={} data_loss_detected={}",
+            if self.scx.shutdown.is_terminating() { "graceful shutdown" } else { "node drain" },
+            phase,
+            self.scx.node.id(),
+            self.scx.shutdown.pod_name(),
+            remaining_millis,
+            progress.message_work_items_remaining,
+            progress.handoff_messages_completed,
+            progress.session_handoffs_completed,
+            progress.connections,
+            progress.sessions,
+            progress.handoff_pending_messages,
+            progress.handoff_pending_bytes,
+            progress.failed_messages,
+            progress.rejected_messages,
+            progress.data_loss_detected
+        );
     }
 
     fn routing_status(&self, target_id: NodeId) -> serde_json::Value {
@@ -1372,6 +1589,7 @@ impl ClusterPlugin {
         let reliable_forwards = self.shared.handoff_active_for_node(target_id);
         let plain_forwards = self.shared.plain_forwards_for_node(target_id);
         let handoff_pending = self.shared.handoff_pending_for_node(target_id);
+        let handoff_completed = self.shared.handoff_completed_for_node(target_id);
         let handoff = self.shared.handoff_stats();
         json!({
             "id": self.scx.node.id(),
@@ -1382,6 +1600,7 @@ impl ClusterPlugin {
             "reliableForwards": reliable_forwards,
             "plainForwards": plain_forwards,
             "handoffPending": handoff_pending,
+            "handoffCompleted": handoff_completed,
             "handoffPendingBytes": handoff.pending_bytes,
             "handoffOldestAgeMillis": handoff.oldest_age_millis,
             "handoffProgressSequence": handoff.progress_sequence,
@@ -1407,6 +1626,9 @@ impl ClusterPlugin {
         reason: &str,
     ) -> Result<serde_json::Value> {
         let local_id = self.scx.node.id();
+        if target_id == local_id && self.scx.shutdown.is_terminating() {
+            self.scx.shutdown.set_phase("force_finalizing");
+        }
         if target_id == local_id && !self.draining.load(Ordering::SeqCst) {
             return Err(anyhow!(
                 "force_drain_finalize is only allowed while target node {target_id} is draining"
@@ -1477,9 +1699,10 @@ impl ClusterPlugin {
             || routes_removed > 0
         {
             log::warn!(
-                "force-finalized drain target_id={} on node_id={} reason={} handoff_messages_discarded={} handoff_bytes_discarded={} handoff_clients_affected={} local_sessions_requested={} local_session_acks={} session_handoffs_discarded={} router_states_removed={} routes_removed={}",
+                "force-finalized drain target_id={} on node_id={} pod_name={} reason={} handoff_messages_discarded={} handoff_bytes_discarded={} handoff_clients_affected={} local_sessions_requested={} local_session_acks={} session_handoffs_discarded={} router_states_removed={} routes_removed={}",
                 target_id,
                 local_id,
+                self.scx.shutdown.pod_name(),
                 reason,
                 handoff.messages,
                 handoff.bytes,
@@ -1529,6 +1752,22 @@ impl ClusterPlugin {
         }
         let local_node =
             self.nodes.local_node_from_config(&self.cfg.node_grpc_addrs, &self.cfg.raft_peer_addrs)?;
+
+        if self.scx.shutdown.is_terminating() {
+            self.scx.shutdown.set_phase("leaving_cluster");
+            let handoff = self.shared.handoff_stats();
+            log::info!(
+                "graceful shutdown phase=leaving_cluster node_id={} pod_name={} handoff_messages_completed={} session_handoffs_completed={} handoff_pending_messages={} force_drain_finalized={}",
+                id,
+                self.scx.shutdown.pod_name(),
+                handoff.completed_messages.saturating_sub(
+                    self.drain_handoff_completed_start.load(Ordering::Relaxed)
+                ),
+                self.drain_sessions_relocated.load(Ordering::Relaxed),
+                handoff.pending_messages,
+                force_drain_finalized
+            );
+        }
 
         let proposal = message::Message::NodeRemove { id }.encode()?;
         raft_mailbox.send_proposal(proposal).await.map_err(anyhow::Error::new)?;

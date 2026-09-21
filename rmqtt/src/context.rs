@@ -75,6 +75,7 @@ use crate::plugin;
 use crate::plugin::PluginManagerConfig;
 use crate::router::DefaultRouter;
 use crate::shared::DefaultShared;
+use crate::shutdown::ShutdownCoordinator;
 #[cfg(feature = "stats")]
 use crate::stats::Stats;
 use crate::types::{DashMap, HashMap, ListenerConfig, ListenerId, NodeId};
@@ -111,6 +112,13 @@ pub struct ServerContextBuilder {
     /// Immediate execution flag for delayed publishes
     pub mqtt_delayed_publish_immediate: bool,
 
+    /// Enable coordinated graceful process termination.
+    pub shutdown_enabled: bool,
+    /// Total graceful termination budget.
+    pub shutdown_timeout: std::time::Duration,
+    /// Time reserved for final local cleanup.
+    pub shutdown_finalize_reserve: std::time::Duration,
+
     /// plugins config, path or configMap<plugin_name, toml_string>
     #[cfg(feature = "plugin")]
     pub plugins_config: PluginManagerConfig,
@@ -135,6 +143,9 @@ impl ServerContextBuilder {
             mqtt_delayed_publish_max: 100_000,
             mqtt_max_sessions: 0,
             mqtt_delayed_publish_immediate: true,
+            shutdown_enabled: false,
+            shutdown_timeout: std::time::Duration::from_secs(100),
+            shutdown_finalize_reserve: std::time::Duration::from_secs(10),
             #[cfg(feature = "plugin")]
             plugins_config: PluginManagerConfig::default(),
         }
@@ -200,6 +211,18 @@ impl ServerContextBuilder {
         self
     }
 
+    pub fn shutdown(
+        mut self,
+        enabled: bool,
+        timeout: std::time::Duration,
+        finalize_reserve: std::time::Duration,
+    ) -> Self {
+        self.shutdown_enabled = enabled;
+        self.shutdown_timeout = timeout;
+        self.shutdown_finalize_reserve = finalize_reserve;
+        self
+    }
+
     /// Sets directory path for plugin loading
     #[cfg(feature = "plugin")]
     pub fn plugins_config_dir<N: Into<String>>(mut self, plugins_dir: N) -> Self {
@@ -230,6 +253,7 @@ impl ServerContextBuilder {
 
     /// Constructs the ServerContext with configured parameters
     pub async fn build(self) -> ServerContext {
+        let node_id = self.node.id();
         ServerContext {
             inner: Arc::new(ServerContextInner {
                 args: self.args,
@@ -249,6 +273,12 @@ impl ServerContextBuilder {
                 mqtt_delayed_publish_max: self.mqtt_delayed_publish_max,
                 mqtt_max_sessions: self.mqtt_max_sessions,
                 mqtt_delayed_publish_immediate: self.mqtt_delayed_publish_immediate,
+                shutdown: ShutdownCoordinator::new(
+                    node_id,
+                    self.shutdown_enabled,
+                    self.shutdown_timeout,
+                    self.shutdown_finalize_reserve,
+                ),
 
                 handshakings: Counter::new(),
                 connections: Counter::new(),
@@ -302,6 +332,9 @@ pub struct ServerContextInner {
     pub mqtt_max_sessions: isize,
     /// Immediate delayed publish flag
     pub mqtt_delayed_publish_immediate: bool,
+
+    /// In-memory graceful termination coordination.
+    pub shutdown: ShutdownCoordinator,
 
     /// Active handshake counter
     pub handshakings: Counter,

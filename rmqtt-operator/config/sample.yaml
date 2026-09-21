@@ -10,6 +10,12 @@ spec:
   imageUpdate:
     autoRollout: true
     stabilizationSeconds: 60
+  gracefulShutdown:
+    enabled: true
+    timeoutSeconds: 100
+    finalizeReserveSeconds: 10
+  pod:
+    terminationGracePeriodSeconds: 120
   service:
     mqttPort: 1883
     mqttsPort: 8883

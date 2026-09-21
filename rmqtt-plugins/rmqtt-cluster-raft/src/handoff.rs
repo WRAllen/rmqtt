@@ -194,6 +194,8 @@ pub(crate) struct HandoffStats {
     pub capacity_percent: u8,
     pub capacity_waiters: usize,
     pub invariant_mismatch_observations: usize,
+    /// Reliable handoff deliveries acknowledged since this process started.
+    pub completed_messages: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -225,6 +227,8 @@ pub(crate) struct HandoffManager {
     progress_sequence: Arc<AtomicU64>,
     capacity_waiters: Arc<AtomicUsize>,
     invariant_mismatch_observations: Arc<AtomicUsize>,
+    completed_messages: Arc<AtomicUsize>,
+    completed_by_drain_target: Arc<DashMap<NodeId, Arc<AtomicUsize>>>,
     capacity_notify: Arc<Notify>,
     data_loss_detected: Arc<AtomicBool>,
 }
@@ -252,6 +256,8 @@ impl HandoffManager {
             progress_sequence: Arc::new(AtomicU64::new(0)),
             capacity_waiters: Arc::new(AtomicUsize::new(0)),
             invariant_mismatch_observations: Arc::new(AtomicUsize::new(0)),
+            completed_messages: Arc::new(AtomicUsize::new(0)),
+            completed_by_drain_target: Arc::new(DashMap::new()),
             capacity_notify: Arc::new(Notify::new()),
             data_loss_detected: Arc::new(AtomicBool::new(false)),
         }
@@ -285,6 +291,7 @@ impl HandoffManager {
         if !self.enabled() {
             return false;
         }
+        self.completed_by_drain_target.entry(node_id).or_insert_with(|| Arc::new(AtomicUsize::new(0)));
         self.draining_targets
             .entry(node_id)
             .and_modify(|state| {
@@ -308,6 +315,7 @@ impl HandoffManager {
 
     pub(crate) fn clear_drain(&self, node_id: NodeId) {
         self.draining_targets.remove(&node_id);
+        self.completed_by_drain_target.remove(&node_id);
         if self.draining_targets.is_empty() {
             self.has_draining_targets.store(false, Ordering::Release);
         }
@@ -555,6 +563,13 @@ impl HandoffManager {
                         self.failed_messages.fetch_sub(1, Ordering::SeqCst);
                     }
                     applied.completed += usize::from(newly_completed);
+                    if newly_completed {
+                        if let Some(drain_target) = item.pending.avoid_node_id {
+                            if let Some(completed) = self.completed_by_drain_target.get(&drain_target) {
+                                completed.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
                 }
                 ReliableForwardStatus::Accepted => {
                     let newly_accepted = item.pinned_node_id != Some(target_node_id);
@@ -580,6 +595,10 @@ impl HandoffManager {
                     applied.rejected += 1;
                 }
             }
+        }
+
+        if applied.completed > 0 {
+            self.completed_messages.fetch_add(applied.completed, Ordering::Relaxed);
         }
 
         let mut completed = Vec::new();
@@ -830,6 +849,7 @@ impl HandoffManager {
             capacity_percent: message_capacity.max(byte_capacity).min(100) as u8,
             capacity_waiters: self.capacity_waiters.load(Ordering::Acquire),
             invariant_mismatch_observations,
+            completed_messages: self.completed_messages.load(Ordering::Relaxed),
         }
     }
 
@@ -853,6 +873,13 @@ impl HandoffManager {
 
     pub(crate) fn active_for_node(&self, node_id: NodeId) -> usize {
         self.active_by_target.get(&node_id).map(|count| count.load(Ordering::SeqCst)).unwrap_or_default()
+    }
+
+    pub(crate) fn completed_for_node(&self, node_id: NodeId) -> usize {
+        self.completed_by_drain_target
+            .get(&node_id)
+            .map(|count| count.load(Ordering::Relaxed))
+            .unwrap_or_default()
     }
 
     pub(crate) fn begin_forward(&self, target_node_id: NodeId, operation_active: bool) -> ForwardMode {
@@ -1029,6 +1056,7 @@ mod tests {
     #[tokio::test]
     async fn queue_batches_fifo_and_releases_only_confirmed_prefix() {
         let manager = manager(10);
+        assert!(manager.prepare_drain(2));
         let first = pending(&manager, "client");
         let second = pending(&manager, "client");
         assert!(manager.enqueue(first.clone()).await.unwrap());
@@ -1045,6 +1073,8 @@ mod tests {
             ],
         );
         assert_eq!(manager.stats().pending_messages, 2);
+        assert_eq!(manager.stats().completed_messages, 1);
+        assert_eq!(manager.completed_for_node(2), 1);
         assert_eq!(manager.next_batch("client").unwrap().pinned_node_id, Some(3));
 
         manager.apply_batch(
@@ -1053,6 +1083,8 @@ mod tests {
             &[HandoffResult { delivery_id: first.delivery_id, status: ReliableForwardStatus::Duplicate }],
         );
         assert_eq!(manager.stats().pending_messages, 0);
+        assert_eq!(manager.stats().completed_messages, 2);
+        assert_eq!(manager.completed_for_node(2), 2);
         assert!(manager.next_batch("client").is_none());
     }
 

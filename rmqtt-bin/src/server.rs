@@ -31,6 +31,24 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Register the OS signal listener before asynchronous broker/plugin
+    // initialization so a deletion signal cannot be missed during startup.
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        #[cfg(target_os = "windows")]
+        tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl-c");
+        #[cfg(not(target_os = "windows"))]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term_signal = signal(SignalKind::terminate()).expect("Failed to create signal handler");
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term_signal.recv() => {}
+            }
+        }
+        let _ = shutdown_tx.send(std::time::Instant::now());
+    });
+
     //init config
     let conf = Settings::init(Options::from_args()).expect("settings init failed");
 
@@ -56,6 +74,7 @@ async fn main() -> Result<()> {
     let _ = Settings::logs();
 
     //init ServerContext
+    let (shutdown_enabled, shutdown_timeout, shutdown_finalize_reserve) = shutdown_config(conf);
     let scx = ServerContext::new()
         .args(config_args(conf))
         .node(node)
@@ -66,6 +85,7 @@ async fn main() -> Result<()> {
         .mqtt_delayed_publish_max(conf.mqtt.delayed_publish_max)
         .mqtt_delayed_publish_immediate(conf.mqtt.delayed_publish_immediate)
         .mqtt_max_sessions(conf.mqtt.max_sessions)
+        .shutdown(shutdown_enabled, shutdown_timeout, shutdown_finalize_reserve)
         .plugins_config_dir(conf.plugins.dir.as_str())
         .build()
         .await;
@@ -76,7 +96,7 @@ async fn main() -> Result<()> {
     //register plugin
     plugin::registers(&scx, conf.plugins.default_startups.clone()).await.expect("register plugin failed");
 
-    let mut builder = MqttServer::new(scx);
+    let mut builder = MqttServer::new(scx.clone());
 
     //tcp
     for (_, listen_cfg) in Settings::instance().listeners.tcps.iter() {
@@ -105,29 +125,69 @@ async fn main() -> Result<()> {
 
     builder.build().start();
 
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-
-    // Listen for Ctrl+C
-    tokio::spawn(async move {
-        #[cfg(target_os = "windows")]
-        tokio::signal::ctrl_c().await.expect("Failed to listen for ctrl-c");
-        #[cfg(not(target_os = "windows"))]
-        {
-            use tokio::signal::unix::{signal, SignalKind};
-            let mut term_signal = signal(SignalKind::terminate()).expect("Failed to create signal handler");
+    let signaled_at = shutdown_rx.await.expect("Failed to receive the shutdown command");
+    scx.shutdown.request("process_signal");
+    if scx.shutdown.enabled() {
+        let remaining = shutdown_timeout.saturating_sub(signaled_at.elapsed());
+        let _ = scx.shutdown.bind(None, None, Some(remaining), None);
+        log::info!(
+            "graceful shutdown entered node_id={} pod_name={} status={}",
+            scx.node.id(),
+            scx.shutdown.pod_name(),
+            scx.shutdown.status_json()
+        );
+        let wait = scx.shutdown.wait_until_complete_or_deadline();
+        tokio::pin!(wait);
+        let mut progress = tokio::time::interval(Duration::from_secs(10));
+        progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The entry record above is the immediate first observation.
+        progress.tick().await;
+        let result = loop {
             tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = term_signal.recv() => {}
+                result = &mut wait => break result,
+                _ = progress.tick() => {
+                    log::info!(
+                        "graceful shutdown waiting node_id={} pod_name={} status={}",
+                        scx.node.id(),
+                        scx.shutdown.pod_name(),
+                        scx.shutdown.status_json()
+                    );
+                }
             }
-        }
-        shutdown_tx.send(()).expect("Failed to send the shutdown command");
-    });
-
-    shutdown_rx.await.expect("Failed to receive the shutdown command");
-    //log::info!("Performing cleanup..."); @TODO ... Hook when exiting
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        log::info!(
+            "graceful shutdown finished node_id={} pod_name={} status={result}",
+            scx.node.id(),
+            scx.shutdown.pod_name()
+        );
+        // Give the final control response and log record a bounded chance to
+        // flush before exiting the process.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    } else {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Preserve the existing hard process-exit behavior. Dropping the Tokio
+    // runtime can wait indefinitely for blocking tasks beyond this deadline.
     std::process::exit(0);
+}
+
+fn shutdown_config(conf: &Settings) -> (bool, Duration, Duration) {
+    let enabled = std::env::var("RMQTT_GRACEFUL_SHUTDOWN_ENABLED")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(conf.shutdown.enabled);
+    let timeout = std::env::var("RMQTT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(conf.shutdown.timeout);
+    let finalize_reserve = std::env::var("RMQTT_GRACEFUL_SHUTDOWN_FINALIZE_RESERVE_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(conf.shutdown.finalize_reserve)
+        .min(timeout);
+    (enabled, timeout, finalize_reserve)
 }
 
 fn config_builder(cfg: &Listener) -> Builder {

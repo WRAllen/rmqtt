@@ -17,7 +17,7 @@ metadata:
 rules:
   - apiGroups: ["rmqtt.io"]
     resources: ["rmqttclusters"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch"]
   - apiGroups: ["rmqtt.io"]
     resources: ["rmqttclusters/status"]
     verbs: ["get", "patch", "update"]

@@ -189,6 +189,13 @@ async fn _handshake(
 ) -> std::result::Result<(SessionState, ConnectAck, u16), (ConnectAckReason, Error)> {
     let connect_info = ConnectInfo::V5(id.clone(), connect);
 
+    if scx.shutdown.is_terminating() {
+        return Err((
+            ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable),
+            anyhow!("node is terminating"),
+        ));
+    }
+
     //hook, client connect
     let _ = scx.extends.hook_mgr().client_connect(&connect_info).await;
 
@@ -231,6 +238,12 @@ async fn _handshake(
         return Err((ack, anyhow!("Authentication failed")));
     }
 
+    if scx.shutdown.is_terminating() {
+        return Err((
+            ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable),
+            anyhow!("node is terminating"),
+        ));
+    }
     let mut entry = match { scx.extends.shared().await.entry(id.clone()) }.try_lock().await {
         Err(e) => {
             return Err((ConnectAckReason::V5(ConnectAckReasonV5::ServerUnavailable), e));

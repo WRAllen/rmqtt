@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::time::sleep;
 
+mod external_termination;
 mod pod_restart;
+use external_termination::handle_external_pod_termination;
 use pod_restart::{PodRestartTarget, POD_MANUAL_RESTART_ANNOTATION};
 
 const GROUP: &str = "rmqtt.io";
@@ -169,6 +171,14 @@ struct ObjectList<T> {
 struct Metadata {
     name: String,
     #[serde(default)]
+    uid: String,
+    #[serde(rename = "resourceVersion", default)]
+    resource_version: String,
+    #[serde(rename = "deletionTimestamp", default)]
+    deletion_timestamp: Option<String>,
+    #[serde(default)]
+    finalizers: Vec<String>,
+    #[serde(default)]
     generation: Option<i64>,
 }
 
@@ -204,6 +214,8 @@ struct ClusterSpec {
     pod: BrokerPodSpec,
     #[serde(default)]
     monitoring: MonitoringSpec,
+    #[serde(default)]
+    graceful_shutdown: GracefulShutdownSpec,
     // Reconcile-only rollout target copied from the StatefulSet pod template.
     // This is never read from or written to RmqttCluster.spec.
     #[serde(skip)]
@@ -225,8 +237,30 @@ impl Default for ClusterSpec {
             resources: None,
             pod: BrokerPodSpec::default(),
             monitoring: MonitoringSpec::default(),
+            graceful_shutdown: GracefulShutdownSpec::default(),
             rollout_restart_at: None,
             pod_restart: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct GracefulShutdownSpec {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_graceful_shutdown_timeout_seconds")]
+    timeout_seconds: u64,
+    #[serde(default = "default_graceful_shutdown_finalize_reserve_seconds")]
+    finalize_reserve_seconds: u64,
+}
+
+impl Default for GracefulShutdownSpec {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout_seconds: default_graceful_shutdown_timeout_seconds(),
+            finalize_reserve_seconds: default_graceful_shutdown_finalize_reserve_seconds(),
         }
     }
 }
@@ -424,6 +458,10 @@ struct PodMetadata {
     name: String,
     #[serde(default)]
     uid: String,
+    #[serde(rename = "resourceVersion", default)]
+    resource_version: String,
+    #[serde(default)]
+    finalizers: Vec<String>,
     #[serde(default)]
     labels: BTreeMap<String, String>,
     #[serde(default)]
@@ -518,8 +556,35 @@ impl StatefulSet {
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect::<BTreeMap<_, _>>();
 
+        let shutdown_env_matches = self.rmqtt_container().is_some_and(|container| {
+            let value = |name: &str| {
+                container.env.iter().find(|entry| entry.name == name).map(|entry| entry.value.as_str())
+            };
+            if spec.graceful_shutdown.enabled {
+                value("RMQTT_GRACEFUL_SHUTDOWN_ENABLED") == Some("true")
+                    && value("RMQTT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS")
+                        == Some(spec.graceful_shutdown.timeout_seconds.to_string().as_str())
+                    && value("RMQTT_GRACEFUL_SHUTDOWN_FINALIZE_RESERVE_SECONDS")
+                        == Some(spec.graceful_shutdown.finalize_reserve_seconds.to_string().as_str())
+            } else {
+                // A legacy template without the variable is already disabled;
+                // a previously-enabled template must be explicitly rewritten.
+                value("RMQTT_GRACEFUL_SHUTDOWN_ENABLED") != Some("true")
+            }
+        });
+        let fence_matches = self
+            .spec
+            .template
+            .metadata
+            .finalizers
+            .iter()
+            .any(|value| value == external_termination::FINALIZER)
+            == spec.graceful_shutdown.enabled;
+
         self.broker_image_matches(spec)
+            && shutdown_env_matches
             && annotations == spec.pod.annotations
+            && fence_matches
             && pod.service_account_name.as_deref().unwrap_or("default")
                 == spec.pod.service_account_name.as_deref().unwrap_or("default")
             && pod.image_pull_secrets == spec.pod.image_pull_secrets
@@ -529,7 +594,7 @@ impl StatefulSet {
             && pod.tolerations == spec.pod.tolerations
             && pod.enable_service_links.unwrap_or(true) == spec.pod.enable_service_links.unwrap_or(false)
             && pod.termination_grace_period_seconds.unwrap_or(30)
-                == spec.pod.termination_grace_period_seconds.unwrap_or(30)
+                == effective_termination_grace_period_seconds(spec)
     }
 
     fn bootstrap_allowed(&self) -> bool {
@@ -561,6 +626,8 @@ struct StatefulSetPodTemplateSpec {
 struct StatefulSetPodTemplateMetadata {
     #[serde(default)]
     annotations: BTreeMap<String, String>,
+    #[serde(default)]
+    finalizers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -593,6 +660,16 @@ struct StatefulSetContainerSpec {
     image: String,
     #[serde(default)]
     image_pull_policy: String,
+    #[serde(default)]
+    env: Vec<StatefulSetEnvVar>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct StatefulSetEnvVar {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    value: String,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -609,6 +686,24 @@ struct DrainStatus {
     blocking_counts: BTreeMap<String, Option<i64>>,
     #[serde(default)]
     data_loss_detected: bool,
+    #[serde(default)]
+    counts: DrainCounts,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct DrainCounts {
+    #[serde(default)]
+    message_work_items_remaining: u64,
+    #[serde(default)]
+    session_handoffs_completed: usize,
+    #[serde(default)]
+    connections: i64,
+    #[serde(default)]
+    sessions: i64,
+    #[serde(default)]
+    handoff_pending_messages: usize,
+    #[serde(default)]
+    handoff_pending_bytes: usize,
 }
 
 impl DrainStatus {
@@ -617,6 +712,25 @@ impl DrainStatus {
             && self.strict_safe_to_leave.unwrap_or(self.safe_to_leave)
             && self.session_handoff_complete.unwrap_or(true)
     }
+}
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct TerminationStatus {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    node_id: i32,
+    #[serde(default)]
+    terminating: bool,
+    #[serde(default)]
+    pod_uid: String,
+    #[serde(default)]
+    boot_id: String,
+    #[serde(default)]
+    remaining_millis: Option<u64>,
+    #[serde(default)]
+    completed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -748,6 +862,7 @@ enum NodeDrainOutcome {
     Ready,
     Unsafe(String),
     TimedOut(String),
+    Preempted(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -881,6 +996,8 @@ struct RoutingStatus {
     plain_forwards: usize,
     #[serde(default)]
     handoff_pending: usize,
+    #[serde(default)]
+    handoff_completed: usize,
     #[serde(default)]
     handoff_pending_bytes: usize,
     #[serde(default)]
@@ -1079,6 +1196,53 @@ struct ClusterStatus {
     observed_restart_at: Option<String>,
     #[serde(default)]
     quorum_recovery: Option<QuorumRecoveryStatus>,
+    #[serde(default)]
+    external_termination_batch: Option<ExternalTerminationBatchStatus>,
+    #[serde(default)]
+    external_termination_cleanup: Option<ExternalTerminationCleanupStatus>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ExternalTerminationCleanupStatus {
+    #[serde(default)]
+    targets: Vec<ExternalTerminationTargetStatus>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ExternalTerminationBatchStatus {
+    #[serde(default)]
+    targets: Vec<ExternalTerminationTargetStatus>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ExternalTerminationTargetStatus {
+    #[serde(default)]
+    node_id: i32,
+    #[serde(default)]
+    pod_uid: String,
+    #[serde(default)]
+    boot_id: String,
+    #[serde(default)]
+    deadline_at: String,
+    #[serde(default)]
+    phase: String,
+    #[serde(default)]
+    stable_observations: u8,
+    #[serde(default)]
+    endpoint_absent_since: Option<String>,
+    #[serde(default)]
+    outcome: Option<String>,
+    #[serde(default)]
+    last_error: Option<String>,
+    /// Persisted before any membership mutation, retained across retries.
+    #[serde(default)]
+    membership_owner: bool,
+    /// Successfully acknowledged topology (including participant incarnations).
+    #[serde(default)]
+    prepared_topology: String,
 }
 
 #[derive(Debug, Deserialize, Clone, Default)]
@@ -1292,6 +1456,24 @@ fn default_raft_port() -> i32 {
 
 fn default_drain_timeout_seconds() -> u64 {
     1200
+}
+
+fn default_graceful_shutdown_timeout_seconds() -> u64 {
+    100
+}
+
+fn default_graceful_shutdown_finalize_reserve_seconds() -> u64 {
+    10
+}
+
+fn effective_termination_grace_period_seconds(spec: &ClusterSpec) -> i64 {
+    spec.pod.termination_grace_period_seconds.unwrap_or_else(|| {
+        if spec.graceful_shutdown.enabled {
+            spec.graceful_shutdown.timeout_seconds.saturating_add(20) as i64
+        } else {
+            30
+        }
+    })
 }
 
 fn default_endpoint_removal_stable_seconds() -> u64 {
@@ -1585,6 +1767,9 @@ async fn reconcile_all(kube: &KubeClient, namespace: &str) -> Result<()> {
 }
 
 async fn reconcile_cluster(kube: &KubeClient, namespace: &str, mut cluster: RmqttCluster) -> Result<()> {
+    if external_termination::reconcile_cluster_fence(kube, namespace, &cluster).await? {
+        return Ok(());
+    }
     let name = cluster.metadata.name.as_str();
     log::debug!(
         "reconciling cluster namespace={} cluster={} generation={:?} desired_replicas={}",
@@ -1625,6 +1810,7 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, mut cluster: Rmqt
     };
 
     let current_replicas = stateful_set.replicas();
+    external_termination::ensure_fences(kube, namespace, &cluster, &stateful_set.metadata.uid).await?;
     let planned_draining_node_id = cluster
         .status
         .as_ref()
@@ -1653,6 +1839,18 @@ async fn reconcile_cluster(kube: &KubeClient, namespace: &str, mut cluster: Rmqt
         degraded_client_endpoints_enabled(&cluster),
     )
     .await?;
+    if cluster.spec.graceful_shutdown.enabled
+        && handle_external_pod_termination(
+            kube,
+            namespace,
+            &cluster,
+            current_replicas,
+            &stateful_set.metadata.uid,
+        )
+        .await?
+    {
+        return Ok(());
+    }
     if stateful_set.bootstrap_allowed() {
         finish_controlled_bootstrap(kube, namespace, &cluster, current_replicas).await?;
         return Ok(());
@@ -2176,6 +2374,133 @@ async fn finish_controlled_bootstrap(
     Ok(())
 }
 
+#[cfg(test)]
+fn pod_termination_remaining(pod: &Pod, configured_timeout_seconds: u64) -> Duration {
+    let configured = Duration::from_secs(configured_timeout_seconds);
+    let Some(deletion_timestamp) = pod.metadata.deletion_timestamp.as_deref() else {
+        return configured;
+    };
+    let Ok(deletion_timestamp) = DateTime::parse_from_rfc3339(deletion_timestamp) else {
+        return configured;
+    };
+    deletion_timestamp
+        .with_timezone(&Utc)
+        .signed_duration_since(Utc::now())
+        .to_std()
+        .unwrap_or_default()
+        .min(configured)
+}
+
+fn external_termination_deadline(pod: &Pod, configured_timeout_seconds: u64) -> DateTime<Utc> {
+    pod.metadata
+        .deletion_timestamp
+        .as_deref()
+        .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| value.with_timezone(&Utc))
+        .unwrap_or_else(|| Utc::now() + chrono::Duration::seconds(configured_timeout_seconds as i64))
+}
+
+fn external_target_remaining(target: &ExternalTerminationTargetStatus) -> Duration {
+    DateTime::parse_from_rfc3339(&target.deadline_at)
+        .ok()
+        .and_then(|deadline| deadline.with_timezone(&Utc).signed_duration_since(Utc::now()).to_std().ok())
+        .unwrap_or_default()
+}
+
+fn external_target_has_old_pod(pods: &[Pod], name: &str, target: &ExternalTerminationTargetStatus) -> bool {
+    pod_for_node(pods, name, target.node_id)
+        .is_some_and(|pod| pod.metadata.uid == target.pod_uid && pod.metadata.deletion_timestamp.is_some())
+}
+
+#[cfg(test)]
+fn external_replacement_has_taken_ordinal(
+    pods: &[Pod],
+    name: &str,
+    target: &ExternalTerminationTargetStatus,
+) -> bool {
+    pod_for_node(pods, name, target.node_id)
+        .is_some_and(|pod| pod.metadata.uid != target.pod_uid && pod.metadata.deletion_timestamp.is_none())
+}
+
+fn upsert_external_termination_target(
+    targets: &mut Vec<ExternalTerminationTargetStatus>,
+    pod: &Pod,
+    node_id: i32,
+    configured_timeout_seconds: u64,
+) {
+    let replacement = ExternalTerminationTargetStatus {
+        node_id,
+        pod_uid: pod.metadata.uid.clone(),
+        deadline_at: external_termination_deadline(pod, configured_timeout_seconds)
+            .to_rfc3339_opts(SecondsFormat::Millis, true),
+        phase: "WaitingForSignal".to_string(),
+        ..Default::default()
+    };
+    match targets.iter_mut().find(|target| target.node_id == node_id) {
+        Some(existing) if existing.pod_uid != pod.metadata.uid => *existing = replacement,
+        Some(_) => {}
+        None => targets.push(replacement),
+    }
+}
+
+fn external_membership_owner(targets: &[ExternalTerminationTargetStatus]) -> Option<usize> {
+    if let Some(index) =
+        targets.iter().position(|target| target.membership_owner && target.phase != "Completed")
+    {
+        return Some(index);
+    }
+    targets
+        .iter()
+        .enumerate()
+        .filter(|(_, target)| {
+            matches!(
+                target.phase.as_str(),
+                "ReadyToLeave" | "Leaving" | "WaitingMembershipRemoval" | "RemovingBusinessMember"
+            )
+        })
+        .min_by_key(|(_, target)| (target.deadline_at.as_str(), target.node_id))
+        .map(|(index, _)| index)
+}
+
+fn external_batch_json(targets: &[ExternalTerminationTargetStatus]) -> Value {
+    if targets.is_empty() {
+        Value::Null
+    } else {
+        json!(ExternalTerminationBatchStatus { targets: targets.to_vec() })
+    }
+}
+
+async fn patch_external_termination_batch(
+    kube: &KubeClient,
+    namespace: &str,
+    cluster: &RmqttCluster,
+    current_replicas: i32,
+    targets: &[ExternalTerminationTargetStatus],
+    message: String,
+) -> Result<()> {
+    let active_ids = targets
+        .iter()
+        .filter(|target| target.phase != "Completed")
+        .map(|target| target.node_id)
+        .collect::<Vec<_>>();
+    patch_status(
+        kube,
+        namespace,
+        &cluster.metadata.name,
+        json!({
+            "phase": "ExternalTermination",
+            "message": message,
+            "replicas": current_replicas,
+            "desiredReplicas": cluster.spec.replicas,
+            "drainingNodeId": active_ids.first(),
+            "drainingNodeIds": active_ids,
+            "externalTerminationBatch": external_batch_json(targets),
+            "observedGeneration": cluster.metadata.generation,
+        }),
+    )
+    .await
+}
+
 fn validate_spec(spec: &ClusterSpec) -> Result<()> {
     if spec.replicas < spec.raft.min_replicas {
         bail!("spec.replicas {} must be >= raft.minReplicas {}", spec.replicas, spec.raft.min_replicas);
@@ -2202,6 +2527,19 @@ fn validate_spec(spec: &ClusterSpec) -> Result<()> {
     }
     if spec.raft.endpoint_removal_stable_seconds < 1 {
         bail!("spec.raft.endpointRemovalStableSeconds must be >= 1");
+    }
+    if spec.graceful_shutdown.enabled {
+        if spec.graceful_shutdown.timeout_seconds == 0 {
+            bail!("spec.gracefulShutdown.timeoutSeconds must be >= 1 when enabled=true");
+        }
+        if spec.graceful_shutdown.finalize_reserve_seconds >= spec.graceful_shutdown.timeout_seconds {
+            bail!("spec.gracefulShutdown.finalizeReserveSeconds must be smaller than timeoutSeconds");
+        }
+        if effective_termination_grace_period_seconds(spec) <= spec.graceful_shutdown.timeout_seconds as i64 {
+            bail!(
+                "spec.pod.terminationGracePeriodSeconds must be greater than gracefulShutdown.timeoutSeconds"
+            );
+        }
     }
     if spec.raft.scale_in_stabilization_seconds < 10 {
         bail!("spec.raft.scaleInStabilizationSeconds must be >= 10");
@@ -4034,8 +4372,26 @@ async fn continue_image_rollout_before_recreation(
     .await?;
 
     let mut forced_drain_description = None;
-    match wait_node_drain_barriers(namespace, cluster, current_replicas, node_id).await {
+    match wait_node_drain_barriers(kube, namespace, cluster, current_replicas, node_id, true).await {
         Ok(NodeDrainOutcome::Ready) => {}
+        Ok(NodeDrainOutcome::Preempted(reason)) => {
+            patch_image_rollout_status(
+                kube,
+                namespace,
+                cluster,
+                current_replicas,
+                "ExternalTerminationPending",
+                reason,
+                node_id,
+                "Preempted",
+                Some(&membership),
+                None,
+                None,
+                false,
+            )
+            .await?;
+            return Ok(());
+        }
         Ok(NodeDrainOutcome::Unsafe(blockers)) => {
             rollback_image_rollout_drain(
                 kube,
@@ -4366,6 +4722,14 @@ async fn finish_scale_in_step(
                 "confChange": conf_change_status_json(conf_change),
                 "observedGeneration": cluster.metadata.generation,
             }),
+        )
+        .await?;
+        external_termination::release_after_planned_drain(
+            kube,
+            namespace,
+            cluster,
+            &pod_name(name, victim_id),
+            None,
         )
         .await?;
         apply_stateful_set(kube, namespace, cluster, desired, false).await?;
@@ -5196,8 +5560,33 @@ async fn scale_in_one(
     .await?;
 
     let mut forced_drain_description = None;
-    match wait_node_drain_barriers(namespace, cluster, current_replicas, victim_id).await {
+    match wait_node_drain_barriers(kube, namespace, cluster, current_replicas, victim_id, true).await {
         Ok(NodeDrainOutcome::Ready) => {}
+        Ok(NodeDrainOutcome::Preempted(reason)) => {
+            patch_status(
+                kube,
+                namespace,
+                name,
+                json!({
+                    "phase": "ExternalTerminationPending",
+                    "message": reason,
+                    "replicas": current_replicas,
+                    "desiredReplicas": cluster.spec.replicas,
+                    "drainingNodeId": victim_id,
+                    "operation": scale_in_operation_status_json(
+                        cluster,
+                        &conf_change,
+                        "Preempted",
+                        None,
+                        false
+                    ),
+                    "confChange": conf_change_status_json(&conf_change),
+                    "observedGeneration": cluster.metadata.generation,
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
         Ok(NodeDrainOutcome::Unsafe(blockers)) => {
             rollback_scale_in_drain(
                 kube,
@@ -6484,6 +6873,7 @@ async fn continue_quorum_recovery(
         // ordinal while stale in-memory Raft processes are still terminating.
         apply_stateful_set(kube, namespace, cluster, 0, false).await?;
         for (old_pod, _) in &old_pods {
+            external_termination::release_for_planned_delete(kube, namespace, cluster, old_pod, None).await?;
             kube.delete(&format!("/api/v1/namespaces/{namespace}/pods/{old_pod}")).await?;
         }
         let old_pod_uids =
@@ -6593,6 +6983,7 @@ async fn continue_quorum_recovery(
         .collect::<Vec<_>>();
     for (target_pod, _) in &old_non_seed_pods {
         patch_pod_unavailable(kube, namespace, target_pod).await?;
+        external_termination::release_for_planned_delete(kube, namespace, cluster, target_pod, None).await?;
         kube.delete(&format!("/api/v1/namespaces/{namespace}/pods/{target_pod}")).await?;
     }
 
@@ -6951,6 +7342,14 @@ async fn continue_recovery_node_recycle(
                     )
                     .await;
                 }
+                external_termination::release_for_planned_delete(
+                    kube,
+                    namespace,
+                    cluster,
+                    &pod.metadata.name,
+                    Some(&expected_uid),
+                )
+                .await?;
                 delete_accepted = kube
                     .delete_with_uid_precondition(
                         &format!("/api/v1/namespaces/{namespace}/pods/{}", pod.metadata.name),
@@ -7385,6 +7784,8 @@ async fn handle_unhealthy_recovery_voter(
         }),
     )
     .await?;
+    external_termination::release_for_planned_delete(kube, namespace, cluster, &pod_name, Some(&pod_uid))
+        .await?;
     let deleted = kube
         .delete_with_uid_precondition(&format!("/api/v1/namespaces/{namespace}/pods/{pod_name}"), &pod_uid)
         .await?;
@@ -8122,6 +8523,9 @@ async fn try_rmqtt_action_value_with_payload(
         matches!(
             action,
             "membership"
+                | "termination_status"
+                | "termination_bind"
+                | "termination_complete"
                 | "drain_status"
                 | "routing_status"
                 | "prepare_drain"
@@ -8185,10 +8589,14 @@ async fn try_rmqtt_action_value_once(
         http_port,
         node_id
     );
-    let request_timeout = if payload.get("action").and_then(Value::as_str) == Some("force_rebootstrap") {
-        Duration::from_secs(60)
-    } else {
-        Duration::from_secs(10)
+    #[cfg(test)]
+    let url = external_termination::TEST_BROKER_URL
+        .try_with(|base| format!("{base}/broker/{node_id}"))
+        .unwrap_or(url);
+    let request_timeout = match payload.get("action").and_then(Value::as_str) {
+        Some("force_rebootstrap") => Duration::from_secs(60),
+        Some("termination_status" | "termination_bind" | "termination_complete") => Duration::from_secs(2),
+        _ => Duration::from_secs(10),
     };
     let client = Client::builder().timeout(request_timeout).build().map_err(|error| {
         RmqttActionError::new(
@@ -8644,15 +9052,30 @@ async fn prepare_node_for_drain_with_operation(
 }
 
 async fn wait_node_drain_barriers(
+    kube: &KubeClient,
     namespace: &str,
     cluster: &RmqttCluster,
     replicas: i32,
     node_id: i32,
+    allow_external_preemption: bool,
 ) -> std::result::Result<NodeDrainOutcome, NodeDrainError> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(cluster.spec.raft.drain_timeout_seconds);
     let mut stable_rounds = 0u8;
     let mut last_progress_log = tokio::time::Instant::now() - Duration::from_secs(30);
     loop {
+        if allow_external_preemption && cluster.spec.graceful_shutdown.enabled {
+            let terminating = cluster_pods(kube, namespace, &cluster.metadata.name)
+                .await
+                .map_err(|error| NodeDrainError::new(NodeDrainStage::ObserveDrain, error.to_string()))?
+                .into_iter()
+                .find(|pod| pod.metadata.deletion_timestamp.is_some());
+            if let Some(pod) = terminating {
+                return Ok(NodeDrainOutcome::Preempted(format!(
+                    "planned drain yielded to externally terminating pod {}",
+                    pod.metadata.name
+                )));
+            }
+        }
         let status = try_rmqtt_action::<DrainStatus>(namespace, cluster, node_id, "drain_status")
             .await
             .map_err(|error| NodeDrainError::from_action(NodeDrainStage::ObserveDrain, error))?;
@@ -8667,9 +9090,11 @@ async fn wait_node_drain_barriers(
             stable_rounds = 0;
         }
         let blockers = drain_blockers(&status, &routing);
+        let cluster_handoff_messages_completed =
+            routing.iter().map(|item| item.handoff_completed).sum::<usize>();
         if last_progress_log.elapsed() >= Duration::from_secs(30) {
             log::info!(
-                "node drain progress namespace={} cluster={} node_id={} pod_name={} local_ready={} routing_ready={} stable_rounds={} blockers={}",
+                "node drain progress namespace={} cluster={} node_id={} pod_name={} local_ready={} routing_ready={} stable_rounds={} message_work_items_remaining={} handoff_messages_completed={} session_handoffs_completed={} connections={} sessions={} handoff_pending_messages={} handoff_pending_bytes={} blockers={}",
                 namespace,
                 cluster.metadata.name,
                 node_id,
@@ -8677,6 +9102,13 @@ async fn wait_node_drain_barriers(
                 local_ready,
                 routing_ready,
                 stable_rounds,
+                status.counts.message_work_items_remaining,
+                cluster_handoff_messages_completed,
+                status.counts.session_handoffs_completed,
+                status.counts.connections,
+                status.counts.sessions,
+                status.counts.handoff_pending_messages,
+                status.counts.handoff_pending_bytes,
                 blockers
             );
             last_progress_log = tokio::time::Instant::now();
@@ -8945,6 +9377,8 @@ fn stateful_set_object(
     let headless = format!("{name}-headless");
     let mut env = vec![
         json!({"name": "POD_NAMESPACE", "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}}}),
+        json!({"name": "RMQTT_POD_NAME", "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}}}),
+        json!({"name": "RMQTT_POD_UID", "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}}),
         json!({"name": "RUST_BACKTRACE", "value": "1"}),
         json!({"name": "RMQTT_NAME", "value": name}),
         json!({"name": "RMQTT_HEADLESS_SERVICE", "value": format!("{name}-headless")}),
@@ -8957,6 +9391,9 @@ fn stateful_set_object(
         json!({"name": "RMQTT_GRPC_PORT", "value": cluster.spec.service.grpc_port.to_string()}),
         json!({"name": "RMQTT_RAFT_PORT", "value": cluster.spec.service.raft_port.to_string()}),
         json!({"name": "RMQTT_RAFT_BOOTSTRAP", "value": bootstrap_allowed.to_string()}),
+        json!({"name": "RMQTT_GRACEFUL_SHUTDOWN_ENABLED", "value": cluster.spec.graceful_shutdown.enabled.to_string()}),
+        json!({"name": "RMQTT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS", "value": cluster.spec.graceful_shutdown.timeout_seconds.to_string()}),
+        json!({"name": "RMQTT_GRACEFUL_SHUTDOWN_FINALIZE_RESERVE_SECONDS", "value": cluster.spec.graceful_shutdown.finalize_reserve_seconds.to_string()}),
     ];
     let mut volume_mounts = vec![
         json!({"name": "work", "mountPath": "/work"}),
@@ -9029,7 +9466,7 @@ fn stateful_set_object(
         "containers": [container],
         "volumes": volumes,
         "enableServiceLinks": cluster.spec.pod.enable_service_links.unwrap_or(false),
-        "terminationGracePeriodSeconds": cluster.spec.pod.termination_grace_period_seconds.unwrap_or(30),
+        "terminationGracePeriodSeconds": effective_termination_grace_period_seconds(&cluster.spec),
     });
     if let Some(service_account_name) = cluster.spec.pod.service_account_name.as_deref() {
         pod_spec["serviceAccountName"] = json!(service_account_name);
@@ -9067,6 +9504,9 @@ fn stateful_set_object(
             "template": {
                 "metadata": {
                     "annotations": cluster.spec.pod.annotations,
+                    "finalizers": if cluster.spec.graceful_shutdown.enabled {
+                        vec![external_termination::FINALIZER]
+                    } else { Vec::<&str>::new() },
                     "labels": {
                         "app.kubernetes.io/name": "rmqtt",
                         "app.kubernetes.io/instance": name,
@@ -9317,6 +9757,9 @@ fn status_log_signature(status: &Value) -> Value {
         "leaderId": status.get("leaderId"),
         "membersReady": status.pointer("/raftStatus/membersReady"),
         "drainingNodeId": status.get("drainingNodeId"),
+        "drainingNodeIds": status.get("drainingNodeIds"),
+        "externalTerminationBatchTargets": status.pointer("/externalTerminationBatch/targets"),
+        "externalTerminationCleanupTargets": status.pointer("/externalTerminationCleanup/targets"),
         "operationType": status.pointer("/operation/type"),
         "operationPhase": status.pointer("/operation/phase"),
         "operationMode": status.pointer("/operation/mode"),
@@ -9425,6 +9868,7 @@ fn status_transition_details(namespace: &str, name: &str, status: &Value) -> Str
         .unwrap_or_else(|| "-".to_string());
     let members_ready = status_field(status, "/raftStatus/membersReady");
     let draining_node_id = status_field(status, "/drainingNodeId");
+    let draining_node_ids = status_field(status, "/drainingNodeIds");
     let operation_type = status_field(status, "/operation/type");
     let operation_phase = status_field(status, "/operation/phase");
     let operation_mode = status_field(status, "/operation/mode");
@@ -9449,7 +9893,7 @@ fn status_transition_details(namespace: &str, name: &str, status: &Value) -> Str
          operation_node_id={operation_node_id} replicas={replicas} ready_replicas={ready_replicas} \
          desired_replicas={desired_replicas} \
          target_restart_at={target_restart_at} updated_replicas={updated_replicas} \
-         leader_id={leader_id} leader_pod_name={leader_pod_name} members_ready={members_ready} draining_node_id={draining_node_id} \
+         leader_id={leader_id} leader_pod_name={leader_pod_name} members_ready={members_ready} draining_node_id={draining_node_id} draining_node_ids={draining_node_ids} \
          operation_type={operation_type} operation_phase={operation_phase} operation_mode={operation_mode} \
          operation_retry_count={operation_retry_count} quorum_recovery_epoch={quorum_recovery_epoch} \
          quorum_recovery_phase={quorum_recovery_phase} quorum_recovery_seed_node_id={quorum_recovery_seed_node_id} \
@@ -12043,5 +12487,176 @@ mod tests {
 
         spec.rollout_restart_at = Some("2026-08-04T02:00:00Z".to_string());
         assert!(image_rollout_terminal_target_superseded(&operation, &spec));
+    }
+
+    #[test]
+    fn deletion_timestamp_is_treated_as_the_kubernetes_deadline() {
+        let deadline = Utc::now() + chrono::Duration::seconds(50);
+        let pod: Pod = serde_json::from_value(json!({
+            "metadata": {
+                "deletionTimestamp": deadline.to_rfc3339(),
+                "deletionGracePeriodSeconds": 120
+            }
+        }))
+        .unwrap();
+
+        let remaining = pod_termination_remaining(&pod, 100);
+        assert!(remaining <= Duration::from_secs(50));
+        assert!(remaining >= Duration::from_secs(45));
+    }
+
+    #[test]
+    fn staggered_external_deletions_are_merged_into_one_batch() {
+        let first_deadline = Utc::now() + chrono::Duration::seconds(90);
+        let second_deadline = Utc::now() + chrono::Duration::seconds(80);
+        let first: Pod = serde_json::from_value(json!({
+            "metadata": {
+                "name": "rmqtt-1",
+                "uid": "pod-2-a",
+                "deletionTimestamp": first_deadline.to_rfc3339()
+            }
+        }))
+        .unwrap();
+        let second: Pod = serde_json::from_value(json!({
+            "metadata": {
+                "name": "rmqtt-3",
+                "uid": "pod-4-a",
+                "deletionTimestamp": second_deadline.to_rfc3339()
+            }
+        }))
+        .unwrap();
+        let mut targets = Vec::new();
+
+        upsert_external_termination_target(&mut targets, &first, 2, 100);
+        targets[0].phase = "Draining".to_string();
+        upsert_external_termination_target(&mut targets, &second, 4, 100);
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].node_id, 2);
+        assert_eq!(targets[0].phase, "Draining");
+        assert_eq!(targets[1].node_id, 4);
+        assert_eq!(targets[1].phase, "WaitingForSignal");
+    }
+
+    #[test]
+    fn recreated_node_uid_replaces_stale_external_termination_state() {
+        let deadline = Utc::now() + chrono::Duration::seconds(90);
+        let replacement: Pod = serde_json::from_value(json!({
+            "metadata": {
+                "name": "rmqtt-1",
+                "uid": "pod-2-new",
+                "deletionTimestamp": deadline.to_rfc3339()
+            }
+        }))
+        .unwrap();
+        let mut targets = vec![ExternalTerminationTargetStatus {
+            node_id: 2,
+            pod_uid: "pod-2-old".to_string(),
+            boot_id: "old-boot".to_string(),
+            deadline_at: deadline.to_rfc3339(),
+            phase: "Completed".to_string(),
+            stable_observations: 2,
+            endpoint_absent_since: None,
+            outcome: Some("Completed".to_string()),
+            last_error: None,
+            ..Default::default()
+        }];
+
+        upsert_external_termination_target(&mut targets, &replacement, 2, 100);
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].pod_uid, "pod-2-new");
+        assert_eq!(targets[0].phase, "WaitingForSignal");
+        assert!(targets[0].boot_id.is_empty());
+        assert_eq!(targets[0].stable_observations, 0);
+    }
+
+    #[test]
+    fn survivor_cleanup_never_targets_a_replacement_process() {
+        let pods: Vec<Pod> = serde_json::from_value(json!([{
+            "metadata": {
+                "name": "rmqtt-1",
+                "uid": "pod-2-new"
+            }
+        }]))
+        .unwrap();
+        let old_target = ExternalTerminationTargetStatus {
+            node_id: 2,
+            pod_uid: "pod-2-old".to_string(),
+            phase: "WaitingMembershipRemoval".to_string(),
+            ..Default::default()
+        };
+
+        assert!(!external_target_has_old_pod(&pods, "rmqtt", &old_target));
+        assert!(external_replacement_has_taken_ordinal(&pods, "rmqtt", &old_target));
+    }
+
+    #[test]
+    fn external_membership_owner_is_single_and_earliest_deadline_first() {
+        let target = |node_id, deadline: &str, phase: &str| ExternalTerminationTargetStatus {
+            node_id,
+            deadline_at: deadline.to_string(),
+            phase: phase.to_string(),
+            ..Default::default()
+        };
+        let targets = vec![
+            target(2, "2026-09-17T10:00:30Z", "ForceFinalizing"),
+            target(4, "2026-09-17T10:00:10Z", "Leaving"),
+            target(5, "2026-09-17T10:00:00Z", "Draining"),
+        ];
+
+        assert_eq!(external_membership_owner(&targets), Some(1));
+    }
+
+    #[test]
+    fn legacy_status_without_external_batch_remains_compatible() {
+        let status: ClusterStatus = serde_json::from_value(json!({
+            "phase": "Ready",
+            "operation": null,
+            "confChange": null
+        }))
+        .unwrap();
+
+        assert!(status.external_termination_batch.is_none());
+    }
+
+    #[test]
+    fn graceful_shutdown_keeps_the_legacy_grace_default_when_disabled() {
+        let disabled = ClusterSpec::default();
+        assert_eq!(effective_termination_grace_period_seconds(&disabled), 30);
+
+        let mut enabled = disabled;
+        enabled.graceful_shutdown.enabled = true;
+        assert_eq!(effective_termination_grace_period_seconds(&enabled), 120);
+    }
+
+    #[test]
+    fn graceful_shutdown_renders_identity_and_budget_environment() {
+        let mut cluster: RmqttCluster = serde_json::from_value(json!({
+            "metadata": {"name": "rmqtt"},
+            "spec": {
+                "gracefulShutdown": {
+                    "enabled": true,
+                    "timeoutSeconds": 100,
+                    "finalizeReserveSeconds": 10
+                }
+            }
+        }))
+        .unwrap();
+        cluster.spec.raft.min_replicas = 1;
+        let object = stateful_set_object("default", &cluster, 1, false);
+        let env = object["spec"]["template"]["spec"]["containers"][0]["env"].as_array().unwrap();
+        let value = |name: &str| {
+            env.iter().find(|entry| entry["name"] == name).and_then(|entry| entry["value"].as_str())
+        };
+
+        assert_eq!(value("RMQTT_GRACEFUL_SHUTDOWN_ENABLED"), Some("true"));
+        assert_eq!(value("RMQTT_GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS"), Some("100"));
+        assert_eq!(object["spec"]["template"]["spec"]["terminationGracePeriodSeconds"], 120);
+        assert!(env.iter().any(|entry| entry["name"] == "RMQTT_POD_UID" && entry["valueFrom"].is_object()));
+        assert!(object["spec"]["template"]["spec"]["containers"][0]["args"][0]
+            .as_str()
+            .unwrap()
+            .contains("exec /app/rmqtt/rmqtt-bin/rmqttd"));
     }
 }

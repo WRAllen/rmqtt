@@ -82,6 +82,7 @@ pub mod router; // Message routing core
 pub mod server; // Server lifecycle management
 pub mod session; // Client session handling
 pub mod shared; // Shared state management
+pub mod shutdown; // Graceful process termination coordination
 
 // Subscription Management
 #[cfg(any(feature = "auto-subscription", feature = "shared-subscription"))]

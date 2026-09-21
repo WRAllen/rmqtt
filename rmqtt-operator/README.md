@@ -134,6 +134,114 @@ Image-specific orchestration only selects the pod, deletes it after membership
 removal, verifies the target template, and enforces the per-pod stability
 window.
 
+## Graceful External Pod Deletion
+
+Direct Pod deletion can opt into the same in-memory drain and membership
+cleanup path:
+
+```yaml
+spec:
+  pod:
+    terminationGracePeriodSeconds: 120
+  gracefulShutdown:
+    enabled: true
+    timeoutSeconds: 100
+    finalizeReserveSeconds: 10
+```
+
+The feature is disabled by default. When enabled, SIGTERM immediately makes
+the broker unready and rejects new MQTT sessions while keeping its internal
+HTTP, gRPC, Raft, existing MQTT connections, and in-memory handoff state alive.
+The operator detects `deletionTimestamp`, validates the Pod UID and broker boot
+identity, transfers leadership when needed, prepares reliable handoff, drains
+the node, removes it from membership, and releases the process. All stages
+share `timeoutSeconds`; the deadline cannot be extended by retries.
+
+Multiple external deletions are tracked as one dynamically expanding batch.
+Each reconciliation discovers newly terminating Pods, so a second deletion is
+merged even when the first Pod is already draining. Data-plane quiesce,
+EndpointSlice observation, session/message handoff, and drain-barrier checks
+advance independently for every target. Leadership transfer and Raft/business
+membership removal remain serialized. The next owner is selected by deadline;
+once persisted, a new earlier deadline cannot replace that owner before membership
+removal is confirmed. The effective deadline is the minimum of Kubernetes' deadline
+and the broker's remaining time, anchored at the start of the status request.
+Control RPCs have a two-second budget without inline retries; each external batch
+round has a twenty-second budget. Progress is saved per target as it completes.
+Terminating targets and an already planned drain target are excluded from handoff
+destinations, but still-live terminating senders participate in reliable forwarding
+and drain barriers. Destination/participant changes are acknowledged and retried
+across rounds, including after leader transfer or operator restart.
+Learners confirmed by the authoritative leader to have no business membership
+do not participate in HTTP drain/clear barriers: their control API starts only
+after promotion. Unready or terminating business senders are not excluded by
+this rule. A learner belonging to an earlier scale-out or rollout remains owned
+by that operation, which resumes after the external batch finishes.
+
+With graceful shutdown enabled, `rmqtt.io/external-membership-cleanup` is added
+to managed Pods before deletion. It keeps the old Pod object (not its process)
+until Raft and business removal are confirmed, preventing an id-only cleanup
+request from racing a new Pod with the same ordinal. The original grace period
+still applies; a stopped process can remain visible as Terminating while cleanup
+finishes. Legacy Pods deleted before receiving the finalizer never undergo
+identity-blind cleanup. Operator-owned rollouts, scale-in and disaster recovery
+release this fence through their existing protected deletion paths.
+Normal scale-in and rollout paths also record `rmqtt.io/planned-drain-pod-uid`
+on the exact old Pod after their drain/removal workflow. If that Pod remains
+Terminating, the external handler binds its shutdown identity and confirms both
+memberships are absent, then completes shutdown without repeating drain. Its
+local drain result still determines whether completion is clean or with loss.
+The marker is not inherited by replacement Pods; disaster-recovery fence release
+does not write it. It is an operator-owned annotation, not a user control switch.
+
+External-batch replacement learners are promoted before resuming a saved scale-in/rollout,
+without overwriting that operation. Handoff exclusion is cleared only after the
+replacement is Ready, caught up, and present in both memberships. Disabling the
+feature durably moves an active batch to disabled-cleanup state, clears its
+handoff markers on every surviving broker, and identity-signals bound terminating
+brokers to finish with a loss outcome. It then updates the OnDelete StatefulSet
+template to disable broker coordination and remove the inherited fence before
+releasing current Pod finalizers. Failed marker clears are retried without holding
+Pod deletion; re-enabling waits for them to finish, including a replacement learner
+whose control API is not available until promotion. Deleting the Cluster CR skips
+network cleanup and releases its Pod fences immediately. The CR has a cleanup
+finalizer for this purpose. Apply the updated operator RBAC (CR metadata patch
+permission). Keep the operator running for cleanup; disable this feature and wait
+for `status.externalTerminationCleanup` and finalizers to clear before uninstalling
+it. Manually removing finalizers bypasses the ordinal-reuse safety guarantee.
+
+For an existing cluster, first deploy broker and operator binaries containing
+this capability, then set `gracefulShutdown.enabled=true` and complete a
+controlled rollout so every running Pod has the new environment and control
+actions. Do not rely on direct deletion until that rollout has finished.
+
+The StatefulSet command already uses `exec rmqttd`, so kubelet signals reach
+the broker process directly. No preStop command or persistent storage is
+required. External deletion reuses the existing broker drain, reliable handoff,
+session relocation, and membership-removal APIs used by planned operations.
+It does not change normal QoS 0/1/2 publish processing, inbound packet-ID
+tracking, outbound inflight restoration, reconnect/takeover RPCs, or the session
+snapshot wire format. It inherits the existing drain's delivery guarantees and
+limitations; it does not add a new inbound QoS 2 migration guarantee. Before
+drain activation, existing sessions and reliable acknowledgements continue
+through their original processing paths. Only new connections and incoming
+session relocations are refused once this process starts terminating.
+At the deadline the operator may force-finalize only the terminating target
+and records the result as `CompletedWithLoss`.
+
+The scope review and regression checks are documented in
+[graceful-shutdown-design-review.md](docs/graceful-shutdown-design-review.md).
+
+During shutdown, the broker logs every phase change and emits a progress line
+at most every 10 seconds. `message_work_items_remaining` sums live queue,
+inflight, delayed, forwarding, and reliable-handoff work; it is an operational
+work-item count and can briefly count one MQTT message in more than one stage.
+`handoff_messages_completed` counts reliable message handoffs confirmed since
+this drain began, while `session_handoffs_completed` counts relocated sessions.
+The broker exposes local counters through `drain_status`; each peer exposes its
+target-specific handoff count through `routing_status`, and the operator sums
+those peer counts in its periodic drain progress log.
+
 ## Restart One Pod
 
 After deploying an operator version containing this feature, choose how a drain
@@ -159,7 +267,9 @@ Both types first run the same graceful drain. `force-on-timeout` does not force
 an immediate deletion. Replace `ams-rmqtt-2` with the Pod you want to restart.
 The command only submits the request; it returns before the restart finishes.
 This is a **single-Pod restart**, not scale-in: the StatefulSet recreates a Pod
-with the same name. Ordinary `kubectl delete pod` does not invoke this workflow.
+with the same name. Ordinary `kubectl delete pod` uses the external deletion
+workflow only when `spec.gracefulShutdown.enabled=true`; otherwise it retains
+the legacy behavior.
 
 The annotation itself submits the restart request and selects its timeout
 policy. `manual-restart=rollback-on-timeout` corresponds to `Rollback`, and

@@ -790,6 +790,15 @@ async fn check_health_one(
 async fn check_raft_ready(depot: &mut Depot, res: &mut Response) -> std::result::Result<(), salvo::Error> {
     let (scx, _) = get_scx_cfg(depot)?;
     let local_id = scx.node.id();
+    if scx.shutdown.is_terminating() {
+        res.status_code(StatusCode::SERVICE_UNAVAILABLE);
+        res.render(Json(json!({
+            "ready": false,
+            "nodeId": local_id,
+            "shutdown": scx.shutdown.status_json(),
+        })));
+        return Ok(());
+    }
     match scx.plugins.send("rmqtt-cluster-raft", json!({"action": "membership"})).await {
         Ok(membership) if local_raft_membership_ready(&membership, local_id) => {
             res.render(Json(json!({"ready": true, "nodeId": local_id})))

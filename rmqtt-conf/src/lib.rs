@@ -46,6 +46,8 @@ pub struct Inner {
     pub plugins: Plugins,
     #[serde(default)]
     pub mqtt: Mqtt,
+    #[serde(default)]
+    pub shutdown: Shutdown,
     #[serde(default, skip)]
     pub opts: Options,
 }
@@ -75,6 +77,15 @@ impl Settings {
         }
 
         let mut inner: Inner = builder.build()?.try_deserialize()?;
+
+        if inner.shutdown.enabled {
+            if inner.shutdown.timeout.is_zero() {
+                return Err(anyhow!("shutdown.timeout must be greater than zero"));
+            }
+            if inner.shutdown.finalize_reserve >= inner.shutdown.timeout {
+                return Err(anyhow!("shutdown.finalize_reserve must be smaller than shutdown.timeout"));
+            }
+        }
 
         inner.listeners.init();
         if inner.listeners.tcps.is_empty() && inner.listeners.tlss.is_empty() {
@@ -121,6 +132,7 @@ impl Settings {
         log::info!("exec_queue_max is {}", cfg.task.exec_queue_max);
         log::info!("node.busy config is: {:?}", cfg.node.busy);
         log::info!("node.rpc config is: {:?}", cfg.rpc);
+        log::info!("shutdown config is: {:?}", cfg.shutdown);
 
         if cfg.opts.node_grpc_addrs.is_some() {
             log::info!("node_grpc_addrs is {:?}", cfg.opts.node_grpc_addrs);
@@ -132,6 +144,36 @@ impl Settings {
             log::info!("raft_leader_id is {:?}", cfg.opts.raft_leader_id);
         }
         Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Shutdown {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "Shutdown::timeout_default", deserialize_with = "deserialize_duration")]
+    pub timeout: Duration,
+    #[serde(default = "Shutdown::finalize_reserve_default", deserialize_with = "deserialize_duration")]
+    pub finalize_reserve: Duration,
+}
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            timeout: Self::timeout_default(),
+            finalize_reserve: Self::finalize_reserve_default(),
+        }
+    }
+}
+
+impl Shutdown {
+    fn timeout_default() -> Duration {
+        Duration::from_secs(100)
+    }
+
+    fn finalize_reserve_default() -> Duration {
+        Duration::from_secs(10)
     }
 }
 

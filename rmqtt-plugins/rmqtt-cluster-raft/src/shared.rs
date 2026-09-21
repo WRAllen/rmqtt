@@ -90,7 +90,10 @@ impl Entry for ClusterLockEntry {
     #[inline]
     async fn try_lock(&self) -> Result<Box<dyn Entry>> {
         let transition = self.cluster_shared.session_transitions.begin(self.id().client_id.clone());
-        if self.cluster_shared.is_draining() || self.cluster_shared.local_handoff_prepared() {
+        if self.scx.shutdown.is_terminating()
+            || self.cluster_shared.is_draining()
+            || self.cluster_shared.local_handoff_prepared()
+        {
             return Err(anyhow!(
                 "node {} is preparing to drain and is not accepting new MQTT sessions",
                 self.scx.node.id()
@@ -680,6 +683,9 @@ impl ClusterShared {
         &self,
         mut handoff: SessionHandoff,
     ) -> Result<SessionHandoffReply> {
+        if self.scx.shutdown.is_terminating() {
+            return Err(anyhow!("node is terminating and cannot accept a session handoff"));
+        }
         let source_id = handoff.offline.id.clone();
         let _transition = self.session_transitions.begin(source_id.client_id.clone());
         let destination_id = source_id.relocated_to(self.scx.node.id());
@@ -995,6 +1001,11 @@ impl ClusterShared {
     #[inline]
     pub(crate) fn handoff_active_for_node(&self, node_id: NodeId) -> usize {
         self.handoff.active_for_node(node_id)
+    }
+
+    #[inline]
+    pub(crate) fn handoff_completed_for_node(&self, node_id: NodeId) -> usize {
+        self.handoff.completed_for_node(node_id)
     }
 
     #[inline]
@@ -1862,6 +1873,66 @@ impl Shared for ClusterShared {
 mod drain_takeover_tests {
     use super::{drain_target_allowed, effective_source_session_policy};
     use ahash::HashSet;
+
+    #[tokio::test]
+    async fn completed_delivery_still_acknowledged_during_shutdown_and_drain() {
+        use super::{From, Id, Publish, ReliableForward, ReliableForwardStatus, ServerContext};
+
+        // No network listeners or Raft runtime are needed to exercise the
+        // receiver's deduplication path after the original delivery completed.
+        let scx = ServerContext::new()
+            .node_id(1)
+            .busy_check_enable(false)
+            .shutdown(true, std::time::Duration::from_secs(100), std::time::Duration::from_secs(10))
+            .plugins_config_map_add(
+                "rmqtt-cluster-raft",
+                "node_grpc_addrs = []\nraft_peer_addrs = []\ntask_exec_queue_workers = 1",
+            )
+            .build()
+            .await;
+        let plugin = crate::ClusterPlugin::new(scx.clone(), "rmqtt-cluster-raft").await.unwrap();
+        let delivery_id = plugin.shared.handoff.next_delivery_id(2);
+        plugin.shared.handoff.mark_completed(delivery_id);
+        let forward = ReliableForward {
+            delivery_id,
+            target_client_id: "shutdown-subscriber".into(),
+            from: From::from_custom(Id::from(2, "publisher".into())),
+            publish: Publish::from(rmqtt::types::CodecPublish {
+                dup: false,
+                retain: false,
+                qos: rmqtt::types::QoS::AtLeastOnce,
+                topic: "test/shutdown".into(),
+                packet_id: None,
+                payload: bytes::Bytes::from_static(b"already-delivered"),
+                properties: None,
+            }),
+            relations: Vec::new(),
+        };
+
+        for phase in ["running", "terminating", "prepared", "draining"] {
+            match phase {
+                "terminating" => {
+                    assert!(scx.shutdown.request("regression-test"));
+                }
+                "prepared" => {
+                    plugin.shared.handoff.prepare_drain(1);
+                }
+                "draining" => {
+                    plugin.shared.activate_drain(1);
+                    plugin.draining.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            let replies = plugin.shared.accept_reliable_forward_batch(vec![forward.clone()]).await;
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].delivery_id, delivery_id);
+            assert_eq!(
+                replies[0].status,
+                ReliableForwardStatus::Duplicate,
+                "lost ACK retries must remain acknowledged while {phase}"
+            );
+        }
+    }
 
     #[test]
     fn planned_drain_preserves_state_and_routes_for_client_reconnects() {

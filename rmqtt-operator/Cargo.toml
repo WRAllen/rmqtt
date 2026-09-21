@@ -12,6 +12,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+futures.workspace = true
 log.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }

@@ -45,6 +45,20 @@ spec:
                       type: integer
                       minimum: 10
                       default: 60
+                gracefulShutdown:
+                  type: object
+                  properties:
+                    enabled:
+                      type: boolean
+                      default: false
+                    timeoutSeconds:
+                      type: integer
+                      minimum: 1
+                      default: 100
+                    finalizeReserveSeconds:
+                      type: integer
+                      minimum: 0
+                      default: 10
                 service:
                   type: object
                   properties:
@@ -141,7 +155,6 @@ spec:
                     terminationGracePeriodSeconds:
                       type: integer
                       minimum: 0
-                      default: 30
                 monitoring:
                   type: object
                   properties:
