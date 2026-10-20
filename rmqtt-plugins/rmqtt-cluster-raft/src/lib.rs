@@ -36,11 +36,14 @@ use shared::ClusterShared;
 mod config;
 mod handler;
 mod handoff;
+mod handoff_diagnostics;
 mod message;
 mod nodes;
 mod raft_admin;
 mod router;
 mod shared;
+mod shared_handoff_scheduler;
+mod shared_recovery;
 
 #[cfg(test)]
 mod reconcile_integration_tests;

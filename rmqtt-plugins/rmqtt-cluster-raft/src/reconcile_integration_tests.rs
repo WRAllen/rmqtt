@@ -393,3 +393,589 @@ raft.proposal_batch_timeout = "10ms"
         plugin.raft_mailbox().await.shutdown().await.unwrap();
     }
 }
+
+async fn connect_receive_max(
+    addr: SocketAddr,
+    client_id: &str,
+    clean_start: bool,
+    receive_max: u16,
+) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut body = utf8("MQTT");
+    // MQTT 5 Clean Start, Session Expiry Interval and Receive Maximum.
+    body.extend([5, if clean_start { 2 } else { 0 }, 0, 30, 8, 0x11]);
+    body.extend(300u32.to_be_bytes());
+    body.push(0x21);
+    body.extend(receive_max.to_be_bytes());
+    body.extend(utf8(client_id));
+    send(&mut stream, 0x10, &body).await;
+    let (header, ack) = frame(&mut stream).await;
+    assert_eq!(header, 0x20, "expected CONNACK: {ack:?}");
+    assert_eq!(ack[1], 0, "MQTT connection rejected: {ack:?}");
+    stream
+}
+
+async fn receive_qos2_without_ack(stream: &mut TcpStream, expected: &str) -> [u8; 2] {
+    let (header, body) = frame(stream).await;
+    assert_eq!(header >> 4, 3, "expected PUBLISH: {body:?}");
+    assert_eq!((header >> 1) & 3, 2, "expected QoS 2 PUBLISH");
+    let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    let mut cursor = 2 + topic_len;
+    let packet_id = [body[cursor], body[cursor + 1]];
+    cursor += 2;
+    let mut property_len = 0;
+    let mut shift = 0;
+    loop {
+        let byte = body[cursor];
+        cursor += 1;
+        property_len |= ((byte & 127) as usize) << shift;
+        if byte < 128 {
+            break;
+        }
+        shift += 7;
+    }
+    cursor += property_len;
+    assert_eq!(&body[cursor..], expected.as_bytes());
+    packet_id
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts three real Raft/gRPC/MQTT nodes on loopback"]
+async fn reciprocal_shared_recovery_does_not_block_receiver_fifo() {
+    // Bound the entire fixture, including chooser barriers and shutdown. The
+    // broken implementation must fail rather than leave a blocked test worker.
+    timeout(Duration::from_secs(90), async {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        use rmqtt::router::Router as _;
+        use rmqtt::types::{CodecPublish, IsOnline, QoS, SubscriptionIdentifier};
+        use tokio::sync::Semaphore;
+
+        struct GateFirstRecovery {
+            entered: Arc<AtomicUsize>,
+            release: Arc<Semaphore>,
+            first: AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl rmqtt::subscribe::SharedSubscription for GateFirstRecovery {
+            async fn choice(
+                &self,
+                _scx: &ServerContext,
+                candidates: &[(
+                    NodeId,
+                    ClientId,
+                    SubscriptionOptions,
+                    Option<Vec<SubscriptionIdentifier>>,
+                    Option<IsOnline>,
+                )],
+            ) -> Option<(usize, IsOnline)> {
+                if self.first.swap(false, Ordering::SeqCst) {
+                    self.entered.fetch_add(1, Ordering::SeqCst);
+                    self.release.acquire().await.expect("recovery gate closed").forget();
+                }
+                // The original consumer is excluded by recovery selection, so
+                // the only eligible shared member is on the opposite broker.
+                assert_eq!(candidates.len(), 1);
+                Some((0, candidates[0].4.unwrap_or(true)))
+            }
+        }
+
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let grpc = [free_addr(), free_addr(), free_addr()];
+        let raft = [free_addr(), free_addr(), free_addr()];
+        let mqtt = [free_addr(), free_addr(), free_addr()];
+        let mut plugins = Vec::new();
+        for index in 0..3 {
+            let grpc_list =
+                (0..=index).map(|i| format!("\"{}@{}\"", i + 1, grpc[i])).collect::<Vec<_>>().join(",");
+            let raft_list =
+                (0..=index).map(|i| format!("\"{}@{}\"", i + 1, raft[i])).collect::<Vec<_>>().join(",");
+            let config = format!(
+                r#"
+node_grpc_addrs = [{grpc_list}]
+raft_peer_addrs = [{raft_list}]
+leader_id = 1
+bootstrap = {}
+worker_threads = 2
+node_grpc_client_timeout = "5s"
+task_exec_queue_workers = 16
+handoff.retry_interval = "20ms"
+handoff.retry_max_interval = "100ms"
+raft.grpc_timeout = "2s"
+raft.proposal_batch_timeout = "10ms"
+"#,
+                index == 0
+            );
+            let scx = ServerContext::new()
+                .node_id((index + 1) as u64)
+                .busy_check_enable(false)
+                .plugins_config_map_add("rmqtt-cluster-raft", config)
+                .build()
+                .await;
+            scx.node.start_grpc_server(scx.clone(), grpc[index], false, false);
+            let mut plugin = ClusterPlugin::new(scx.clone(), "rmqtt-cluster-raft").await.unwrap();
+            plugin.init().await.unwrap();
+            plugin.start().await.unwrap();
+            *scx.extends.shared_subscription_mut().await = Box::new(GateFirstRecovery {
+                entered: entered.clone(),
+                release: release.clone(),
+                first: AtomicBool::new(true),
+            });
+            let listener = Builder::new()
+                .name("shared-recovery-cycle/tcp")
+                .laddr(mqtt[index])
+                .allow_anonymous(true)
+                .shared_subscription(true)
+                .max_qos_allowed(QoS::ExactlyOnce)
+                .message_retry_interval(Duration::from_secs(60))
+                .bind()
+                .unwrap()
+                .tcp()
+                .unwrap();
+            MqttServer::new(scx).listener_by_id(listener, 1883).build().start();
+            plugins.push(plugin);
+        }
+        until("reciprocal recovery business peers replicated", || {
+            plugins.iter().all(|plugin| plugin.nodes.snapshot_nodes().len() == 3)
+        })
+        .await;
+        sleep(Duration::from_millis(500)).await;
+
+        const TOPIC: &str = "test/shared-recovery-cycle";
+        const SHARED: &str = "$share/workers/test/shared-recovery-cycle";
+        const CLIENT_A: &str = "cycle-consumer-a";
+        const CLIENT_B: &str = "cycle-consumer-b";
+        let mut consumer_a = connect(mqtt[1], CLIENT_A, true).await;
+        let mut consumer_b = connect(mqtt[2], CLIENT_B, true).await;
+        for consumer in [&mut consumer_a, &mut consumer_b] {
+            let mut body = vec![0, 1, 0];
+            body.extend(utf8(SHARED));
+            body.push(1);
+            send(consumer, 0x82, &body).await;
+            let (header, ack) = frame(consumer).await;
+            assert_eq!(header, 0x90);
+            assert_eq!(ack.last(), Some(&1));
+        }
+        until("reciprocal recovery routes and owners replicated", || {
+            plugins.iter().all(|plugin| {
+                plugin.router.relations().get(TOPIC).is_some_and(|routes| {
+                    routes.len() == 2
+                        && plugin.router.get_ready_target_node_id(CLIENT_A) == Some(2)
+                        && plugin.router.get_ready_target_node_id(CLIENT_B) == Some(3)
+                })
+            })
+        })
+        .await;
+
+        let from = From::from_custom(Id::from(1, "cycle-publisher".into()));
+        let make_publish = |payload: &'static str| {
+            Publish::from(CodecPublish {
+                dup: false,
+                retain: false,
+                qos: QoS::ExactlyOnce,
+                topic: TOPIC.into(),
+                packet_id: None,
+                payload: bytes::Bytes::from_static(payload.as_bytes()),
+                properties: None,
+            })
+        };
+        let make_relation = |index: usize, client: &str, stale: bool| {
+            let mut opts =
+                plugins[index].router.relations().get(TOPIC).unwrap().get(client).unwrap().1.clone();
+            if stale {
+                // A live subscriber changed its QoS after this accepted
+                // obligation captured its relation. Both original heads must
+                // therefore select the other consumer while remaining owed.
+                opts.set_qos(QoS::ExactlyOnce);
+            }
+            (
+                TOPIC.into(),
+                ClientId::from(client.to_owned()),
+                opts,
+                None,
+                Some(("workers".into(), true, vec![CLIENT_A.into(), CLIENT_B.into()])),
+            )
+        };
+        let recoveries =
+            [(1, CLIENT_A, "recovery-from-a", 2, 1001), (2, CLIENT_B, "recovery-from-b", 3, 1002)].map(
+                |(index, client, payload, origin_node_id, sequence)| {
+                    (
+                        index,
+                        message::DeliveryId { origin_node_id, boot_id: 0xba22_1e22, sequence },
+                        ClientId::from(client),
+                        make_publish(payload),
+                        vec![make_relation(index, client, true)],
+                    )
+                },
+            );
+        for (index, delivery_id, client, publish, relations) in &recoveries {
+            assert!(matches!(
+                plugins[*index]
+                    .shared
+                    .accept_reliable_forward(
+                        *delivery_id,
+                        client.clone(),
+                        from.clone(),
+                        publish.clone(),
+                        relations.clone(),
+                    )
+                    .await,
+                message::ReliableForwardStatus::Accepted
+            ));
+        }
+        until("both reciprocal queue heads reached consumer reselection", || {
+            entered.load(Ordering::SeqCst) == 2
+        })
+        .await;
+
+        // These ordinary local-target obligations share each receiver's FIFO.
+        // They must remain ordered even while its independent recovery head
+        // waits for a remote Accepted reply. Both recovery heads are held by
+        // the gate until these local prefixes have been enqueued.
+        for (index, client, payload, sequence) in [
+            (1, CLIENT_A, "local-a-first", 1),
+            (1, CLIENT_A, "local-a-second", 2),
+            (2, CLIENT_B, "local-b-first", 3),
+            (2, CLIENT_B, "local-b-second", 4),
+        ] {
+            assert!(matches!(
+                plugins[index]
+                    .shared
+                    .accept_reliable_forward(
+                        message::DeliveryId { origin_node_id: 1, boot_id: 0xfa17_0001, sequence },
+                        client.into(),
+                        from.clone(),
+                        make_publish(payload),
+                        vec![make_relation(index, client, false)],
+                    )
+                    .await,
+                message::ReliableForwardStatus::Accepted
+            ));
+        }
+        release.add_permits(2);
+
+        let ((), ()) = tokio::join!(
+            async {
+                receive(&mut consumer_a, "local-a-first").await;
+                receive(&mut consumer_a, "local-a-second").await;
+                receive(&mut consumer_a, "recovery-from-b").await;
+            },
+            async {
+                receive(&mut consumer_b, "local-b-first").await;
+                receive(&mut consumer_b, "local-b-second").await;
+                receive(&mut consumer_b, "recovery-from-a").await;
+            },
+        );
+        until("reciprocal shared obligations and MQTT inflights all completed", || {
+            plugins.iter().all(|plugin| {
+                let stats = plugin.shared.handoff_stats();
+                stats.pending_messages == 0
+                    && stats.pending_bytes == 0
+                    && plugin.scx.stats.out_inflights.count() == 0
+            })
+        })
+        .await;
+        for (index, delivery_id, client, publish, relations) in recoveries {
+            assert!(matches!(
+                plugins[index]
+                    .shared
+                    .accept_reliable_forward(delivery_id, client, from.clone(), publish, relations)
+                    .await,
+                message::ReliableForwardStatus::Duplicate
+            ));
+        }
+        for (name, consumer) in [("A", &mut consumer_a), ("B", &mut consumer_b)] {
+            assert!(
+                timeout(Duration::from_millis(300), consumer.read_u8()).await.is_err(),
+                "unexpected duplicate delivery to reciprocal consumer {name}"
+            );
+        }
+        assert!(plugins.iter().all(|plugin| !plugin.shared.handoff_data_loss_detected()));
+        eprintln!("reciprocal shared recovery completed once per consumer; local receiver FIFO retained");
+        drop((consumer_a, consumer_b));
+        for plugin in &plugins {
+            plugin.raft_mailbox().await.shutdown().await.unwrap();
+        }
+    })
+    .await
+    .expect("reciprocal shared recovery fixture exceeded 90 seconds");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts three loopback nodes"]
+async fn shared_subscription_retirement_recovers_queued_delivery() {
+    use rmqtt::router::Router as _;
+    use rmqtt::types::{IsOnline, QoS, SubscriptionIdentifier};
+
+    struct PreferRetiringConsumer;
+    #[async_trait::async_trait]
+    impl rmqtt::subscribe::SharedSubscription for PreferRetiringConsumer {
+        async fn choice(
+            &self,
+            _scx: &ServerContext,
+            candidates: &[(
+                NodeId,
+                ClientId,
+                SubscriptionOptions,
+                Option<Vec<SubscriptionIdentifier>>,
+                Option<IsOnline>,
+            )],
+        ) -> Option<(usize, IsOnline)> {
+            let index = candidates
+                .iter()
+                .position(|(_, client, _, _, _)| client == "retiring-consumer")
+                .or_else(|| (!candidates.is_empty()).then_some(0))?;
+            Some((index, candidates[index].4.unwrap_or(true)))
+        }
+    }
+
+    let grpc = [free_addr(), free_addr(), free_addr()];
+    let raft = [free_addr(), free_addr(), free_addr()];
+    let mqtt = [free_addr(), free_addr(), free_addr()];
+    let mut plugins = Vec::new();
+    for index in 0..3 {
+        let grpc_list =
+            (0..=index).map(|i| format!("\"{}@{}\"", i + 1, grpc[i])).collect::<Vec<_>>().join(",");
+        let raft_list =
+            (0..=index).map(|i| format!("\"{}@{}\"", i + 1, raft[i])).collect::<Vec<_>>().join(",");
+        let config = format!(
+            r#"
+node_grpc_addrs = [{grpc_list}]
+raft_peer_addrs = [{raft_list}]
+leader_id = 1
+bootstrap = {}
+worker_threads = 2
+node_grpc_client_timeout = "5s"
+task_exec_queue_workers = 16
+handoff.retry_interval = "20ms"
+handoff.retry_max_interval = "100ms"
+raft.grpc_timeout = "2s"
+raft.proposal_batch_timeout = "10ms"
+"#,
+            index == 0
+        );
+        let scx = ServerContext::new()
+            .node_id((index + 1) as u64)
+            .busy_check_enable(false)
+            .plugins_config_map_add("rmqtt-cluster-raft", config)
+            .build()
+            .await;
+        scx.node.start_grpc_server(scx.clone(), grpc[index], false, false);
+        let mut plugin = ClusterPlugin::new(scx.clone(), "rmqtt-cluster-raft").await.unwrap();
+        plugin.init().await.unwrap();
+        plugin.start().await.unwrap();
+        *scx.extends.shared_subscription_mut().await = Box::new(PreferRetiringConsumer);
+        let listener = Builder::new()
+            .name("shared-recovery/tcp")
+            .laddr(mqtt[index])
+            .allow_anonymous(true)
+            .shared_subscription(true)
+            .max_qos_allowed(QoS::ExactlyOnce)
+            // Keep the intentionally unacknowledged first PUBLISH quiet while
+            // checking that only the unsent second message changes consumer.
+            .message_retry_interval(Duration::from_secs(60))
+            .bind()
+            .unwrap()
+            .tcp()
+            .unwrap();
+        MqttServer::new(scx).listener_by_id(listener, 1883).build().start();
+        plugins.push(plugin);
+    }
+    until("shared recovery business peers replicated", || {
+        plugins.iter().all(|plugin| plugin.nodes.snapshot_nodes().len() == 3)
+    })
+    .await;
+    sleep(Duration::from_millis(500)).await;
+
+    const TOPIC: &str = "test/shared-retirement";
+    const SHARED: &str = "$share/workers/test/shared-retirement";
+    let mut publisher = connect(mqtt[0], "shared-recovery-publisher", true).await;
+    let mut retiring = connect_receive_max(mqtt[1], "retiring-consumer", true, 1).await;
+    let mut replacement = connect(mqtt[2], "replacement-consumer", true).await;
+    let mut ordinary = connect(mqtt[2], "ordinary-consumer", true).await;
+    let mut other_group = connect(mqtt[2], "other-group-consumer", true).await;
+    subscribe(&mut retiring, SHARED).await;
+    subscribe(&mut replacement, SHARED).await;
+    subscribe(&mut ordinary, TOPIC).await;
+    subscribe(&mut other_group, "$share/other-workers/test/shared-retirement").await;
+    until("shared subscribers and owners replicated", || {
+        plugins.iter().all(|plugin| {
+            plugin.router.relations().get(TOPIC).is_some_and(|routes| {
+                routes.len() == 4
+                    && [
+                        "retiring-consumer",
+                        "replacement-consumer",
+                        "ordinary-consumer",
+                        "other-group-consumer",
+                    ]
+                    .iter()
+                    .all(|client| plugin.router.get_ready_target_node_id(client).is_some())
+            })
+        })
+    })
+    .await;
+
+    publish(&mut publisher, TOPIC, "already-started", 1, 2).await;
+    let first_packet_id = receive_qos2_without_ack(&mut retiring, "already-started").await;
+    receive(&mut ordinary, "already-started").await;
+    receive(&mut other_group, "already-started").await;
+
+    publish(&mut publisher, TOPIC, "queued-before-maintenance", 2, 2).await;
+    receive(&mut ordinary, "queued-before-maintenance").await;
+    receive(&mut other_group, "queued-before-maintenance").await;
+    let retiring_id = plugins[1].router.id("retiring-consumer").unwrap();
+    let session = plugins[1].shared.inner().entry(retiring_id.clone()).session().unwrap();
+    until("Receive Maximum holds second message in delivery queue", || session.deliver_queue().len() == 1)
+        .await;
+    assert_eq!(session.out_inflight().read().await.len(), 1);
+    // With credit exhausted, the actor cannot consume this queue item. Inspect
+    // and restore the same item to prove pre-maintenance context was retained.
+    let pending = session.deliver_queue().pop().unwrap();
+    assert_eq!(&pending.1.payload[..], b"queued-before-maintenance");
+    assert!(pending.1.shared_delivery_not_started());
+    let context = pending.1.shared_delivery.as_ref().expect("shared delivery context before maintenance");
+    assert_eq!(context.group, "workers");
+    assert_eq!(context.topic_filter, TOPIC);
+    assert_eq!(context.target_id, retiring_id);
+    session.deliver_queue().push(pending).unwrap();
+    assert!(plugins.iter().all(|plugin| !plugin.shared.shared_delivery_recovery_enabled()));
+
+    for plugin in &plugins {
+        plugin.shared.prepare_drain(2, Some(vec![1, 3])).await.unwrap();
+    }
+    assert!(plugins.iter().all(|plugin| plugin.shared.shared_delivery_recovery_enabled()));
+    let mut unsubscribe = vec![0, 9, 0];
+    unsubscribe.extend(utf8(SHARED));
+    send(&mut retiring, 0xa2, &unsubscribe).await;
+    let (header, ack) = frame(&mut retiring).await;
+    assert_eq!(header, 0xb0, "expected UNSUBACK while old QoS 2 remains inflight: {ack:?}");
+    assert_eq!(&ack[..2], &[0, 9]);
+    assert_eq!(ack.last(), Some(&0));
+
+    receive(&mut replacement, "queued-before-maintenance").await;
+    assert!(session.deliver_queue().is_empty());
+    assert_eq!(session.out_inflight().read().await.len(), 1);
+
+    // The first message has started QoS 2 with A and must finish there even
+    // after UNSUBSCRIBE. Only the never-sent second message was reassigned.
+    send(&mut retiring, 0x50, &first_packet_id).await;
+    let (header, release) = frame(&mut retiring).await;
+    assert_eq!(header, 0x62);
+    assert_eq!(&release[..2], &first_packet_id);
+    send(&mut retiring, 0x70, &first_packet_id).await;
+    until("all MQTT inflights acknowledged", || {
+        plugins.iter().all(|plugin| plugin.scx.stats.out_inflights.count() == 0)
+    })
+    .await;
+    for (name, stream) in [
+        ("replacement", &mut replacement),
+        ("ordinary", &mut ordinary),
+        ("other group", &mut other_group),
+        ("retiring", &mut retiring),
+    ] {
+        assert!(
+            timeout(Duration::from_millis(300), stream.read_u8()).await.is_err(),
+            "unexpected duplicate delivery to {name}"
+        );
+    }
+    eprintln!("queued shared message recovered to B; started QoS 2 completed on A; fan-out was not replayed");
+
+    // Exercise the separate pull path used by an ordinary cross-node MQTT
+    // reconnect, with no maintenance active while the snapshot is extracted.
+    for plugin in &plugins {
+        plugin.shared.clear_drain(2);
+    }
+    subscribe(&mut retiring, SHARED).await;
+    until("retiring member resubscribed on every router", || {
+        plugins.iter().all(|plugin| {
+            plugin.router.relations().get(TOPIC).is_some_and(|routes| {
+                routes
+                    .get("retiring-consumer")
+                    .is_some_and(|(_, opts)| opts.shared_group().is_some_and(|group| group == "workers"))
+            })
+        })
+    })
+    .await;
+    publish(&mut publisher, TOPIC, "pull-already-started", 3, 2).await;
+    let pull_first_packet_id = receive_qos2_without_ack(&mut retiring, "pull-already-started").await;
+    receive(&mut ordinary, "pull-already-started").await;
+    receive(&mut other_group, "pull-already-started").await;
+    publish(&mut publisher, TOPIC, "pull-queued-before-maintenance", 4, 2).await;
+    receive(&mut ordinary, "pull-queued-before-maintenance").await;
+    receive(&mut other_group, "pull-queued-before-maintenance").await;
+    until("pull fixture has an unsent shared delivery", || session.deliver_queue().len() == 1).await;
+    assert_eq!(session.out_inflight().read().await.len(), 1);
+    send(&mut retiring, 0xe0, &[]).await;
+    drop(retiring);
+    until("old retiring connection became offline", || {
+        plugins[1].router.get_ready_target_node_id("retiring-consumer").is_none()
+    })
+    .await;
+
+    let mut retiring = connect_receive_max(mqtt[0], "retiring-consumer", false, 1).await;
+    let resumed_packet_id = receive_qos2_without_ack(&mut retiring, "pull-already-started").await;
+    assert_eq!(resumed_packet_id, pull_first_packet_id, "QoS 2 retains its packet identity across pull");
+    until("pull installed new session owner", || {
+        plugins.iter().all(|plugin| plugin.router.get_ready_target_node_id("retiring-consumer") == Some(1))
+    })
+    .await;
+    let pulled_id = plugins[0].router.id("retiring-consumer").unwrap();
+    let pulled_session = plugins[0].shared.inner().entry(pulled_id.clone()).session().unwrap();
+    until("pulled shared delivery still waits for MQTT credit", || pulled_session.deliver_queue().len() == 1)
+        .await;
+    let pulled_pending = pulled_session.deliver_queue().pop().unwrap();
+    assert_eq!(&pulled_pending.1.payload[..], b"pull-queued-before-maintenance");
+    assert!(pulled_pending.1.shared_delivery_not_started());
+    let pulled_context = pulled_pending
+        .1
+        .shared_delivery
+        .as_ref()
+        .expect("KickWithShared must preserve queued delivery context");
+    assert_eq!(pulled_context.group, "workers");
+    assert_eq!(pulled_context.topic_filter, TOPIC);
+    assert_eq!(pulled_context.target_id, pulled_id, "pull context must bind to the new connection");
+    assert_ne!(pulled_context.subscription_generation, 0);
+    assert!(pulled_session.shared_delivery_context_valid(&pulled_pending.1).await);
+    pulled_session.deliver_queue().push(pulled_pending).unwrap();
+
+    for plugin in &plugins {
+        plugin.shared.prepare_drain(1, Some(vec![2, 3])).await.unwrap();
+    }
+    let mut unsubscribe = vec![0, 10, 0];
+    unsubscribe.extend(utf8(SHARED));
+    send(&mut retiring, 0xa2, &unsubscribe).await;
+    let (header, ack) = frame(&mut retiring).await;
+    assert_eq!(header, 0xb0, "expected UNSUBACK after cross-node pull: {ack:?}");
+    assert_eq!(&ack[..2], &[0, 10]);
+    assert_eq!(ack.last(), Some(&0));
+    receive(&mut replacement, "pull-queued-before-maintenance").await;
+    assert!(pulled_session.deliver_queue().is_empty());
+    assert_eq!(pulled_session.out_inflight().read().await.len(), 1);
+    send(&mut retiring, 0x50, &resumed_packet_id).await;
+    let (header, release) = frame(&mut retiring).await;
+    assert_eq!(header, 0x62);
+    assert_eq!(&release[..2], &resumed_packet_id);
+    send(&mut retiring, 0x70, &resumed_packet_id).await;
+    until("pulled MQTT inflights acknowledged", || {
+        plugins.iter().all(|plugin| plugin.scx.stats.out_inflights.count() == 0)
+    })
+    .await;
+    for (name, stream) in [
+        ("replacement after pull", &mut replacement),
+        ("ordinary after pull", &mut ordinary),
+        ("other group after pull", &mut other_group),
+        ("retiring after pull", &mut retiring),
+    ] {
+        assert!(
+            timeout(Duration::from_millis(300), stream.read_u8()).await.is_err(),
+            "unexpected duplicate delivery to {name}"
+        );
+    }
+    eprintln!("PASS: local retirement and cross-node pull preserve/recover queued shared deliveries without replaying started QoS 2 or unrelated fan-out");
+    drop((publisher, retiring, replacement, ordinary, other_group));
+    for plugin in &plugins {
+        plugin.raft_mailbox().await.shutdown().await.unwrap();
+    }
+}

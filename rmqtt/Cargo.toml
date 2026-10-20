@@ -74,3 +74,6 @@ parking_lot.workspace = true
 [build-dependencies]
 chrono = { workspace = true, features = ["clock"] }
 rustc_version = "0.4"
+
+[dev-dependencies]
+tokio-util.workspace = true

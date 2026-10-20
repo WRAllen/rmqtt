@@ -146,7 +146,22 @@ impl Handler for HookHandler {
                         }
                         return (false, Some(HookResult::GrpcMessageReply(Ok(MessageReply::Success))));
                     }
-                    GrpcMessage::Kick(id, clean_start, clear_subscriptions, is_admin) => {
+                    GrpcMessage::Kick(id, clean_start, clear_subscriptions, is_admin)
+                    | GrpcMessage::KickWithShared(id, clean_start, clear_subscriptions, is_admin) => {
+                        let with_shared = matches!(msg, GrpcMessage::KickWithShared(..));
+                        if !with_shared && !*is_admin {
+                            // Checking today's queue is insufficient: an older
+                            // route can still enqueue another shared delivery
+                            // before Kick freezes the actor. Reject before any
+                            // lock, extraction or disconnect instead of losing
+                            // ownership metadata through a legacy snapshot.
+                            return (
+                                false,
+                                Some(HookResult::GrpcMessageReply(Ok(MessageReply::Error(
+                                    "legacy non-admin Kick is unsupported by this source; the destination must negotiate shared-delivery session context".to_string(),
+                                )))),
+                            );
+                        }
                         let _transition = self.shared.begin_session_transition(id.client_id.clone());
                         let mut entry = match self.shared.lock_session_for_takeover(id.clone()).await {
                             Ok(entry) => entry,
@@ -171,7 +186,13 @@ impl Handler for HookHandler {
                                 self.shared.complete_pull_session_handoff(&id.client_id);
                                 return (
                                     false,
-                                    Some(HookResult::GrpcMessageReply(Ok(MessageReply::Kick(cached)))),
+                                    Some(HookResult::GrpcMessageReply(Ok(if with_shared {
+                                        MessageReply::KickWithShared(
+                                            rmqtt::grpc::SharedOfflineSession::from_session(cached),
+                                        )
+                                    } else {
+                                        MessageReply::Kick(cached)
+                                    }))),
                                 );
                             }
                         }
@@ -210,7 +231,13 @@ impl Handler for HookHandler {
                                             self.shared.complete_relocated_takeover(source_id);
                                         }
                                     }
-                                    HookResult::GrpcMessageReply(Ok(MessageReply::Kick(o)))
+                                    HookResult::GrpcMessageReply(Ok(if with_shared {
+                                        MessageReply::KickWithShared(
+                                            rmqtt::grpc::SharedOfflineSession::from_session(o),
+                                        )
+                                    } else {
+                                        MessageReply::Kick(o)
+                                    }))
                                 }
                                 Err(e) => HookResult::GrpcMessageReply(Err(e)),
                             };
@@ -276,6 +303,25 @@ impl Handler for HookHandler {
                                     }
                                 }
                             }
+                            Ok(RaftGrpcMessage::GetForwardingCapabilities) => {
+                                let result =
+                                    RaftGrpcMessageReply::GetForwardingCapabilities { version: 1 }.encode();
+                                HookResult::GrpcMessageReply(Ok(match result {
+                                    Ok(data) => MessageReply::Data(data),
+                                    Err(error) => MessageReply::Error(error.to_string()),
+                                }))
+                            }
+                            Ok(RaftGrpcMessage::SessionHandoffWithShared(snapshot)) => {
+                                let result = match snapshot.restore() {
+                                    Ok(handoff) => self.shared.accept_session_handoff(handoff).await,
+                                    Err(error) => Err(error),
+                                }
+                                .and_then(|reply| RaftGrpcMessageReply::SessionHandoff(reply).encode());
+                                HookResult::GrpcMessageReply(Ok(match result {
+                                    Ok(data) => MessageReply::Data(data),
+                                    Err(error) => MessageReply::Error(error.to_string()),
+                                }))
+                            }
                             Ok(RaftGrpcMessage::ProbeHandoffSession { client_id }) => {
                                 let result =
                                     self.shared.probe_handoff_session(&client_id).await.and_then(|busy| {
@@ -321,5 +367,84 @@ impl Handler for HookHandler {
             }
         }
         (true, acc)
+    }
+}
+
+#[cfg(test)]
+mod shared_pull_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn legacy_pull_is_rejected_before_locking_and_versioned_pull_is_supported() {
+        let scx = ServerContext::new()
+            .node_id(1)
+            .busy_check_enable(false)
+            .plugins_config_map_add(
+                "rmqtt-cluster-raft",
+                "node_grpc_addrs = []\nraft_peer_addrs = []\ntask_exec_queue_workers = 1",
+            )
+            .build()
+            .await;
+        let plugin = crate::ClusterPlugin::new(scx.clone(), "rmqtt-cluster-raft").await.unwrap();
+        let handler = HookHandler::new(
+            scx,
+            plugin.cfg.clone(),
+            plugin.backoff_strategy.clone(),
+            plugin.shared.clone(),
+            plugin.router.clone(),
+        );
+        let id = Id::from(1, "legacy-pull-worker".into());
+        let locked = plugin.shared.inner().entry(id.clone()).try_lock().await.unwrap();
+        let (_, result) = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            handler.hook(
+                &Parameter::GrpcMessageReceived(
+                    plugin.shared.message_type,
+                    GrpcMessage::Kick(id.clone(), false, true, false),
+                ),
+                None,
+            ),
+        )
+        .await
+        .expect("legacy pull must be rejected before waiting for a session lock");
+        match result {
+            Some(HookResult::GrpcMessageReply(Ok(MessageReply::Error(reason)))) => {
+                assert!(reason.contains("destination must negotiate"));
+            }
+            _ => panic!("expected explicit legacy pull incompatibility"),
+        }
+        drop(locked);
+
+        let (_, result) = handler
+            .hook(
+                &Parameter::GrpcMessageReceived(
+                    plugin.shared.message_type,
+                    GrpcMessage::KickWithShared(id.clone(), false, true, false),
+                ),
+                None,
+            )
+            .await;
+        match result {
+            Some(HookResult::GrpcMessageReply(Ok(MessageReply::KickWithShared(snapshot)))) => {
+                assert!(matches!(snapshot.restore().unwrap(), rmqtt::types::OfflineSession::NotExist));
+            }
+            _ => panic!("expected versioned pull reply"),
+        }
+
+        let (_, result) = handler
+            .hook(
+                &Parameter::GrpcMessageReceived(
+                    plugin.shared.message_type,
+                    GrpcMessage::Kick(id, false, true, true),
+                ),
+                None,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Some(HookResult::GrpcMessageReply(Ok(MessageReply::Kick(
+                rmqtt::types::OfflineSession::NotExist
+            ))))
+        ));
     }
 }

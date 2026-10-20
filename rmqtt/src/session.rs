@@ -180,6 +180,135 @@ impl SessionState {
         &self.tx
     }
 
+    async fn shared_delivery_is_stale(&self, publish: &Publish) -> bool {
+        if !publish.shared_delivery_not_started()
+            || !self.scx.extends.shared().await.shared_delivery_recovery_enabled()
+        {
+            return false;
+        }
+        !self.shared_delivery_context_valid(publish).await
+    }
+
+    /// An Err from recovery returns ownership; keep this item until the
+    /// maintenance queue accepts it instead of turning queue pressure into loss.
+    async fn recover_owned_shared(
+        &self,
+        mut from: From,
+        mut publish: Publish,
+        committed_recovery: bool,
+    ) -> std::result::Result<(), (From, Publish)> {
+        if !publish.shared_delivery_not_started()
+            || (!committed_recovery && !self.scx.extends.shared().await.shared_delivery_recovery_enabled())
+        {
+            return Err((from, publish));
+        }
+        publish.restore_shared_delivery_source();
+        let mut reported = false;
+        loop {
+            let result = self.scx.extends.shared().await.recover_shared_delivery(from, publish).await;
+            match result {
+                Ok(()) => return Ok(()),
+                Err((returned_from, returned_publish, reason)) => {
+                    from = returned_from;
+                    publish = returned_publish;
+                    if !reported {
+                        log::warn!(
+                            "{:?} retaining unsent shared delivery until recovery accepts it: {reason:?}",
+                            self.id
+                        );
+                        reported = true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    }
+
+    async fn recover_shared_or_drop(
+        &self,
+        from: From,
+        publish: Publish,
+        reason: Reason,
+        committed_recovery: bool,
+    ) {
+        if let Err((from, publish)) = self.recover_owned_shared(from, publish, committed_recovery).await {
+            self.scx.extends.hook_mgr().message_dropped(Some(self.id.clone()), from, publish, reason).await;
+        }
+    }
+
+    async fn queue_owned_forward(&self, from: From, publish: Publish, deliver_queue_tx: &MessageSender) {
+        if self.shared_delivery_is_stale(&publish).await {
+            self.recover_shared_or_drop(
+                from,
+                publish,
+                Reason::from_static("shared subscription was withdrawn"),
+                true,
+            )
+            .await;
+        } else if let Err((from, publish)) = deliver_queue_tx.send((from, publish)).await {
+            self.recover_shared_or_drop(from, publish, Reason::MessageQueueFull, false).await;
+        }
+    }
+
+    /// Close the old mailbox before acknowledging takeover. All messages
+    /// accepted before the close are moved into the snapshot or recovery queue.
+    async fn freeze_mailbox(&mut self, deliver_queue_tx: &MessageSender, recover_all: bool) {
+        self.rx.close();
+        while let Some(message) = self.rx.next().await {
+            #[cfg(feature = "debug")]
+            self.scx.stats.debug_session_channels.dec();
+            match message {
+                Message::Forward(from, publish) => {
+                    if recover_all && publish.shared_delivery_not_started() {
+                        self.recover_shared_or_drop(
+                            from,
+                            publish,
+                            Reason::from_static("session terminated before delivery"),
+                            false,
+                        )
+                        .await;
+                    } else {
+                        self.queue_owned_forward(from, publish, deliver_queue_tx).await;
+                    }
+                }
+                Message::SendRerelease(mut inflight) => {
+                    // The timer removed this QoS2 item before queueing its
+                    // PUBREL retry. Preserve its protocol phase in the frozen
+                    // snapshot; it must never become a new shared assignment.
+                    inflight.publish.shared_delivery = None;
+                    self.out_inflight().write().await.push_back(inflight);
+                }
+                _ => {}
+            }
+        }
+        self.recover_queued_shared(recover_all).await;
+    }
+
+    async fn recover_queued_shared(&self, recover_all: bool) {
+        // Older queue entries can predate UNSUBSCRIBE. Validate them before
+        // snapshot installation can rebind their connection identity.
+        let mut retained = Vec::new();
+        while let Some((from, publish)) = self.deliver_queue().pop() {
+            let committed_recovery = self.shared_delivery_is_stale(&publish).await;
+            if (recover_all && publish.shared_delivery_not_started()) || committed_recovery {
+                self.recover_shared_or_drop(
+                    from,
+                    publish,
+                    Reason::from_static("shared subscription was withdrawn"),
+                    committed_recovery,
+                )
+                .await;
+            } else {
+                retained.push((from, publish));
+            }
+        }
+        for (from, publish) in retained {
+            if let Err((from, publish)) = self.deliver_queue().push((from, publish)) {
+                self.recover_shared_or_drop(from, publish, Reason::MessageQueueFull, false).await;
+            }
+        }
+    }
+
     #[inline]
     pub(crate) async fn run<Io>(mut self, mut sink: Sink<Io>, keep_alive: u16)
     where
@@ -461,15 +590,12 @@ impl SessionState {
                                 //hook, offline_message
                                 self.hook.offline_message(from.clone(), &p).await;
 
-                                if let Err((from, p)) = deliver_queue_tx.send((from, p)).await {
-                                    log::debug!("{:?} offline deliver_dropped, from: {:?}, {:?}", self.id, from, p);
-                                    //hook, message_dropped
-                                   self.scx.extends.hook_mgr().message_dropped(Some(self.id.clone()), from, p, Reason::MessageQueueFull).await;
-                                }
+                                self.queue_owned_forward(from, p, deliver_queue_tx).await;
                             },
                             Message::Kick(sender, by_id, clean_start, is_admin) => {
                                 log::debug!("{:?} offline Kicked, send kick result, to: {:?}, clean_start: {}, is_admin: {}", self.id, by_id, clean_start, is_admin);
                                 if !sender.is_closed() {
+                                    self.freeze_mailbox(deliver_queue_tx, is_admin || clean_start).await;
                                     if let Err(e) = sender.send(()) {
                                         log::warn!("{:?} offline Kick send response error, to: {:?}, clean_start: {}, is_admin: {}, {:?}", self.id, by_id, clean_start, is_admin, e);
                                     }
@@ -643,15 +769,7 @@ impl SessionState {
     {
         match msg {
             Message::Forward(from, p) => {
-                if let Err((from, p)) = deliver_queue_tx.send((from, p)).await {
-                    log::debug!("{:?} deliver_dropped, from: {:?}, {:?}", self.id, from, p);
-                    //hook, message_dropped
-                    self.scx
-                        .extends
-                        .hook_mgr()
-                        .message_dropped(Some(self.id.clone()), from, p, Reason::MessageQueueFull)
-                        .await;
-                }
+                self.queue_owned_forward(from, p, deliver_queue_tx).await;
             }
             Message::SendRerelease(iflt_msg) => {
                 self.send_rerelease(sink, iflt_msg).await?;
@@ -665,6 +783,7 @@ impl SessionState {
                     is_admin
                 );
                 if !sender.is_closed() {
+                    self.freeze_mailbox(deliver_queue_tx, is_admin || clean_start).await;
                     if sender.send(()).is_err() {
                         log::warn!("{:?} Message::Kick, send response error, sender is closed", self.id);
                     }
@@ -1314,6 +1433,11 @@ impl SessionState {
             //hook, session_unsubscribed
             self.hook.session_unsubscribed(unsub).await;
         }
+        if self.scx.extends.shared().await.shared_delivery_recovery_enabled() {
+            // Do not wait for MQTT inflight credit: a retiring consumer may
+            // never acknowledge its existing inflight packets.
+            self.recover_queued_shared(false).await;
+        }
         Ok(())
     }
 
@@ -1525,8 +1649,27 @@ impl SessionState {
             }
         }
 
+        // A frozen snapshot preserves validity in the old connection epoch.
+        // Generation zero explicitly marks obligations that were already stale
+        // when snapshotted and must not be revived by a later resubscribe.
+        let source_id = offline_info.id.clone();
+        let subscriptions = self.subscriptions().await?;
         //Send offline messages
-        while let Some((from, p)) = offline_info.offline_messages.pop_front() {
+        while let Some((from, mut p)) = offline_info.offline_messages.pop_front() {
+            if p.shared_delivery_not_started() {
+                let rebind = if let Some(context) = &p.shared_delivery {
+                    if context.target_id == source_id && context.subscription_generation != 0 {
+                        subscriptions.shared_delivery_generation(&context.topic_filter, &context.group).await
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(generation) = rebind {
+                    p.rebind_shared_delivery(self.id.clone(), generation);
+                }
+            }
             self.forward(from, p).await;
         }
         Ok(())
@@ -1635,6 +1778,16 @@ impl SessionState {
     where
         Io: AsyncRead + AsyncWrite + Unpin,
     {
+        if self.shared_delivery_is_stale(&publish).await {
+            self.recover_shared_or_drop(
+                from,
+                publish,
+                Reason::from_static("shared subscription was withdrawn"),
+                true,
+            )
+            .await;
+            return Ok(());
+        }
         //hook, message_expiry_check
         let expiry_check_res = self.hook.message_expiry_check(from.clone(), &publish).await;
         if expiry_check_res.is_expiry() {
@@ -1654,9 +1807,12 @@ impl SessionState {
         }
 
         //hook, message_delivered
-        let publish = self.hook.message_delivered(from.clone(), &publish).await.unwrap_or(publish);
+        let mut publish = self.hook.message_delivered(from.clone(), &publish).await.unwrap_or(publish);
 
         //send message
+        // Crossing this boundary makes the result potentially ambiguous. The
+        // ordinary QoS inflight protocol, never shared-member reselection, owns it.
+        publish.shared_delivery = None;
         sink.publish(
             publish.clone(),
             expiry_check_res.message_expiry_interval(),
@@ -1771,18 +1927,15 @@ impl SessionState {
     }
 
     #[inline]
-    pub(crate) async fn clean(&self, deliver_queue_tx: &MessageSender, reason: Reason) {
+    pub(crate) async fn clean(&mut self, deliver_queue_tx: &MessageSender, reason: Reason) {
         log::debug!("{:?} clean, reason: {:?}", self.id, reason);
+        self.freeze_mailbox(deliver_queue_tx, true).await;
 
         //Session expired, discarding messages in deliver queue
         while let Some((from, publish)) = deliver_queue_tx.pop() {
             log::debug!("{:?} clean.dropped, from: {:?}, publish: {:?}", self.id, from, publish);
             //hook, message dropped
-            self.scx
-                .extends
-                .hook_mgr()
-                .message_dropped(Some(self.id.clone()), from, publish, reason.clone())
-                .await;
+            self.recover_shared_or_drop(from, publish, reason.clone(), false).await;
         }
 
         //Session expired, discarding messages in the flight window
@@ -2016,6 +2169,22 @@ impl fmt::Debug for Session {
 }
 
 impl Session {
+    pub async fn shared_delivery_context_valid(&self, publish: &Publish) -> bool {
+        let Some(context) = &publish.shared_delivery else {
+            return false;
+        };
+        if context.target_id != self.id || context.subscription_generation == 0 {
+            return false;
+        }
+        match self.subscriptions().await {
+            Ok(subscriptions) => {
+                subscriptions.shared_delivery_generation(&context.topic_filter, &context.group).await
+                    == Some(context.subscription_generation)
+            }
+            Err(_) => false,
+        }
+    }
+
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
@@ -2131,13 +2300,17 @@ impl Session {
     pub(crate) async fn to_offline_info(&self) -> Result<OfflineInfo> {
         let id = self.id.clone();
         let created_at = self.created_at().await?;
-        let subscriptions = self.subscriptions_drain().await?;
-
         let mut offline_messages = VecDeque::new();
-        while let Some(item) = self.deliver_queue().pop() {
+        while let Some((from, mut publish)) = self.deliver_queue().pop() {
             //@TODO ..., check message expired
-            offline_messages.push_back(item);
+            if publish.shared_delivery_not_started() && !self.shared_delivery_context_valid(&publish).await {
+                if let Some(context) = &mut publish.shared_delivery {
+                    Arc::make_mut(context).subscription_generation = 0;
+                }
+            }
+            offline_messages.push_back((from, publish));
         }
+        let subscriptions = self.subscriptions_drain().await?;
         let inflight_messages = self.out_inflight().write().await.to_inflight_messages();
 
         Ok(OfflineInfo { id, subscriptions, offline_messages, inflight_messages, created_at })
@@ -2520,5 +2693,398 @@ impl SessionLike for DefaultSession {
     async fn on_drop(&self) -> Result<()> {
         self.subscriptions.clear(&self.scx).await;
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "shared-subscription"))]
+mod shared_delivery_session_tests {
+    use super::*;
+    use crate::shared::{DefaultShared, Entry, Shared};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct RecoveryState {
+        enabled: AtomicBool,
+        refusals: AtomicUsize,
+        attempts: AtomicUsize,
+        received: parking_lot::Mutex<Vec<(From, Publish)>>,
+    }
+
+    struct RecoveryShared {
+        inner: DefaultShared,
+        state: Arc<RecoveryState>,
+    }
+
+    #[async_trait]
+    impl Shared for RecoveryShared {
+        fn shared_delivery_recovery_enabled(&self) -> bool {
+            self.state.enabled.load(Ordering::SeqCst)
+        }
+        async fn recover_shared_delivery(
+            &self,
+            from: From,
+            publish: Publish,
+        ) -> std::result::Result<(), (From, Publish, Reason)> {
+            self.state.attempts.fetch_add(1, Ordering::SeqCst);
+            if self
+                .state
+                .refusals
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| count.checked_sub(1))
+                .is_ok()
+            {
+                return Err((from, publish, Reason::from_static("test recovery queue is full")));
+            }
+            self.state.received.lock().push((from, publish));
+            Ok(())
+        }
+        fn entry(&self, id: Id) -> Box<dyn Entry> {
+            self.inner.entry(id)
+        }
+        fn exist(&self, client_id: &str) -> bool {
+            self.inner.exist(client_id)
+        }
+        async fn forwards(
+            &self,
+            from: From,
+            publish: Publish,
+        ) -> std::result::Result<SubscriptionClientIds, Vec<(To, From, Publish, Reason)>> {
+            self.inner.forwards(from, publish).await
+        }
+        async fn forwards_and_get_shareds(
+            &self,
+            from: From,
+            publish: Publish,
+        ) -> std::result::Result<(SubRelationsMap, SubscriptionClientIds), Vec<(To, From, Publish, Reason)>>
+        {
+            self.inner.forwards_and_get_shareds(from, publish).await
+        }
+        async fn forwards_to(
+            &self,
+            from: From,
+            publish: &Publish,
+            relations: SubRelations,
+        ) -> std::result::Result<(), Vec<(To, From, Publish, Reason)>> {
+            self.inner.forwards_to(from, publish, relations).await
+        }
+        fn iter(&self) -> Box<dyn Iterator<Item = Box<dyn Entry>> + Send + Sync + '_> {
+            self.inner.iter()
+        }
+        fn random_session(&self) -> Option<Session> {
+            self.inner.random_session()
+        }
+        async fn session_status(&self, client_id: &str) -> Option<SessionStatus> {
+            self.inner.session_status(client_id).await
+        }
+        async fn client_states_count(&self) -> usize {
+            self.inner.client_states_count().await
+        }
+        fn sessions_count(&self) -> usize {
+            self.inner.sessions_count()
+        }
+        async fn query_subscriptions(&self, q: &SubsSearchParams) -> Vec<SubsSearchResult> {
+            self.inner.query_subscriptions(q).await
+        }
+        async fn subscriptions_count(&self) -> usize {
+            self.inner.subscriptions_count().await
+        }
+        #[cfg(feature = "msgstore")]
+        async fn message_load(
+            &self,
+            client_id: &str,
+            topic_filter: &str,
+            group: Option<&SharedGroup>,
+        ) -> Result<Vec<(MsgID, From, Publish)>> {
+            self.inner.message_load(client_id, topic_filter, group).await
+        }
+    }
+
+    async fn recovering_state(session: Session) -> (SessionState, Arc<RecoveryState>) {
+        let hook = session.scx.extends.hook_mgr().hook(session.clone());
+        let state = SessionState::new(session.clone(), hook, 0, 0);
+        let inner = DefaultShared::new(Some(session.scx.clone()));
+        inner.entry(session.id.clone()).set(session.clone(), state.tx.clone()).await.unwrap();
+        let recovery = Arc::new(RecoveryState::default());
+        recovery.enabled.store(true, Ordering::SeqCst);
+        *session.scx.extends.shared_mut().await = Box::new(RecoveryShared { inner, state: recovery.clone() });
+        (state, recovery)
+    }
+
+    fn mqtt_sink() -> (Sink<tokio::io::DuplexStream>, tokio::io::DuplexStream) {
+        let (io, peer) = tokio::io::duplex(4096);
+        let stream = crate::net::v3::MqttStream {
+            io: tokio_util::codec::Framed::new(io, rmqtt_codec::MqttCodec::V3(Default::default())),
+            remote_addr: "127.0.0.1:1883".parse().unwrap(),
+            cfg: ListenerConfig::default(),
+            #[cfg(feature = "tls")]
+            cert_info: None,
+        };
+        (Sink::V3(stream), peer)
+    }
+
+    async fn session(node_id: NodeId) -> Session {
+        let scx = ServerContext::new().busy_check_enable(false).node_id(node_id).build().await;
+        let id = Id::from(node_id, "shared-worker".into());
+        let config = ListenerConfig::default();
+        let connect = Arc::new(ConnectInfo::from(id.clone()));
+        let fitter = scx.extends.fitter_mgr().await.create(connect.clone(), id.clone(), config.clone());
+        let max_inflight = fitter.max_inflight();
+        Session::new(
+            id,
+            scx,
+            16,
+            config,
+            fitter,
+            None,
+            max_inflight,
+            1,
+            connect,
+            false,
+            false,
+            true,
+            1,
+            SessionSubs::new(),
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn queued(session: &Session) -> (From, Publish) {
+        let opts = SubscriptionOptions::from((QoS::ExactlyOnce, Some("workers".into()), None));
+        session.subscriptions_add("work/#".into(), opts).await.unwrap();
+        let generation = session
+            .subscriptions()
+            .await
+            .unwrap()
+            .shared_delivery_generation("work/#", "workers")
+            .await
+            .unwrap();
+        let mut publish = Publish::from(CodecPublish {
+            dup: false,
+            retain: false,
+            qos: QoS::ExactlyOnce,
+            topic: "work/request".into(),
+            packet_id: None,
+            payload: bytes::Bytes::from_static(b"queued"),
+            properties: None,
+        });
+        publish.shared_delivery = Some(Arc::new(SharedDeliveryContext {
+            group: "workers".into(),
+            topic_filter: "work/#".into(),
+            source_qos: QoS::ExactlyOnce,
+            source_retain: false,
+            target_id: session.id.clone(),
+            subscription_generation: generation,
+        }));
+        (From::from_custom(Id::from(9, "publisher".into())), publish)
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_recovers_unsent_delivery_without_waiting_for_inflight_credit() {
+        let session = session(1).await;
+        let (from, publish) = queued(&session).await;
+        let (mut state, recovery) = recovering_state(session.clone()).await;
+        let (mut sink, _peer) = mqtt_sink();
+        let limiter = Limiter::new(std::num::NonZeroU32::new(10).unwrap(), Duration::from_secs(1));
+        let (queue, _receiver) = state.deliver_queue_channel(&limiter);
+        let mut flags = StateFlags::empty();
+        state
+            .process_message(&mut sink, Message::Forward(from.clone(), publish.clone()), &queue, &mut flags)
+            .await
+            .unwrap();
+        assert_eq!(queue.len(), 1);
+        {
+            let mut inflight = session.out_inflight().write().await;
+            while inflight.has_credit() {
+                let mut started = publish.clone();
+                started.shared_delivery = None;
+                started.packet_id = std::num::NonZeroU16::new(inflight.next_id().unwrap());
+                inflight.push_back(OutInflightMessage::new(MomentStatus::UnReceived, from.clone(), started));
+            }
+            assert!(!inflight.has_credit());
+        }
+        state
+            .process_mqtt_message(
+                &mut sink,
+                Packet::V3(v3::Packet::Unsubscribe {
+                    packet_id: std::num::NonZeroU16::new(7).unwrap(),
+                    topic_filters: vec!["$share/workers/work/#".into()],
+                }),
+                &mut flags,
+            )
+            .await
+            .unwrap();
+        assert!(queue.is_empty());
+        let received = recovery.received.lock();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].1.payload.as_ref(), b"queued");
+        assert_eq!(received[0].1.shared_delivery.as_ref().unwrap().group, "workers");
+        assert!(received[0].1.shared_delivery_not_started());
+        drop(received);
+        while session.out_inflight().write().await.pop_front().is_some() {}
+    }
+
+    #[tokio::test]
+    async fn sent_qos2_delivery_uses_inflight_retry_after_unsubscribe() {
+        let session = session(1).await;
+        let (from, publish) = queued(&session).await;
+        let (mut state, recovery) = recovering_state(session.clone()).await;
+        let (mut sink, _peer) = mqtt_sink();
+        state.deliver(&mut sink, from, publish).await.unwrap();
+        let inflight = session.out_inflight().write().await.pop_front().unwrap();
+        assert!(inflight.publish.shared_delivery.is_none());
+        session.subscriptions_remove("work/#").await.unwrap();
+        state.reforward(inflight).await.unwrap();
+        let Some(Message::Forward(from, retry)) = state.rx.next().await else { panic!("retry missing") };
+        assert!(retry.dup);
+        assert!(retry.packet_id.is_some());
+        state.deliver(&mut sink, from, retry).await.unwrap();
+        assert_eq!(recovery.attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn first_network_write_failure_does_not_reselect_shared_member() {
+        let session = session(1).await;
+        let (from, publish) = queued(&session).await;
+        let (state, recovery) = recovering_state(session).await;
+        let (mut sink, peer) = mqtt_sink();
+        drop(peer);
+        assert!(state.deliver(&mut sink, from, publish).await.is_err());
+        assert_eq!(recovery.attempts.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn recovery_committed_before_rollback_keeps_ownership_until_accepted() {
+        let session = session(1).await;
+        let (from, publish) = queued(&session).await;
+        let (state, recovery) = recovering_state(session.clone()).await;
+        session.subscriptions_remove("work/#").await.unwrap();
+        assert!(state.shared_delivery_is_stale(&publish).await);
+        recovery.enabled.store(false, Ordering::SeqCst);
+        recovery.refusals.store(1, Ordering::SeqCst);
+        tokio::time::timeout(Duration::from_secs(2), state.recover_owned_shared(from, publish, true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovery.attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(recovery.received.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn early_queue_policy_recovers_evicted_old_item_and_keeps_new_item() {
+        let session = session(1).await;
+        let (from, publish) = queued(&session).await;
+        let (mut state, recovery) = recovering_state(session).await;
+        let limiter = Limiter::new(std::num::NonZeroU32::new(10).unwrap(), Duration::from_secs(1));
+        let (queue, _receiver) = state.deliver_queue_channel(&limiter);
+        for index in 0..16 {
+            let mut publish = publish.clone();
+            publish.payload = bytes::Bytes::from(format!("old-{index}"));
+            state.queue_owned_forward(from.clone(), publish, &queue).await;
+        }
+        let mut newest = publish;
+        newest.payload = bytes::Bytes::from_static(b"new");
+        state.queue_owned_forward(from, newest, &queue).await;
+        let received = recovery.received.lock();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].1.payload.as_ref(), b"old-0");
+        drop(received);
+        let mut retained = Vec::new();
+        while let Some((_, publish)) = queue.pop() {
+            retained.push(publish.take_payload());
+        }
+        assert_eq!(retained.len(), 16);
+        assert_eq!(retained.last().unwrap().as_ref(), b"new");
+    }
+
+    #[tokio::test]
+    async fn mailbox_barrier_preserves_queued_shared_context_for_snapshot() {
+        let session = session(1).await;
+        let (from, publish) = queued(&session).await;
+        let hook = session.scx.extends.hook_mgr().hook(session.clone());
+        let mut state = SessionState::new(session.clone(), hook, 0, 0);
+        let tx = state.tx.clone();
+        tx.unbounded_send(Message::Forward(from.clone(), publish)).unwrap();
+        let limiter = Limiter::new(std::num::NonZeroU32::new(10).unwrap(), Duration::from_secs(1));
+        let (queue, _receiver) = state.deliver_queue_channel(&limiter);
+        state.freeze_mailbox(&queue, false).await;
+        assert!(tx.is_closed());
+        let offline = session.to_offline_info().await.unwrap();
+        assert_eq!(offline.offline_messages.len(), 1);
+        assert!(offline.offline_messages[0].1.shared_delivery_not_started());
+        assert_ne!(
+            offline.offline_messages[0].1.shared_delivery.as_ref().unwrap().subscription_generation,
+            0
+        );
+        let late = Publish::from(CodecPublish {
+            dup: false,
+            retain: false,
+            qos: QoS::ExactlyOnce,
+            topic: "work/request".into(),
+            packet_id: None,
+            payload: bytes::Bytes::from_static(b"late"),
+            properties: None,
+        });
+        assert!(tx.unbounded_send(Message::Forward(from, late)).is_err());
+        let destination = self::session(2).await;
+        let hook = destination.scx.extends.hook_mgr().hook(destination.clone());
+        let mut restored = SessionState::new(destination.clone(), hook, 0, 0);
+        restored.transfer_session_state(false, offline).await.unwrap();
+        let Some(Message::Forward(_, publish)) = restored.rx.next().await else {
+            panic!("restored message missing")
+        };
+        assert_eq!(publish.shared_delivery.as_ref().unwrap().target_id, destination.id);
+        assert!(destination.shared_delivery_context_valid(&publish).await);
+    }
+
+    #[tokio::test]
+    async fn mailbox_barrier_preserves_pending_qos2_pubrel_retry_as_inflight() {
+        let session = session(1).await;
+        let (from, mut publish) = queued(&session).await;
+        publish.packet_id = std::num::NonZeroU16::new(41);
+        let hook = session.scx.extends.hook_mgr().hook(session.clone());
+        let mut state = SessionState::new(session.clone(), hook, 0, 0);
+        state
+            .tx
+            .unbounded_send(Message::SendRerelease(OutInflightMessage::new(
+                MomentStatus::UnComplete,
+                from,
+                publish,
+            )))
+            .unwrap();
+        let limiter = Limiter::new(std::num::NonZeroU32::new(10).unwrap(), Duration::from_secs(1));
+        let (queue, _receiver) = state.deliver_queue_channel(&limiter);
+        state.freeze_mailbox(&queue, false).await;
+        let offline = session.to_offline_info().await.unwrap();
+        assert!(offline.offline_messages.is_empty());
+        assert_eq!(offline.inflight_messages.len(), 1);
+        assert_eq!(offline.inflight_messages[0].status, MomentStatus::UnComplete);
+        assert_eq!(offline.inflight_messages[0].publish.packet_id.unwrap().get(), 41);
+        assert!(offline.inflight_messages[0].publish.shared_delivery.is_none());
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_generation_is_not_revived_during_restore() {
+        let source = session(1).await;
+        let (from, publish) = queued(&source).await;
+        source.subscriptions_remove("work/#").await.unwrap();
+        let opts = SubscriptionOptions::from((QoS::ExactlyOnce, Some("workers".into()), None));
+        source.subscriptions_add("work/#".into(), opts).await.unwrap();
+        source.deliver_queue().push((from, publish)).unwrap();
+        let offline = source.to_offline_info().await.unwrap();
+        assert_eq!(
+            offline.offline_messages[0].1.shared_delivery.as_ref().unwrap().subscription_generation,
+            0
+        );
+        let destination = session(2).await;
+        let hook = destination.scx.extends.hook_mgr().hook(destination.clone());
+        let mut state = SessionState::new(destination.clone(), hook, 0, 0);
+        state.transfer_session_state(false, offline).await.unwrap();
+        let Some(Message::Forward(_, publish)) = state.rx.next().await else {
+            panic!("restored message missing")
+        };
+        assert_eq!(publish.shared_delivery.as_ref().unwrap().subscription_generation, 0);
+        assert!(!destination.shared_delivery_context_valid(&publish).await);
     }
 }

@@ -31,18 +31,70 @@ use rmqtt::{
 
 use super::config::Handoff;
 use super::handoff::{
-    ForwardMode, HandoffDiscardStats, HandoffManager, HandoffResult, HandoffStats, PendingHandoff,
+    ForwardMode, HandoffBatch, HandoffDiscardStats, HandoffManager, HandoffResult, HandoffStats,
+    PendingHandoff,
+};
+use super::handoff_diagnostics::{
+    bounded_detail, AttemptDiagnostic, ForwardAttemptError, ForwardAttemptStage, ReceiverLogThrottle,
+    WaitLogThrottle,
 };
 use super::message::{
     get_client_node_id, DeliveryId, Message as RaftMessage, MessageReply as RaftMessageReply,
     RaftGrpcMessage, RaftGrpcMessageReply, ReliableForward, ReliableForwardReply, ReliableForwardStatus,
-    SessionHandoff, SessionHandoffReply,
+    SessionHandoff, SessionHandoffReply, SharedSessionHandoff,
 };
 use super::nodes::ClusterNodeManager;
+use super::shared_handoff_scheduler::{SharedHandoffScheduler, WorkKind};
+use super::shared_recovery::{
+    bind_current_shared_relation, is_shared_relation_current, select_shared_replacement,
+    shared_candidate_diagnostics, SharedSelectionDiagnostic,
+};
 use super::ClusterRouter;
 
 mod reconcile;
 use reconcile::{SessionReconcileLimits, SessionTransition, SessionTransitions};
+
+type HandoffWaitLogKey = (
+    DeliveryId,
+    &'static str,
+    Option<NodeId>,
+    Option<NodeId>,
+    Option<NodeId>,
+    &'static str,
+    Option<ForwardAttemptStage>,
+    &'static str,
+);
+
+// Allocated only for maintenance work. Ordinary publication never visits this
+// scheduler or pays for a per-message timer, task, or additional queue lock.
+struct SharedHandoffAttempt {
+    delivery_id: Option<DeliveryId>,
+    retry_delay: Duration,
+    timeout_reported: bool,
+    reported: bool,
+    throttle: WaitLogThrottle<HandoffWaitLogKey>,
+    attempt: Option<AttemptDiagnostic>,
+    selection: Option<SharedSelectionDiagnostic>,
+}
+
+impl Default for SharedHandoffAttempt {
+    fn default() -> Self {
+        Self {
+            delivery_id: None,
+            retry_delay: Duration::ZERO,
+            timeout_reported: false,
+            reported: false,
+            throttle: WaitLogThrottle::new(),
+            attempt: None,
+            selection: None,
+        }
+    }
+}
+
+enum SharedHandoffStep {
+    Done,
+    Again(Duration),
+}
 
 #[inline]
 pub(crate) fn effective_source_session_policy(
@@ -265,30 +317,62 @@ impl Entry for ClusterLockEntry {
             result
         } else {
             //kicked from other node
-            if let Some(client) = self.cluster_shared.grpc_client(prev_node_id) {
+            if let Some(mut client) = self.cluster_shared.grpc_client(prev_node_id) {
                 let message_type = self.cluster_shared.message_type;
                 let rw_timeout = self.cluster_shared.rw_timeout;
                 let id1 = id.clone();
                 let kick_fut = async move {
+                    let with_shared = if is_admin {
+                        false
+                    } else {
+                        let probe = RaftGrpcMessage::GetForwardingCapabilities.encode()?;
+                        match client.send_message(message_type, Message::Data(probe), Some(rw_timeout)).await? {
+                            MessageReply::Data(data) => match RaftGrpcMessageReply::decode(&data)? {
+                                RaftGrpcMessageReply::GetForwardingCapabilities { version } => version >= 1,
+                                reply => return Err(anyhow!(
+                                    "unexpected session-pull capability reply from node {prev_node_id}: {reply:?}"
+                                )),
+                            },
+                            // Old sources cannot decode the appended capability
+                            // variant and have no local shared context to lose.
+                            // A timeout or any other unknown failure must not
+                            // cause a second, legacy takeover attempt.
+                            MessageReply::Error(reason)
+                                if reason.contains("expected variant index")
+                                    || reason.contains("unknown variant")
+                                    || reason == "shared-delivery session context is unsupported" => false,
+                            reply => return Err(anyhow!(
+                                "session-pull capability probe failed on node {prev_node_id}: {reply:?}"
+                            )),
+                        }
+                    };
+                    let request = if with_shared {
+                        Message::KickWithShared(id1, clean_start, true, is_admin)
+                    } else {
+                        Message::Kick(id1, clean_start, true, is_admin)
+                    };
                     let msg_sender = MessageSender::new(
                         client,
                         message_type,
-                        Message::Kick(id1, clean_start, true, is_admin), //clear_subscriptions
+                        request, // clear_subscriptions
                         Some(rw_timeout),
                     );
                     match msg_sender.send().await {
                         Ok(reply) => {
-                            if let MessageReply::Kick(kicked) = reply {
-                                log::debug!("{id:?} kicked: {kicked:?}");
-                                Ok(kicked)
-                            } else if let MessageReply::Error(reason) = reply {
-                                Err(anyhow!(
+                            match reply {
+                                MessageReply::KickWithShared(snapshot) if with_shared => {
+                                    snapshot.restore()
+                                }
+                                MessageReply::Kick(kicked) if !with_shared => {
+                                    log::debug!("{id:?} kicked: {kicked:?}");
+                                    Ok(kicked)
+                                }
+                                MessageReply::Error(reason) => Err(anyhow!(
                                     "Message::Kick was rejected by source node {prev_node_id}: {reason}"
-                                ))
-                            } else {
-                                Err(anyhow!(
+                                )),
+                                reply => Err(anyhow!(
                                     "unexpected Message::Kick reply from source node {prev_node_id}: {reply:?}"
-                                ))
+                                )),
                             }
                         }
                         Err(e) => {
@@ -391,6 +475,9 @@ pub struct ClusterShared {
     nodes: ClusterNodeManager,
     draining: Arc<AtomicBool>,
     handoff: Arc<HandoffManager>,
+    shared_handoff_scheduler: SharedHandoffScheduler<SharedHandoffAttempt>,
+    shared_handoff_workers_started: Arc<AtomicBool>,
+    handoff_receiver_log_throttle: Arc<parking_lot::Mutex<ReceiverLogThrottle>>,
     session_transitions: SessionTransitions,
     reconcile_limits: SessionReconcileLimits,
     // Operator-provided destinations for proactive session relocation. This
@@ -438,10 +525,13 @@ impl ClusterShared {
             exec,
             forwards_exec,
             inner: DefaultShared::new(Some(scx1)),
+            handoff_receiver_log_throttle: Arc::new(parking_lot::Mutex::new(ReceiverLogThrottle::new())),
             router,
             nodes,
             draining,
             handoff: Arc::new(HandoffManager::new(handoff_cfg)),
+            shared_handoff_scheduler: SharedHandoffScheduler::default(),
+            shared_handoff_workers_started: Arc::new(AtomicBool::new(false)),
             session_transitions: SessionTransitions::default(),
             reconcile_limits: SessionReconcileLimits::default(),
             drain_allowed_targets: Arc::new(DashMap::new()),
@@ -509,6 +599,8 @@ impl ClusterShared {
     async fn reroute_stale_local_delivery(
         &self,
         dropped: (To, From, Publish, Reason),
+        relation: rmqtt::types::SubRelation,
+        original_publish: &Publish,
     ) -> std::result::Result<(), (To, From, Publish, Reason)> {
         let (to, from, publish, reason) = dropped;
         let this_node_id = self.scx.node.id();
@@ -518,25 +610,19 @@ impl ClusterShared {
         if !self.handoff.operation_active() {
             return Err((to, from, publish, reason));
         }
-        let Some(target_node_id) = self.router.get_ready_target_node_id(&to.client_id) else {
-            return Err((to, from, publish, reason));
-        };
-        if target_node_id == this_node_id {
+        let target_node_id = self.router.get_ready_target_node_id(&to.client_id);
+        if relation.4.is_none() && (target_node_id.is_none() || target_node_id == Some(this_node_id)) {
             return Err((to, from, publish, reason));
         }
-
-        let mut opts = SubscriptionOptions::default();
-        opts.set_qos(publish.qos);
         let target_client_id = to.client_id.clone();
-        let relations = vec![(publish.topic.clone(), target_client_id.clone(), opts, None, None)];
         let pending = PendingHandoff::new(
             self.handoff.next_delivery_id(this_node_id),
             target_client_id,
-            Some(target_node_id),
             Some(this_node_id),
+            self.handoff.should_avoid_target(this_node_id).then_some(this_node_id),
             from.clone(),
-            publish.clone(),
-            relations,
+            original_publish.clone(),
+            vec![relation],
         );
         if self.enqueue_handoff(pending).await.is_ok() {
             Ok(())
@@ -862,7 +948,29 @@ impl ClusterShared {
         let (client_generation, mut client) = self
             .grpc_client_with_generation(target_node_id)
             .ok_or_else(|| anyhow!("grpc client for node {target_node_id} does not exist"))?;
-        let data = RaftGrpcMessage::SessionHandoff(handoff.clone()).encode()?;
+        let request = if handoff.has_shared_context() {
+            // Probe only on maintenance transfers. An old peer must never
+            // silently accept a snapshot with its shared context stripped.
+            let probe = RaftGrpcMessage::GetForwardingCapabilities.encode()?;
+            let reply =
+                client.send_message(self.message_type, Message::Data(probe), Some(self.rw_timeout)).await?;
+            let supported = match reply {
+                MessageReply::Data(data) => matches!(
+                    RaftGrpcMessageReply::decode(&data)?,
+                    RaftGrpcMessageReply::GetForwardingCapabilities { version: 1.. }
+                ),
+                _ => false,
+            };
+            if !supported {
+                return Err(anyhow!(
+                    "node {target_node_id} does not support shared-delivery session context"
+                ));
+            }
+            RaftGrpcMessage::SessionHandoffWithShared(SharedSessionHandoff::from_handoff(handoff.clone()))
+        } else {
+            RaftGrpcMessage::SessionHandoff(handoff.clone())
+        };
+        let data = request.encode()?;
         let reply = client.send_message(self.message_type, Message::Data(data), Some(self.rw_timeout)).await;
         let reply = match reply {
             Ok(reply) => reply,
@@ -1014,6 +1122,27 @@ impl ClusterShared {
     }
 
     async fn enqueue_handoff(&self, pending: PendingHandoff) -> std::result::Result<(), PendingHandoff> {
+        if pending.is_shared() {
+            let key = match self.handoff.enqueue_shared_recovery(pending).await {
+                Ok(key) => key,
+                Err(pending) => {
+                    if log::log_enabled!(log::Level::Error)
+                        && self
+                            .handoff_receiver_log_throttle
+                            .lock()
+                            .should_log(&pending.target_client_id, std::time::Instant::now())
+                    {
+                        log::error!(
+                            "shared recovery admission rejected; ownership retained by caller: delivery_id={:?}, size_bytes={}, receive_budget_bytes={}, at_least_two_message_slots_required=true; check handoff capacity and batch_max_bytes",
+                            pending.delivery_id, pending.size, self.handoff.shared_receive_bytes(),
+                        );
+                    }
+                    return Err(pending);
+                }
+            };
+            self.schedule_shared_handoff(key, WorkKind::Recovery);
+            return Ok(());
+        }
         let client_id = pending.target_client_id.clone();
         match self.handoff.enqueue(pending).await {
             Ok(start_worker) => {
@@ -1044,24 +1173,399 @@ impl ClusterShared {
         }
     }
 
+    fn schedule_shared_handoff(&self, key: String, kind: WorkKind) {
+        self.shared_handoff_scheduler.schedule(key, kind);
+        if self.shared_handoff_workers_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Separate execution budgets: slow remote RPCs can never consume the
+        // local-delivery workers needed to finish those same RPC obligations.
+        for (kind, workers) in [(WorkKind::LocalDelivery, 4), (WorkKind::Recovery, 8)] {
+            for _ in 0..workers {
+                let shared = self.clone();
+                tokio::spawn(async move { shared.run_shared_handoff_worker(kind).await });
+            }
+        }
+    }
+
+    async fn run_shared_handoff_worker(self, kind: WorkKind) {
+        loop {
+            let mut work = self.shared_handoff_scheduler.next(kind).await;
+            self.handoff.restart_worker_if_pending(&work.key);
+            let result =
+                AssertUnwindSafe(self.run_shared_handoff_step(&work.key, work.kind, &mut work.state))
+                    .catch_unwind()
+                    .await;
+            self.handoff.stop_worker(&work.key);
+            match result {
+                Ok(SharedHandoffStep::Done) => self.shared_handoff_scheduler.complete(work),
+                Ok(SharedHandoffStep::Again(delay)) => {
+                    self.shared_handoff_scheduler.reschedule(work, delay);
+                }
+                Err(_) => {
+                    log::error!("shared handoff step panicked, kind={kind:?}, queue_key={:?}; retaining responsibility", work.key);
+                    self.shared_handoff_scheduler.reschedule(work, self.handoff.retry_max_interval());
+                }
+            }
+        }
+    }
+
+    fn shared_handoff_retry(&self, state: &mut SharedHandoffAttempt) -> Duration {
+        let delay =
+            if state.retry_delay.is_zero() { self.handoff.retry_interval() } else { state.retry_delay };
+        state.retry_delay = next_retry_delay(delay, self.handoff.retry_max_interval());
+        delay
+    }
+
+    fn log_shared_handoff_wait(
+        &self,
+        key: &str,
+        batch: &HandoffBatch,
+        avoid: Option<NodeId>,
+        reason: &'static str,
+        state: &mut SharedHandoffAttempt,
+    ) {
+        if self.log_handoff_wait(
+            key,
+            batch,
+            avoid,
+            reason,
+            state.attempt.as_ref(),
+            state.selection.as_ref(),
+            &mut state.throttle,
+        ) {
+            state.reported = true;
+        }
+    }
+
+    fn shared_local_delivery_usable(&self, pending: &PendingHandoff) -> bool {
+        !pending.shared_relation_unbound
+            && !self.is_draining()
+            && !self.local_handoff_prepared()
+            && self.router.get_ready_target_node_id(&pending.target_client_id) == Some(self.scx.node.id())
+            && is_shared_relation_current(&self.router, &pending.relations[0])
+    }
+
+    async fn run_shared_handoff_step(
+        &self,
+        key: &str,
+        kind: WorkKind,
+        state: &mut SharedHandoffAttempt,
+    ) -> SharedHandoffStep {
+        // A receiver becomes a new recovery source before it can forward an
+        // accepted obligation again, including an owner-only migration. The
+        // parent acknowledgement is protected by this still-owned child.
+        // Refresh the batch after changing its ID; never send a stale parent.
+        if kind == WorkKind::Recovery && self.handoff.prepare_shared_recovery_child(key, self.scx.node.id()) {
+            return SharedHandoffStep::Again(Duration::ZERO);
+        }
+        let Some(batch) = self.handoff.next_batch(key) else {
+            if state.reported {
+                log::info!("handoff diagnostic resolved: node_id={}, queue_key={key:?}, reason=queue_drained, kind={kind:?}", self.scx.node.id());
+            }
+            return SharedHandoffStep::Done;
+        };
+        let Some(front) = batch.messages.first() else {
+            return SharedHandoffStep::Done;
+        };
+        if state.delivery_id != Some(front.delivery_id) {
+            *state = SharedHandoffAttempt::default();
+            state.delivery_id = Some(front.delivery_id);
+        }
+        if !state.timeout_reported && front.created_at.elapsed() >= self.handoff.retry_timeout() {
+            log::error!("reliable handoff timed out but remains queued for fail-closed retry, delivery_id={:?}, client_id={}, age_ms={}, kind={kind:?}", front.delivery_id, front.target_client_id, front.created_at.elapsed().as_millis());
+            state.timeout_reported = true;
+        }
+
+        if kind == WorkKind::LocalDelivery {
+            // An ingress FIFO never waits for a remote receiver. When its
+            // consumer changes, transfer the same owned slot to independent
+            // recovery scheduling before allowing the next local delivery.
+            if !self.shared_local_delivery_usable(front) {
+                if let Some(recovery_key) = self.handoff.promote_shared_local_front(key) {
+                    self.schedule_shared_handoff(recovery_key, WorkKind::Recovery);
+                    return SharedHandoffStep::Again(Duration::ZERO);
+                }
+                return SharedHandoffStep::Again(self.shared_handoff_retry(state));
+            }
+            let mut results = Vec::with_capacity(batch.messages.len());
+            for pending in &batch.messages {
+                if !self.shared_local_delivery_usable(pending) {
+                    break;
+                }
+                let status = match self
+                    .inner
+                    .forwards_to(pending.from.clone(), &pending.publish, pending.relations.clone())
+                    .await
+                {
+                    Ok(()) => ReliableForwardStatus::Delivered,
+                    Err(_) => ReliableForwardStatus::Retryable("local target session is not ready".into()),
+                };
+                let stop = matches!(status, ReliableForwardStatus::Retryable(_));
+                results.push(HandoffResult { delivery_id: pending.delivery_id, status });
+                if stop {
+                    break;
+                }
+            }
+            let applied = self.handoff.apply_batch(key, self.scx.node.id(), &results);
+            if applied.completed > 0 {
+                if state.reported {
+                    log::info!("handoff diagnostic resolved: node_id={}, queue_key={key:?}, delivery_id={:?}, result=local_delivered", self.scx.node.id(), front.delivery_id);
+                }
+                state.retry_delay = self.handoff.retry_interval();
+                return SharedHandoffStep::Again(Duration::ZERO);
+            }
+            self.log_shared_handoff_wait(key, &batch, None, "local_delivery_retry", state);
+            return SharedHandoffStep::Again(self.shared_handoff_retry(state));
+        }
+
+        let avoid = if batch.pinned_node_id.is_none()
+            && front.target_node_id.is_some_and(|node| self.handoff.should_avoid_target(node))
+        {
+            front.target_node_id
+        } else {
+            batch.avoid_node_id
+        };
+        if self.handoff.shared_reassignment_allowed(key, front.delivery_id) {
+            let current = self.router.get_ready_target_node_id(&front.target_client_id);
+            let current_usable = !front.shared_relation_unbound
+                && is_shared_relation_current(&self.router, &front.relations[0])
+                && current.is_some_and(|node| {
+                    Some(node) != avoid
+                        && !self.handoff.should_avoid_target(node)
+                        && !(node == self.scx.node.id()
+                            && (self.is_draining() || self.local_handoff_prepared()))
+                });
+            if !current_usable {
+                let mut excluded = std::collections::HashSet::new();
+                excluded.extend(avoid);
+                for node in self.nodes.snapshot_nodes() {
+                    if self.handoff.should_avoid_target(node.id) {
+                        excluded.insert(node.id);
+                    }
+                }
+                if self.is_draining() || self.local_handoff_prepared() {
+                    excluded.insert(self.scx.node.id());
+                }
+                let mut selection = SharedSelectionDiagnostic::default();
+                let replacement = select_shared_replacement(
+                    &self.scx,
+                    &self.router,
+                    &front.relations[0],
+                    &front.from,
+                    &front.target_client_id,
+                    &excluded,
+                    &mut selection,
+                )
+                .await;
+                state.selection = Some(selection);
+                if let Some((_, relation)) = replacement {
+                    if self.handoff.reassign_shared(key, front.delivery_id, self.scx.node.id(), relation) {
+                        state.retry_delay = self.handoff.retry_interval();
+                        return SharedHandoffStep::Again(Duration::ZERO);
+                    }
+                }
+                self.log_shared_handoff_wait(key, &batch, avoid, "shared_no_replacement", state);
+                return SharedHandoffStep::Again(self.shared_handoff_retry(state));
+            }
+        }
+        let target = batch.pinned_node_id.or_else(|| {
+            self.router.get_target_node_id(&front.target_client_id).filter(|node| Some(*node) != avoid)
+        });
+        let Some(target) = target else {
+            self.log_shared_handoff_wait(key, &batch, avoid, "no_target_owner_or_avoided", state);
+            return SharedHandoffStep::Again(self.shared_handoff_retry(state));
+        };
+        if target == self.scx.node.id() {
+            if let Some(local_key) = self.handoff.move_shared_recovery_to_local(key) {
+                self.schedule_shared_handoff(local_key, WorkKind::LocalDelivery);
+                return SharedHandoffStep::Done;
+            }
+            return SharedHandoffStep::Again(self.shared_handoff_retry(state));
+        }
+        let guard = self.handoff.retry_guard(target);
+        let result = self.send_reliable_forward_batch(target, &batch.messages).await;
+        drop(guard);
+        match result {
+            Ok(results) => {
+                let applied = self.handoff.apply_batch(key, target, &results);
+                let status = results.iter().find(|r| r.delivery_id == front.delivery_id).map(|r| &r.status);
+                let (reason, detail) = match status {
+                    Some(ReliableForwardStatus::Delivered) => ("delivered", String::new()),
+                    Some(ReliableForwardStatus::Duplicate) => ("duplicate", String::new()),
+                    Some(ReliableForwardStatus::Accepted) => ("accepted_waiting_completion", String::new()),
+                    Some(ReliableForwardStatus::Retryable(s)) => ("retryable", bounded_detail(s)),
+                    Some(ReliableForwardStatus::Rejected(s)) => ("rejected", bounded_detail(s)),
+                    None => ("empty_or_missing_head_reply", String::new()),
+                };
+                state.attempt = Some(AttemptDiagnostic {
+                    target_node_id: target,
+                    result: reason,
+                    stage: None,
+                    request_may_have_been_sent: None,
+                    detail,
+                });
+                if applied.completed > 0 {
+                    if state.reported {
+                        log::info!("handoff diagnostic resolved: node_id={}, queue_key={key:?}, delivery_id={:?}, target_node_id={target}, result={reason}", self.scx.node.id(), front.delivery_id);
+                    }
+                    return SharedHandoffStep::Again(Duration::ZERO);
+                }
+                self.log_shared_handoff_wait(key, &batch, avoid, reason, state);
+                if applied.made_progress() {
+                    state.retry_delay = self.handoff.retry_interval();
+                }
+            }
+            Err(error) => {
+                self.handoff.pin_uncertain_batch(key, &batch.messages, target, error.stage);
+                state.attempt = Some(error.diagnostic(target));
+                self.log_shared_handoff_wait(key, &batch, avoid, "transport_error_pinned", state);
+            }
+        }
+        SharedHandoffStep::Again(self.shared_handoff_retry(state))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_handoff_wait(
+        &self,
+        queue_key: &str,
+        batch: &HandoffBatch,
+        dynamic_avoid: Option<NodeId>,
+        reason: &'static str,
+        attempt: Option<&AttemptDiagnostic>,
+        selection: Option<&SharedSelectionDiagnostic>,
+        throttle: &mut WaitLogThrottle<HandoffWaitLogKey>,
+    ) -> bool {
+        if !log::log_enabled!(log::Level::Warn) {
+            return false;
+        }
+        let Some(front) = batch.messages.first() else {
+            return false;
+        };
+        let owner = self.router.get_target_node_id(&front.target_client_id);
+        let ready_owner = self.router.get_ready_target_node_id(&front.target_client_id);
+        let key = (
+            front.delivery_id,
+            reason,
+            batch.pinned_node_id,
+            owner,
+            ready_owner,
+            attempt.map_or("none", |attempt| attempt.result),
+            attempt.and_then(|attempt| attempt.stage),
+            selection.map_or("none", |selection| selection.outcome),
+        );
+        if !throttle.should_log(key, std::time::Instant::now(), front.created_at.elapsed()) {
+            return false;
+        }
+        let snapshot = self.handoff.diagnostic_snapshot(queue_key);
+        let mut excluded = std::collections::HashSet::new();
+        excluded.extend(dynamic_avoid);
+        for node in self.nodes.snapshot_nodes() {
+            if self.handoff.should_avoid_target(node.id) {
+                excluded.insert(node.id);
+            }
+        }
+        if self.is_draining() || self.local_handoff_prepared() {
+            excluded.insert(self.scx.node.id());
+        }
+        let candidates = front.is_shared().then(|| {
+            shared_candidate_diagnostics(
+                &self.router,
+                &front.relations[0],
+                &front.from,
+                &front.target_client_id,
+                &excluded,
+            )
+        });
+        let observed_pin = snapshot
+            .as_ref()
+            .filter(|snapshot| snapshot.head_delivery_id == front.delivery_id)
+            .map(|snapshot| snapshot.head_pinned_node_id)
+            .unwrap_or(batch.pinned_node_id);
+        let observed_next_target = observed_pin.or_else(|| owner.filter(|node| Some(*node) != dynamic_avoid));
+        let grpc_generation = observed_next_target
+            .filter(|node| *node != self.scx.node.id())
+            .and_then(|node| self.grpc_client_with_generation(node).map(|(generation, _)| generation));
+        let relation = front.relations.first();
+        log::warn!(
+            "handoff diagnostic: reason={reason}, node_id={}, queue_key={queue_key:?}, delivery_id={:?}, target_client={:?}, topic={:?}, payload_bytes={}, relation_count={}, filter={:?}, group={:?}, age_ms={}, batch_messages={}, original_target={:?}, dynamic_avoid={dynamic_avoid:?}, attempt_pin_before={:?}, owner={owner:?}, ready_owner={ready_owner:?}, observed_next_target={observed_next_target:?}, observed_grpc_generation={grpc_generation:?}, excluded_nodes={excluded:?}, reassignment_allowed={}, snapshot={snapshot:?}, last_result={:?}, attempt_target_node_id={:?}, transport_stage={:?}, request_may_have_been_sent={:?}, detail={:?}, selection={selection:?}, candidates={candidates:?}; routing and candidate fields are non-atomic local observations; request_may_have_been_sent describes only this attempt",
+            self.scx.node.id(),
+            front.delivery_id,
+            front.target_client_id,
+            front.publish.topic,
+            front.publish.payload.len(),
+            front.relations.len(),
+            relation.map(|relation| &relation.0),
+            relation.and_then(|relation| relation.4.as_ref().map(|group| &group.0).or_else(|| relation.2.shared_group())),
+            front.created_at.elapsed().as_millis(),
+            batch.messages.len(),
+            front.target_node_id,
+            batch.pinned_node_id,
+            self.handoff.shared_reassignment_allowed(queue_key, front.delivery_id),
+            attempt.map(|attempt| attempt.result),
+            attempt.map(|attempt| attempt.target_node_id),
+            attempt.and_then(|attempt| attempt.stage),
+            attempt.and_then(|attempt| attempt.request_may_have_been_sent),
+            attempt.map(|attempt| &attempt.detail),
+        );
+        true
+    }
+
     async fn run_handoff_worker(self, client_id: ClientId) {
         let mut timeout_reported_for = None;
         let mut retry_delay = self.handoff.retry_interval();
         let reconcile_interval = Duration::from_millis(5_000 + (self.scx.node.id() % 17) * 37);
         let mut next_reconcile = tokio::time::Instant::now() + reconcile_interval;
+        let mut diagnostic_throttle = WaitLogThrottle::new();
+        let mut diagnostic_head = None;
+        let mut last_attempt = None;
+        let mut last_selection = None;
+        let mut last_reported_delivery = None;
         loop {
             let Some(batch) = self.handoff.next_batch(&client_id) else {
+                if last_reported_delivery.is_some() {
+                    log::info!("handoff diagnostic resolved: node_id={}, queue_key={client_id:?}, reason=queue_drained", self.scx.node.id());
+                }
                 return;
             };
             let Some(front) = batch.messages.first() else {
                 self.handoff.stop_worker(&client_id);
                 return;
             };
+            if diagnostic_head != Some(front.delivery_id) {
+                diagnostic_head = Some(front.delivery_id);
+                last_attempt = None;
+                last_selection = None;
+            }
+            if front.created_at.elapsed() >= self.handoff.retry_timeout()
+                && timeout_reported_for != Some(front.delivery_id)
+            {
+                log::error!(
+                    "reliable handoff timed out but remains queued for fail-closed retry, delivery_id={:?}, client_id={}, age_ms={}",
+                    front.delivery_id,
+                    front.target_client_id,
+                    front.created_at.elapsed().as_millis()
+                );
+                timeout_reported_for = Some(front.delivery_id);
+            }
+
+            let dynamic_avoid = if batch.pinned_node_id.is_none()
+                && front.target_node_id.is_some_and(|target| self.handoff.should_avoid_target(target))
+            {
+                front.target_node_id
+            } else {
+                batch.avoid_node_id
+            };
+
+            // Shared obligations are admitted through the independent shared
+            // scheduler; this legacy worker preserves ordinary-session FIFO.
+            debug_assert!(batch.messages.iter().all(|pending| !pending.is_shared()));
 
             // Reconcile only maintenance-queue deliveries owned by this
             // sender. Absence in a local router snapshot is not proof of
             // termination: another node may still hold a session snapshot.
             if batch.pinned_node_id.is_none()
+                && !front.is_shared()
                 && front.delivery_id.origin_node_id == self.scx.node.id()
                 && tokio::time::Instant::now() >= next_reconcile
             {
@@ -1087,33 +1591,26 @@ impl ClusterShared {
                     _ => {}
                 }
             }
-            if front.created_at.elapsed() >= self.handoff.retry_timeout()
-                && timeout_reported_for != Some(front.delivery_id)
-            {
-                log::error!(
-                    "reliable handoff timed out but remains queued for fail-closed retry, delivery_id={:?}, client_id={}, age_ms={}",
-                    front.delivery_id,
-                    front.target_client_id,
-                    front.created_at.elapsed().as_millis()
-                );
-                timeout_reported_for = Some(front.delivery_id);
-            }
 
             // A proactively relocated session is deliberately offline until
             // the real MQTT client reconnects, but it can already own routes
             // and queue messages. Reliable handoff therefore follows any
             // replicated owner, not only an online socket.
             let ready_owner = self.router.get_target_node_id(&front.target_client_id);
-            let dynamic_avoid = if batch.pinned_node_id.is_none()
-                && front.target_node_id.is_some_and(|target| self.handoff.should_avoid_target(target))
-            {
-                front.target_node_id
-            } else {
-                batch.avoid_node_id
-            };
             let target_node_id =
                 batch.pinned_node_id.or_else(|| ready_owner.filter(|owner| Some(*owner) != dynamic_avoid));
             let Some(target_node_id) = target_node_id else {
+                if self.log_handoff_wait(
+                    &client_id,
+                    &batch,
+                    dynamic_avoid,
+                    "no_target_owner_or_avoided",
+                    last_attempt.as_ref(),
+                    last_selection.as_ref(),
+                    &mut diagnostic_throttle,
+                ) {
+                    last_reported_delivery = Some(front.delivery_id);
+                }
                 tokio::time::sleep(retry_delay).await;
                 retry_delay = next_retry_delay(retry_delay, self.handoff.retry_max_interval());
                 continue;
@@ -1159,6 +1656,48 @@ impl ClusterShared {
                         }
                     }
                     let applied = self.handoff.apply_batch(&client_id, target_node_id, &results);
+                    let head_status = results
+                        .iter()
+                        .find(|result| result.delivery_id == front.delivery_id)
+                        .map(|result| &result.status);
+                    let (reason, detail) = match head_status {
+                        Some(ReliableForwardStatus::Delivered) => ("delivered", String::new()),
+                        Some(ReliableForwardStatus::Duplicate) => ("duplicate", String::new()),
+                        Some(ReliableForwardStatus::Accepted) => {
+                            ("accepted_waiting_completion", String::new())
+                        }
+                        Some(ReliableForwardStatus::Retryable(detail)) => {
+                            ("retryable", bounded_detail(detail))
+                        }
+                        Some(ReliableForwardStatus::Rejected(detail)) => ("rejected", bounded_detail(detail)),
+                        None => ("empty_or_missing_head_reply", String::new()),
+                    };
+                    last_attempt = Some(AttemptDiagnostic {
+                        target_node_id,
+                        result: reason,
+                        stage: None,
+                        request_may_have_been_sent: None,
+                        detail,
+                    });
+                    if matches!(
+                        head_status,
+                        Some(ReliableForwardStatus::Delivered | ReliableForwardStatus::Duplicate)
+                    ) {
+                        if last_reported_delivery == Some(front.delivery_id) {
+                            log::info!("handoff diagnostic resolved: node_id={}, queue_key={client_id:?}, delivery_id={:?}, target_node_id={target_node_id}, result={reason}", self.scx.node.id(), front.delivery_id);
+                            last_reported_delivery = None;
+                        }
+                    } else if self.log_handoff_wait(
+                        &client_id,
+                        &batch,
+                        dynamic_avoid,
+                        reason,
+                        last_attempt.as_ref(),
+                        last_selection.as_ref(),
+                        &mut diagnostic_throttle,
+                    ) {
+                        last_reported_delivery = Some(front.delivery_id);
+                    }
                     if applied.completed > 0 {
                         timeout_reported_for = None;
                     }
@@ -1173,7 +1712,19 @@ impl ClusterShared {
                     // A timeout cannot establish whether a receiver accepted
                     // this batch. Keep it ineligible for absence retirement
                     // until the existing delivery protocol finishes it.
-                    self.handoff.mark_transport_uncertain(&client_id, &batch.messages);
+                    self.handoff.pin_uncertain_batch(&client_id, &batch.messages, target_node_id, e.stage);
+                    last_attempt = Some(e.diagnostic(target_node_id));
+                    if self.log_handoff_wait(
+                        &client_id,
+                        &batch,
+                        dynamic_avoid,
+                        "transport_error_pinned",
+                        last_attempt.as_ref(),
+                        last_selection.as_ref(),
+                        &mut diagnostic_throttle,
+                    ) {
+                        last_reported_delivery = Some(front.delivery_id);
+                    }
                     log::debug!(
                         "reliable handoff batch transport retry, first_delivery_id={:?}, batch_messages={}, client_id={}, target_node_id={}, error={:?}",
                         front.delivery_id,
@@ -1193,10 +1744,14 @@ impl ClusterShared {
         &self,
         target_node_id: NodeId,
         batch: &[PendingHandoff],
-    ) -> Result<Vec<HandoffResult>> {
-        let (client_generation, mut batch_client) = self
-            .grpc_client_with_generation(target_node_id)
-            .ok_or_else(|| anyhow!("grpc client for node {target_node_id} does not exist"))?;
+    ) -> std::result::Result<Vec<HandoffResult>, ForwardAttemptError> {
+        let (client_generation, mut batch_client) =
+            self.grpc_client_with_generation(target_node_id).ok_or_else(|| {
+                ForwardAttemptError::new(
+                    ForwardAttemptStage::MissingClient,
+                    anyhow!("grpc client for node {target_node_id} does not exist"),
+                )
+            })?;
         let forwards = batch
             .iter()
             .map(|pending| ReliableForward {
@@ -1207,22 +1762,28 @@ impl ClusterShared {
                 relations: pending.relations.clone(),
             })
             .collect();
-        let data = RaftGrpcMessage::ReliableForwardBatch(forwards).encode()?;
+        let data = RaftGrpcMessage::ReliableForwardBatch(forwards)
+            .encode()
+            .map_err(|error| ForwardAttemptError::new(ForwardAttemptStage::Encode, error))?;
         let reply =
             batch_client.send_message(self.message_type, Message::Data(data), Some(self.rw_timeout)).await;
         let reply = match reply {
             Ok(reply) => reply,
             Err(error) => {
                 self.schedule_grpc_client_repair(target_node_id, client_generation, "reliable handoff batch");
-                return Err(error);
+                return Err(ForwardAttemptError::new(ForwardAttemptStage::SendCall, error));
             }
         };
         match reply {
             MessageReply::Data(data) => {
                 let RaftGrpcMessageReply::ReliableForwardBatch(statuses) =
-                    RaftGrpcMessageReply::decode(&data)?
+                    RaftGrpcMessageReply::decode(&data)
+                        .map_err(|error| ForwardAttemptError::new(ForwardAttemptStage::DecodeReply, error))?
                 else {
-                    return Err(anyhow!("unexpected reliable handoff reply from node {target_node_id}"));
+                    return Err(ForwardAttemptError::new(
+                        ForwardAttemptStage::ReplyType,
+                        anyhow!("unexpected reliable handoff reply from node {target_node_id}"),
+                    ));
                 };
                 if statuses.len() > batch.len()
                     || !statuses
@@ -1230,8 +1791,9 @@ impl ClusterShared {
                         .zip(batch)
                         .all(|(status, pending)| status.delivery_id == pending.delivery_id)
                 {
-                    return Err(anyhow!(
-                        "unexpected reliable handoff batch reply from node {target_node_id}"
+                    return Err(ForwardAttemptError::new(
+                        ForwardAttemptStage::ReplyShape,
+                        anyhow!("unexpected reliable handoff batch reply from node {target_node_id}"),
                     ));
                 }
                 Ok(statuses
@@ -1239,12 +1801,14 @@ impl ClusterShared {
                     .map(|status| HandoffResult { delivery_id: status.delivery_id, status: status.status })
                     .collect())
             }
-            MessageReply::Error(reason) => {
-                Err(anyhow!("reliable handoff was rejected by node {target_node_id}: {reason}"))
-            }
-            reply => {
-                Err(anyhow!("unexpected reliable handoff gRPC reply from node {target_node_id}: {reply:?}"))
-            }
+            MessageReply::Error(reason) => Err(ForwardAttemptError::new(
+                ForwardAttemptStage::RemoteError,
+                anyhow!("reliable handoff was rejected by node {target_node_id}: {reason}"),
+            )),
+            reply => Err(ForwardAttemptError::new(
+                ForwardAttemptStage::GrpcReplyType,
+                anyhow!("unexpected reliable handoff gRPC reply from node {target_node_id}: {reply:?}"),
+            )),
         }
     }
 
@@ -1263,6 +1827,19 @@ impl ClusterShared {
             return ReliableForwardStatus::Duplicate;
         }
         if self.handoff.delivery_pending(delivery_id) {
+            if log::log_enabled!(log::Level::Warn)
+                && self
+                    .handoff_receiver_log_throttle
+                    .lock()
+                    .should_log(&target_client_id, std::time::Instant::now())
+            {
+                log::warn!(
+                    "handoff receiver diagnostic: result=accepted_dedup_pending, delivery_id={delivery_id:?}, node_id={}, target_client={target_client_id:?}, owner={:?}, target_queue_snapshot={:?}; shared recovery and local delivery have separate scheduling domains, reply unchanged",
+                    self.scx.node.id(), self.router.get_target_node_id(&target_client_id),
+                    self.handoff.diagnostic_snapshot(&HandoffManager::shared_local_key(&target_client_id))
+                        .or_else(|| self.handoff.diagnostic_snapshot(&target_client_id)),
+                );
+            }
             return ReliableForwardStatus::Accepted;
         }
 
@@ -1273,6 +1850,17 @@ impl ClusterShared {
             || owner != Some(self.scx.node.id())
             || !self.inner.exist(&target_client_id)
         {
+            if log::log_enabled!(log::Level::Warn)
+                && self
+                    .handoff_receiver_log_throttle
+                    .lock()
+                    .should_log(&target_client_id, std::time::Instant::now())
+            {
+                log::warn!(
+                    "handoff receiver diagnostic: result=retryable, delivery_id={delivery_id:?}, node_id={}, target_client={target_client_id:?}, owner={owner:?}, draining={}, prepared={local_handoff_prepared}, local_session_exists={}, reason=target_not_local_or_not_accepting; flags are non-atomic local observations, reply unchanged",
+                    self.scx.node.id(), self.is_draining(), self.inner.exist(&target_client_id),
+                );
+            }
             return ReliableForwardStatus::Retryable(
                 "target node does not currently own a local session".to_string(),
             );
@@ -1280,6 +1868,19 @@ impl ClusterShared {
 
         let pending =
             PendingHandoff::new(delivery_id, target_client_id, owner, None, from, publish, relations);
+        if pending.is_shared() {
+            return match self.handoff.try_enqueue_shared_local(pending) {
+                Ok(key) => {
+                    self.schedule_shared_handoff(key, WorkKind::LocalDelivery);
+                    ReliableForwardStatus::Accepted
+                }
+                // Do not wait for capacity while holding a gRPC execution
+                // slot. The source still owns this unaccepted obligation.
+                Err(_) => ReliableForwardStatus::Retryable(
+                    "shared local delivery admission is full or exceeds its receive budget".into(),
+                ),
+            };
+        }
         match self.enqueue_handoff(pending).await {
             Ok(()) => ReliableForwardStatus::Accepted,
             Err(_) => ReliableForwardStatus::Rejected("reliable handoff queue limit exceeded".to_string()),
@@ -1333,11 +1934,22 @@ impl ClusterShared {
         }
 
         let mut grouped = HashMap::<ClientId, SubRelations>::new();
-        for relation in relations {
-            grouped.entry(relation.1.clone()).or_default().push(relation);
+        let mut deliveries = Vec::new();
+        for mut relation in relations {
+            if relation.4.is_none() {
+                if let Some(group) = relation.2.shared_group() {
+                    relation.4 = Some((group.clone(), false, Vec::new()));
+                }
+            }
+            if relation.4.is_some() {
+                deliveries.push((relation.1.clone(), vec![relation]));
+            } else {
+                grouped.entry(relation.1.clone()).or_default().push(relation);
+            }
         }
+        deliveries.extend(grouped);
         let mut dropped = Vec::new();
-        for (target_client_id, relations) in grouped {
+        for (target_client_id, relations) in deliveries {
             let pending = PendingHandoff::new(
                 self.handoff.next_delivery_id(self.scx.node.id()),
                 target_client_id.clone(),
@@ -1648,6 +2260,62 @@ fn next_retry_delay(current: Duration, maximum: Duration) -> Duration {
 #[async_trait]
 impl Shared for ClusterShared {
     #[inline]
+    fn shared_delivery_recovery_enabled(&self) -> bool {
+        self.handoff.operation_active()
+    }
+
+    async fn recover_shared_delivery(
+        &self,
+        from: From,
+        mut publish: Publish,
+    ) -> std::result::Result<(), (From, Publish, Reason)> {
+        // Rollback stops new captures, but a session which already handed off
+        // ownership must still be able to finish its recovery after rollback.
+        if !self.handoff.enabled() || !publish.shared_delivery_not_started() {
+            return Err((from, publish, Reason::from_static("shared recovery is unavailable")));
+        }
+        let context = publish.shared_delivery.as_ref().expect("checked shared context").clone();
+        publish.restore_shared_delivery_source();
+        let bound = bind_current_shared_relation(
+            &self.router,
+            &context.topic_filter,
+            &context.target_id,
+            &context.group,
+            &from,
+        );
+        let unbound = bound.is_none();
+        // A missing route is an unbound recovery intent, not a fabricated V3
+        // subscription. Its options are never compared with a real route or
+        // used for delivery; selection must first bind an actual consumer.
+        let relation = bound.unwrap_or_else(|| {
+            (
+                context.topic_filter.clone(),
+                context.target_id.client_id.clone(),
+                SubscriptionOptions::default(),
+                None,
+                Some((context.group.clone(), false, Vec::new())),
+            )
+        });
+        let mut pending = PendingHandoff::new(
+            self.handoff.next_delivery_id(self.scx.node.id()),
+            context.target_id.client_id.clone(),
+            Some(context.target_id.node_id),
+            self.handoff.should_avoid_target(context.target_id.node_id).then_some(context.target_id.node_id),
+            from,
+            publish,
+            vec![relation],
+        );
+        pending.shared_relation_unbound = unbound;
+        self.enqueue_handoff(pending).await.map_err(|pending| {
+            (
+                pending.from,
+                pending.publish,
+                Reason::from_static("shared recovery queue cannot accept the delivery"),
+            )
+        })
+    }
+
+    #[inline]
     fn entry(&self, id: Id) -> Box<dyn Entry> {
         Box::new(ClusterLockEntry::new(
             self.scx.clone(),
@@ -1690,21 +2358,28 @@ impl Shared for ClusterShared {
                 .await;
         }
 
-        match self.inner.forwards_to(from, publish, relations).await {
-            Ok(()) => Ok(()),
-            Err(droppeds) => {
-                let mut remaining = Vec::new();
+        if !self.handoff.operation_active() {
+            return self.inner.forwards_to(from, publish, relations).await;
+        }
+        // Preserve each failed obligation during maintenance. Reconstructing
+        // from a dropped packet loses its filter/group and original QoS.
+        let mut remaining = Vec::new();
+        for relation in relations {
+            if let Err(droppeds) = self.inner.forwards_to(from.clone(), publish, vec![relation.clone()]).await
+            {
                 for dropped in droppeds {
-                    if let Err(dropped) = self.reroute_stale_local_delivery(dropped).await {
+                    if let Err(dropped) =
+                        self.reroute_stale_local_delivery(dropped, relation.clone(), publish).await
+                    {
                         remaining.push(dropped);
                     }
                 }
-                if remaining.is_empty() {
-                    Ok(())
-                } else {
-                    Err(remaining)
-                }
             }
+        }
+        if remaining.is_empty() {
+            Ok(())
+        } else {
+            Err(remaining)
         }
     }
 
@@ -1873,6 +2548,24 @@ impl Shared for ClusterShared {
 mod drain_takeover_tests {
     use super::{drain_target_allowed, effective_source_session_policy};
     use ahash::HashSet;
+
+    #[tokio::test]
+    async fn missing_grpc_client_is_diagnosed_as_pre_send_without_changing_failure() {
+        let scx = super::ServerContext::new()
+            .node_id(1)
+            .busy_check_enable(false)
+            .plugins_config_map_add(
+                "rmqtt-cluster-raft",
+                "node_grpc_addrs = []\nraft_peer_addrs = []\ntask_exec_queue_workers = 1",
+            )
+            .build()
+            .await;
+        let plugin = crate::ClusterPlugin::new(scx, "rmqtt-cluster-raft").await.unwrap();
+        let failure = plugin.shared.send_reliable_forward_batch(999, &[]).await.unwrap_err();
+        assert_eq!(failure.stage, super::ForwardAttemptStage::MissingClient);
+        assert!(!failure.stage.request_may_have_been_sent());
+        assert!(failure.error.to_string().contains("grpc client for node 999 does not exist"));
+    }
 
     #[tokio::test]
     async fn completed_delivery_still_acknowledged_during_shutdown_and_drain() {

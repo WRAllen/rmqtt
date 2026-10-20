@@ -68,8 +68,8 @@ use serde::{Deserialize, Serialize};
 use crate::context::ServerContext;
 use crate::types::{
     Addr, CleanStart, ClearSubscriptions, ClientId, From, HashMap, Id, IsAdmin, MsgID, NodeId,
-    OfflineSession, Publish, Retain, Route, SessionStatus, SharedGroup, SubRelations, SubRelationsMap,
-    SubsSearchParams, SubsSearchResult, SubscriptionClientIds, TopicFilter, TopicName,
+    OfflineSession, Publish, Retain, Route, SessionStatus, SharedDeliveryContext, SharedGroup, SubRelations,
+    SubRelationsMap, SubsSearchParams, SubsSearchResult, SubscriptionClientIds, TopicFilter, TopicName,
 };
 use crate::utils::Counter;
 use crate::Result;
@@ -332,6 +332,9 @@ pub enum Message {
     SessionStatus(ClientId),
     MessageGet(ClientId, TopicFilter, Option<SharedGroup>),
     Data(Vec<u8>),
+    // Append only: negotiated pull snapshots preserve shared queue context
+    // without changing the legacy Publish, Kick or OfflineSession wire layout.
+    KickWithShared(Id, CleanStart, ClearSubscriptions, IsAdmin),
 }
 
 impl Message {
@@ -362,6 +365,78 @@ pub enum MessageReply {
     SessionStatus(Option<SessionStatus>),
     MessageGet(Vec<(MsgID, From, Publish)>),
     Data(Vec<u8>),
+    KickWithShared(SharedOfflineSession),
+}
+
+/// Versioned pull-session wrapper. Contexts correspond to the offline queue,
+/// never to MQTT inflight messages whose delivery has already started.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SharedOfflineSession {
+    pub session: OfflineSession,
+    pub queued_contexts: Vec<Option<SharedDeliveryContext>>,
+}
+
+impl SharedOfflineSession {
+    pub fn from_session(mut session: OfflineSession) -> Self {
+        let queued_contexts = match &mut session {
+            OfflineSession::Exist(Some(offline)) => {
+                for message in &mut offline.inflight_messages {
+                    message.publish.shared_delivery = None;
+                }
+                offline
+                    .offline_messages
+                    .iter_mut()
+                    .map(|(_, publish)| {
+                        let not_started = publish.shared_delivery_not_started();
+                        let context = publish.shared_delivery.take();
+                        if not_started {
+                            context.map(|context| context.as_ref().clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            }
+            _ => Vec::new(),
+        };
+        Self { session, queued_contexts }
+    }
+
+    pub fn restore(mut self) -> Result<OfflineSession> {
+        let OfflineSession::Exist(Some(offline)) = &mut self.session else {
+            anyhow::ensure!(self.queued_contexts.is_empty(), "shared pull context requires a session");
+            return Ok(self.session);
+        };
+        anyhow::ensure!(
+            self.queued_contexts.len() == offline.offline_messages.len(),
+            "shared pull context length does not match the offline queue"
+        );
+        for ((_, publish), context) in offline.offline_messages.iter().zip(&self.queued_contexts) {
+            if let Some(context) = context {
+                anyhow::ensure!(
+                    !publish.dup && publish.packet_id.is_none(),
+                    "shared pull context cannot be attached to a started delivery"
+                );
+                anyhow::ensure!(
+                    context.target_id.client_id == offline.id.client_id
+                        && context.target_id.create_time == offline.id.create_time,
+                    "shared pull context does not belong to the snapshot session"
+                );
+                let filter = context.topic_filter.parse::<crate::topic::Topic>()?;
+                anyhow::ensure!(
+                    filter.matches_str(&publish.topic),
+                    "shared pull context does not match the queued publication"
+                );
+            }
+        }
+        for ((_, publish), context) in offline.offline_messages.iter_mut().zip(self.queued_contexts) {
+            publish.shared_delivery = context.map(Arc::new);
+        }
+        for message in &mut offline.inflight_messages {
+            message.publish.shared_delivery = None;
+        }
+        Ok(self.session)
+    }
 }
 
 impl MessageReply {
@@ -494,10 +569,110 @@ impl MessageBroadcaster {
 
 #[cfg(test)]
 mod tests {
-    use super::{GrpcClient, Message};
+    use super::{GrpcClient, Message, MessageReply, SharedOfflineSession};
+    use crate::{
+        inflight::{MomentStatus, OutInflightMessage},
+        session::OfflineInfo,
+        types::{CodecPublish, From, Id, OfflineSession, Publish, QoS, SharedDeliveryContext},
+    };
+    use std::num::NonZeroU16;
+    use std::sync::Arc;
     use std::time::Duration;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    fn shared_pull_session() -> OfflineSession {
+        let id = Id::from(2, "shared-worker".into());
+        let from = From::from_custom(Id::from(1, "publisher".into()));
+        let mut queued = Publish::from(CodecPublish {
+            dup: false,
+            retain: false,
+            qos: QoS::ExactlyOnce,
+            topic: "work/request".into(),
+            packet_id: None,
+            payload: bytes::Bytes::from_static(b"queued"),
+            properties: None,
+        });
+        queued.shared_delivery = Some(Arc::new(SharedDeliveryContext {
+            group: "workers".into(),
+            topic_filter: "work/#".into(),
+            source_qos: QoS::ExactlyOnce,
+            source_retain: false,
+            target_id: id.clone(),
+            subscription_generation: 11,
+        }));
+        let mut started = queued.clone();
+        started.packet_id = NonZeroU16::new(7);
+        OfflineSession::Exist(Some(OfflineInfo {
+            id,
+            subscriptions: Vec::new(),
+            offline_messages: std::collections::VecDeque::from([(from.clone(), queued)]),
+            inflight_messages: vec![OutInflightMessage::new(MomentStatus::UnReceived, from, started)],
+            created_at: 1,
+        }))
+    }
+
+    #[test]
+    fn shared_pull_reply_preserves_queued_context_but_never_marks_inflight_unstarted() {
+        let wire = MessageReply::KickWithShared(SharedOfflineSession::from_session(shared_pull_session()))
+            .encode()
+            .unwrap();
+        let MessageReply::KickWithShared(snapshot) = MessageReply::decode(&wire).unwrap() else {
+            panic!("expected versioned pull snapshot");
+        };
+        let OfflineSession::Exist(Some(offline)) = snapshot.restore().unwrap() else {
+            panic!("expected offline session");
+        };
+        let context = offline.offline_messages[0].1.shared_delivery.as_ref().unwrap();
+        assert_eq!(context.group, "workers");
+        assert_eq!(context.topic_filter, "work/#");
+        assert_eq!(context.subscription_generation, 11);
+        assert_eq!(context.target_id, offline.id);
+        assert!(offline.offline_messages[0].1.shared_delivery_not_started());
+        assert!(offline.inflight_messages[0].publish.shared_delivery.is_none());
+        assert_eq!(offline.inflight_messages[0].publish.packet_id, NonZeroU16::new(7));
+    }
+
+    #[test]
+    fn shared_pull_reply_rejects_misaligned_or_wrong_session_context() {
+        let mut snapshot = SharedOfflineSession::from_session(shared_pull_session());
+        snapshot.queued_contexts.clear();
+        assert!(snapshot.restore().is_err());
+
+        let mut snapshot = SharedOfflineSession::from_session(shared_pull_session());
+        snapshot.queued_contexts[0].as_mut().unwrap().target_id = Id::from(2, "another-worker".into());
+        assert!(snapshot.restore().is_err());
+
+        let mut snapshot = SharedOfflineSession::from_session(shared_pull_session());
+        snapshot.queued_contexts[0].as_mut().unwrap().topic_filter = "unrelated/#".into();
+        assert!(snapshot.restore().is_err());
+
+        let mut snapshot = SharedOfflineSession::from_session(shared_pull_session());
+        if let OfflineSession::Exist(Some(offline)) = &mut snapshot.session {
+            offline.offline_messages[0].1.packet_id = NonZeroU16::new(3);
+        }
+        assert!(snapshot.restore().is_err());
+    }
+
+    #[test]
+    fn shared_pull_variants_leave_legacy_grpc_discriminants_unchanged() {
+        let id = Id::from(2, "worker".into());
+        let legacy = Message::Kick(id.clone(), false, true, false).encode(99).unwrap();
+        assert_eq!(&legacy[8..12], &2u32.to_le_bytes());
+        let data = Message::Data(Vec::new()).encode(99).unwrap();
+        assert_eq!(&data[8..12], &13u32.to_le_bytes());
+        let pull = Message::KickWithShared(id, false, true, false).encode(99).unwrap();
+        assert_eq!(&pull[8..12], &14u32.to_le_bytes());
+        let legacy_reply = MessageReply::Kick(OfflineSession::NotExist).encode().unwrap();
+        assert_eq!(&legacy_reply[..4], &3u32.to_le_bytes());
+        let data_reply = MessageReply::Data(Vec::new()).encode().unwrap();
+        assert_eq!(&data_reply[..4], &14u32.to_le_bytes());
+        let pull_reply =
+            MessageReply::KickWithShared(SharedOfflineSession::from_session(OfflineSession::NotExist))
+                .encode()
+                .unwrap();
+        assert_eq!(&pull_reply[..4], &15u32.to_le_bytes());
+    }
 
     #[tokio::test]
     async fn request_once_deadline_includes_an_unresponsive_connection() {

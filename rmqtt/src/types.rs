@@ -9,6 +9,7 @@ use std::mem::{size_of, size_of_val};
 use std::net::SocketAddr;
 use std::num::{NonZeroU16, NonZeroU32};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -467,6 +468,7 @@ impl std::convert::From<SubscriptioRelationsCollector> for SubRelations {
         subs.extend(collector.v5_rels.into_iter().map(|(clientid, (topic_filter, opts, sub_ids, group))| {
             (topic_filter, clientid, opts, sub_ids, group)
         }));
+        subs.extend(collector.v5_shared_rels);
         subs
     }
 }
@@ -477,6 +479,7 @@ pub type SubscriptioRelationsCollectorMap = HashMap<NodeId, SubscriptioRelations
 #[derive(Debug, Default)]
 pub struct SubscriptioRelationsCollector {
     v3_rels: Vec<SubRelation>,
+    v5_shared_rels: Vec<SubRelation>,
     v5_rels: HashMap<
         ClientId,
         (TopicFilter, SubscriptionOptions, Option<Vec<SubscriptionIdentifier>>, Option<SharedGroupType>),
@@ -494,6 +497,12 @@ impl SubscriptioRelationsCollector {
     ) {
         if opts.is_v3() {
             self.v3_rels.push((topic_filter.clone(), client_id, opts, None, group));
+        } else if group.is_some() || opts.shared_group().is_some() {
+            // A shared subscription is a separate delivery obligation for
+            // each group and filter, even when the same client is selected.
+            // Keep it separate from ordinary V5 subscription aggregation.
+            let sub_ids = opts.subscription_identifier().map(|id| vec![id]);
+            self.v5_shared_rels.push((topic_filter.clone(), client_id, opts, sub_ids, group));
         } else {
             //MQTT V5: Subscription Identifiers
             self.v5_rels
@@ -512,6 +521,125 @@ impl SubscriptioRelationsCollector {
                     (topic_filter.clone(), opts, sub_ids, group)
                 });
         }
+    }
+}
+
+#[cfg(test)]
+mod subscription_relations_collector_tests {
+    use super::*;
+
+    fn v5_options(qos: QoS, group: Option<&str>, id: u32) -> SubscriptionOptions {
+        #[cfg(not(feature = "shared-subscription"))]
+        let _ = group;
+        SubscriptionOptions::V5(SubOptionsV5 {
+            qos,
+            #[cfg(feature = "shared-subscription")]
+            shared_group: group.map(SharedGroup::from),
+            #[cfg(feature = "limit-subscription")]
+            limit_subs: None,
+            no_local: false,
+            retain_as_published: false,
+            retain_handling: RetainHandling::AtSubscribe,
+            id: NonZeroU32::new(id),
+        })
+    }
+
+    #[test]
+    fn ordinary_v5_subscriptions_still_merge_identifiers_for_one_client() {
+        let mut collector = SubscriptioRelationsCollector::default();
+        for (filter, id) in [("sensor/#", 1), ("sensor/+/temperature", 2)] {
+            collector.add(
+                &TopicFilter::from(filter),
+                ClientId::from_static("consumer"),
+                v5_options(QoS::AtLeastOnce, None, id),
+                None,
+            );
+        }
+
+        let relations = SubRelations::from(collector);
+        assert_eq!(relations.len(), 1);
+        assert_eq!(relations[0].0, "sensor/#");
+        assert_eq!(relations[0].3, Some(vec![NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap()]));
+        assert!(relations[0].4.is_none());
+    }
+
+    #[test]
+    fn shared_v5_group_and_filter_obligations_survive_ordinary_client_aggregation() {
+        for ordinary_first in [true, false] {
+            let mut collector = SubscriptioRelationsCollector::default();
+            let client_id = ClientId::from_static("consumer");
+            let add_ordinary = |collector: &mut SubscriptioRelationsCollector| {
+                for (filter, id) in [("sensor/#", 1), ("sensor/+/temperature", 2)] {
+                    collector.add(
+                        &TopicFilter::from(filter),
+                        client_id.clone(),
+                        v5_options(QoS::AtLeastOnce, None, id),
+                        None,
+                    );
+                }
+            };
+            if ordinary_first {
+                add_ordinary(&mut collector);
+            }
+            for (filter, group, qos, id) in [
+                ("sensor/#", "workers-a", QoS::AtLeastOnce, 3),
+                ("sensor/#", "workers-b", QoS::ExactlyOnce, 4),
+                ("sensor/+/temperature", "workers-a", QoS::AtMostOnce, 5),
+            ] {
+                collector.add(
+                    &TopicFilter::from(filter),
+                    client_id.clone(),
+                    v5_options(qos, Some(group), id),
+                    Some((SharedGroup::from(group), true, vec![client_id.clone()])),
+                );
+            }
+            if !ordinary_first {
+                add_ordinary(&mut collector);
+            }
+
+            let relations = SubRelations::from(collector);
+            assert_eq!(relations.len(), 4);
+            let ordinary = relations.iter().find(|relation| relation.4.is_none()).unwrap();
+            assert_eq!(ordinary.3, Some(vec![NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap()]));
+            for (filter, group, qos, id) in [
+                ("sensor/#", "workers-a", QoS::AtLeastOnce, 3),
+                ("sensor/#", "workers-b", QoS::ExactlyOnce, 4),
+                ("sensor/+/temperature", "workers-a", QoS::AtMostOnce, 5),
+            ] {
+                let relation = relations
+                    .iter()
+                    .find(|relation| {
+                        relation.0 == filter && relation.4.as_ref().is_some_and(|shared| shared.0 == group)
+                    })
+                    .unwrap();
+                assert_eq!(relation.1, client_id);
+                assert_eq!(relation.2.qos(), qos);
+                assert_eq!(relation.3, Some(vec![NonZeroU32::new(id).unwrap()]));
+            }
+        }
+    }
+
+    #[cfg(feature = "shared-subscription")]
+    #[test]
+    fn shared_v5_options_do_not_merge_when_group_metadata_is_missing() {
+        let mut collector = SubscriptioRelationsCollector::default();
+        for (group, id) in [(None, 1), (Some("workers-a"), 2), (Some("workers-b"), 3)] {
+            collector.add(
+                &TopicFilter::from_static("sensor/#"),
+                ClientId::from_static("consumer"),
+                v5_options(QoS::ExactlyOnce, group, id),
+                None,
+            );
+        }
+
+        let relations = SubRelations::from(collector);
+        assert_eq!(relations.len(), 3);
+        let mut groups = relations
+            .iter()
+            .map(|relation| relation.2.shared_group().map(|group| &**group))
+            .collect::<Vec<_>>();
+        groups.sort();
+        assert_eq!(groups, vec![None, Some("workers-a"), Some("workers-b")]);
     }
 }
 
@@ -1186,6 +1314,21 @@ pub struct Publish {
 
     /// Message creation timestamp
     pub create_time: Option<i64>,
+
+    /// Local delivery ownership. Legacy wire packets deliberately omit this;
+    /// coordinated session handoff transports it in an explicit sidecar.
+    #[serde(skip)]
+    pub shared_delivery: Option<Arc<SharedDeliveryContext>>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct SharedDeliveryContext {
+    pub group: SharedGroup,
+    pub topic_filter: TopicFilter,
+    pub source_qos: QoS,
+    pub source_retain: bool,
+    pub target_id: Id,
+    pub subscription_generation: u64,
 }
 
 impl Publish {
@@ -1214,7 +1357,7 @@ impl Publish {
         delay_interval: Option<u32>,
         create_time: Option<i64>,
     ) -> Self {
-        Publish { inner, target_clientid, delay_interval, create_time }
+        Publish { inner, target_clientid, delay_interval, create_time, shared_delivery: None }
     }
 
     #[inline]
@@ -1230,6 +1373,33 @@ impl Publish {
     #[inline]
     pub fn take_payload(self) -> Bytes {
         self.inner.payload
+    }
+
+    /// Restore publisher attributes before selecting a different subscriber.
+    /// Keep the context until the recovery queue has accepted ownership.
+    pub fn restore_shared_delivery_source(&mut self) {
+        if let Some(context) = self.shared_delivery.clone() {
+            self.qos = context.source_qos;
+            self.retain = context.source_retain;
+            self.dup = false;
+            self.packet_id = None;
+            if let Some(properties) = &mut self.properties {
+                properties.subscription_ids.clear();
+            }
+        }
+    }
+
+    pub fn shared_delivery_not_started(&self) -> bool {
+        self.shared_delivery.is_some() && !self.dup && self.packet_id.is_none()
+    }
+
+    /// Rebind an already validated, unsent snapshot item after session takeover.
+    pub fn rebind_shared_delivery(&mut self, target_id: Id, subscription_generation: u64) {
+        if let Some(context) = &mut self.shared_delivery {
+            let context = Arc::make_mut(context);
+            context.target_id = target_id;
+            context.subscription_generation = subscription_generation;
+        }
     }
 }
 
@@ -1250,13 +1420,25 @@ impl DerefMut for Publish {
 
 impl std::convert::From<CodecPublish> for Publish {
     fn from(p: CodecPublish) -> Self {
-        Publish { inner: Box::new(p), target_clientid: None, delay_interval: None, create_time: None }
+        Publish {
+            inner: Box::new(p),
+            target_clientid: None,
+            delay_interval: None,
+            create_time: None,
+            shared_delivery: None,
+        }
     }
 }
 
 impl std::convert::From<Box<CodecPublish>> for Publish {
     fn from(p: Box<CodecPublish>) -> Self {
-        Publish { inner: p, target_clientid: None, delay_interval: None, create_time: None }
+        Publish {
+            inner: p,
+            target_clientid: None,
+            delay_interval: None,
+            create_time: None,
+            shared_delivery: None,
+        }
     }
 }
 
@@ -1992,6 +2174,8 @@ pub type SessionSubMap = HashMap<TopicFilter, SubscriptionOptions>;
 #[derive(Clone)]
 pub struct SessionSubs {
     subs: Arc<RwLock<SessionSubMap>>,
+    generations: Arc<parking_lot::RwLock<HashMap<TopicFilter, u64>>>,
+    next_generation: Arc<AtomicU64>,
 }
 
 impl Deref for SessionSubs {
@@ -2017,7 +2201,44 @@ impl SessionSubs {
     #[inline]
     #[allow(clippy::mutable_key_type)]
     pub fn from(subs: SessionSubMap) -> Self {
-        Self { subs: Arc::new(RwLock::new(subs)) }
+        let generations = subs
+            .iter()
+            .filter(|(_, opts)| opts.shared_group().is_some())
+            .map(|(filter, _)| (filter.clone(), 1))
+            .collect();
+        Self {
+            subs: Arc::new(RwLock::new(subs)),
+            generations: Arc::new(parking_lot::RwLock::new(generations)),
+            next_generation: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Read subscription membership and its epoch under the same session lock.
+    pub async fn shared_delivery_generation(&self, topic_filter: &str, group: &str) -> Option<u64> {
+        let subs = self.subs.read().await;
+        let opts = subs.get(topic_filter)?;
+        if opts.shared_group().is_none_or(|current| &**current != group) {
+            return None;
+        }
+        self.generations.read().get(topic_filter).copied()
+    }
+
+    /// Cheap enqueue snapshot. The owning actor checks group membership and
+    /// this epoch together before first transmission during maintenance.
+    pub fn shared_delivery_enqueue_generation(&self, topic_filter: &str) -> u64 {
+        self.generations.read().get(topic_filter).copied().unwrap_or(0)
+    }
+
+    pub fn shared_delivery_generations(&self) -> Vec<(TopicFilter, u64)> {
+        self.generations.read().iter().map(|(filter, generation)| (filter.clone(), *generation)).collect()
+    }
+
+    /// Only for installing a frozen session snapshot before its mailbox opens.
+    pub fn restore_shared_delivery_generations(&self, generations: &[(TopicFilter, u64)]) {
+        for (filter, generation) in generations {
+            self.generations.write().insert(filter.clone(), *generation);
+            self.next_generation.fetch_max(*generation, Ordering::Relaxed);
+        }
     }
 
     #[inline]
@@ -2033,6 +2254,12 @@ impl SessionSubs {
 
         let prev = {
             let mut subs = self.subs.write().await;
+            if opts.shared_group().is_some() {
+                let generation = self.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                self.generations.write().insert(topic_filter.clone(), generation);
+            } else {
+                self.generations.write().remove(&topic_filter);
+            }
             let prev = subs.insert(topic_filter, opts);
             subs.shrink_to_fit();
             prev
@@ -2074,6 +2301,7 @@ impl SessionSubs {
         let removed = {
             let mut subs = self.subs.write().await;
             let removed = subs.remove_entry(topic_filter);
+            self.generations.write().remove(topic_filter);
             subs.shrink_to_fit();
             removed
         };
@@ -2128,6 +2356,7 @@ impl SessionSubs {
         }
         let mut subs = self.subs.write().await;
         subs.clear();
+        self.generations.write().clear();
         subs.shrink_to_fit();
     }
 
@@ -2969,4 +3198,78 @@ fn relocated_session_keeps_connection_epoch() {
     assert_eq!(relocated.lid, source.lid);
     assert_eq!(relocated.client_id, source.client_id);
     assert_eq!(relocated.create_time, source.create_time);
+}
+
+#[cfg(test)]
+mod shared_delivery_tests {
+    use super::*;
+
+    fn queued_publish() -> Publish {
+        let mut publish = Publish::from(CodecPublish {
+            dup: false,
+            retain: false,
+            qos: QoS::AtMostOnce,
+            topic: "work/request".into(),
+            packet_id: None,
+            payload: Bytes::from_static(b"payload"),
+            properties: Some(PublishProperties {
+                subscription_ids: vec![NonZeroU32::new(3).unwrap()],
+                ..Default::default()
+            }),
+        });
+        publish.shared_delivery = Some(Arc::new(SharedDeliveryContext {
+            group: "workers".into(),
+            topic_filter: "work/#".into(),
+            source_qos: QoS::ExactlyOnce,
+            source_retain: true,
+            target_id: Id::from(1, "worker".into()),
+            subscription_generation: 2,
+        }));
+        publish
+    }
+
+    #[test]
+    fn shared_context_keeps_legacy_publish_wire_bytes() {
+        let publish = queued_publish();
+        let with_context = bincode::serialize(&publish).unwrap();
+        let mut plain = publish.clone();
+        plain.shared_delivery = None;
+        assert_eq!(with_context, bincode::serialize(&plain).unwrap());
+        let decoded: Publish = bincode::deserialize(&with_context).unwrap();
+        assert!(decoded.shared_delivery.is_none());
+        assert_eq!(decoded.payload, publish.payload);
+    }
+
+    #[test]
+    fn restoring_shared_source_removes_old_subscriber_attributes() {
+        let mut publish = queued_publish();
+        publish.restore_shared_delivery_source();
+        assert_eq!(publish.qos, QoS::ExactlyOnce);
+        assert!(publish.retain);
+        assert!(publish.properties.as_ref().unwrap().subscription_ids.is_empty());
+        assert!(publish.shared_delivery_not_started());
+        publish.packet_id = NonZeroU16::new(17);
+        assert!(!publish.shared_delivery_not_started());
+        publish.packet_id = None;
+        publish.dup = true;
+        assert!(!publish.shared_delivery_not_started());
+    }
+
+    #[cfg(feature = "shared-subscription")]
+    #[tokio::test]
+    async fn unsubscribe_resubscribe_changes_shared_generation() {
+        let scx = ServerContext::new().busy_check_enable(false).build().await;
+        let subs = SessionSubs::new();
+        let filter = TopicFilter::from_static("work/#");
+        let opts = SubscriptionOptions::from((QoS::ExactlyOnce, Some("workers".into()), None));
+        subs._add(&scx, filter.clone(), opts.clone()).await;
+        let first = subs.shared_delivery_generation(&filter, "workers").await.unwrap();
+        assert_eq!(subs.shared_delivery_enqueue_generation(&filter), first);
+        assert!(subs.shared_delivery_generation(&filter, "other-workers").await.is_none());
+        subs._remove(&scx, &filter).await;
+        assert_eq!(subs.shared_delivery_enqueue_generation(&filter), 0);
+        assert!(subs.shared_delivery_generation(&filter, "workers").await.is_none());
+        subs._add(&scx, filter.clone(), opts).await;
+        assert_ne!(subs.shared_delivery_generation(&filter, "workers").await, Some(first));
+    }
 }

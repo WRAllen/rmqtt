@@ -108,6 +108,21 @@ pub trait Entry: Sync + Send {
 
 #[async_trait]
 pub trait Shared: Sync + Send {
+    /// Recovery is activated only during coordinated maintenance.
+    fn shared_delivery_recovery_enabled(&self) -> bool {
+        false
+    }
+
+    /// Move an unsent shared delivery into a queue that retains responsibility
+    /// until a currently eligible member can accept it. Err returns ownership.
+    async fn recover_shared_delivery(
+        &self,
+        from: From,
+        publish: Publish,
+    ) -> std::result::Result<(), (From, Publish, Reason)> {
+        Err((from, publish, Reason::from_static("shared delivery recovery is unavailable")))
+    }
+
     /// Entry of the id
     fn entry(&self, id: Id) -> Box<dyn Entry>;
 
@@ -751,7 +766,7 @@ impl Shared for DefaultShared {
     ) -> std::result::Result<(), Vec<(To, From, Publish, Reason)>> {
         let mut errs = Vec::new();
 
-        for (topic_filter, client_id, opts, sub_ids, _) in relations.drain(..) {
+        for (topic_filter, client_id, opts, sub_ids, shared_group) in relations.drain(..) {
             let retain = if let Some(retain_as_published) = opts.retain_as_published() {
                 //MQTT V5: Retain As Publish
                 if retain_as_published {
@@ -775,8 +790,18 @@ impl Shared for DefaultShared {
             }
             // p.properties.subscription_ids = sub_ids;
 
-            let (tx, to) = if let Some((tx, to)) = self.tx(&client_id) {
-                (tx, to)
+            let group = shared_group.map(|(group, _, _)| group).or_else(|| opts.shared_group().cloned());
+            let target = if group.is_some() {
+                // Capture the mailbox and subscription owner from one peer
+                // snapshot; never hold a DashMap guard across an await.
+                self.peers
+                    .get(&client_id)
+                    .map(|peer| (peer.tx.clone(), peer.s.id.clone(), Some(peer.s.clone())))
+            } else {
+                self.tx(&client_id).map(|(tx, to)| (tx, to, None))
+            };
+            let (tx, to, target_session) = if let Some(target) = target {
+                target
             } else {
                 log::debug!(
                     "forwards_to failed, from:{:?}, to:{:?}, topic_filter:{:?}, topic:{:?}, reason: the client has disconnected.",
@@ -786,13 +811,36 @@ impl Shared for DefaultShared {
                     publish.topic
                 );
                 errs.push((
-                    To::from(0, client_id),
+                    To::from(self.context().node.id(), client_id),
                     from.clone(),
                     p,
                     Reason::from_static("the client has disconnected"),
                 ));
                 continue;
             };
+
+            if let Some(group) = group {
+                let source_qos = publish.shared_delivery.as_ref().map_or(publish.qos, |c| c.source_qos);
+                let source_retain =
+                    publish.shared_delivery.as_ref().map_or(publish.retain, |c| c.source_retain);
+                let generation =
+                    match target_session.expect("shared target has a session").subscriptions().await {
+                        Ok(subscriptions) => {
+                            Some(subscriptions.shared_delivery_enqueue_generation(&topic_filter))
+                        }
+                        Err(_) => None,
+                    };
+                p.shared_delivery = Some(Arc::new(SharedDeliveryContext {
+                    group,
+                    topic_filter: topic_filter.clone(),
+                    source_qos,
+                    source_retain,
+                    target_id: to.clone(),
+                    subscription_generation: generation.unwrap_or(0),
+                }));
+            } else {
+                p.shared_delivery = None;
+            }
 
             if let Err(e) = tx.unbounded_send(Message::Forward(from.clone(), p)) {
                 log::warn!(
@@ -941,5 +989,59 @@ impl Iterator for DefaultIter<'_> {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod forwarding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn missing_local_session_failure_preserves_target_node_and_delivery() {
+        // A remote publisher's node is not the node that attempted this local
+        // delivery. The drain fallback needs the latter to verify ownership.
+        let from = From::from_custom(Id::from(99, "publisher".into()));
+        let publish = Publish::from(CodecPublish {
+            dup: true,
+            retain: true,
+            qos: QoS::ExactlyOnce,
+            topic: "test/missing-session".into(),
+            packet_id: std::num::NonZeroU16::new(12),
+            payload: bytes::Bytes::from_static(b"not-enqueued"),
+            properties: None,
+        });
+
+        for local_node_id in [7, 19] {
+            let scx = ServerContext::new().busy_check_enable(false).node_id(local_node_id).build().await;
+            let shared = DefaultShared::new(Some(scx));
+            let client_id = ClientId::from("moved-subscriber");
+            let mut opts = SubscriptionOptions::default();
+            opts.set_qos(QoS::AtLeastOnce);
+            let relations = vec![("test/#".into(), client_id.clone(), opts, None, None)];
+
+            let mut errors = shared
+                .forwards_to(from.clone(), &publish, relations)
+                .await
+                .expect_err("a missing local session must remain a forwarding failure");
+            assert_eq!(errors.len(), 1);
+            let (to, failed_from, failed_publish, reason) = errors.remove(0);
+
+            assert_eq!(to.node_id, local_node_id);
+            assert_eq!(to.client_id, client_id);
+            assert_eq!(failed_from.id.node_id, 99);
+            assert_eq!(failed_from.id.client_id, from.id.client_id);
+            assert_eq!(failed_publish.topic, publish.topic);
+            assert_eq!(failed_publish.payload, publish.payload);
+            assert_eq!(failed_publish.qos, QoS::AtLeastOnce);
+            assert!(!failed_publish.dup);
+            assert!(!failed_publish.retain);
+            assert!(failed_publish.packet_id.is_none());
+            assert!(matches!(reason, Reason::Error(message) if message == "the client has disconnected"));
+        }
+
+        assert!(publish.dup);
+        assert!(publish.retain);
+        assert_eq!(publish.qos, QoS::ExactlyOnce);
+        assert_eq!(publish.packet_id, std::num::NonZeroU16::new(12));
     }
 }
