@@ -386,6 +386,10 @@ impl Drop for InInflight {
 }
 
 impl InInflight {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cached.is_empty()
+    }
+
     pub(crate) fn new(scx: ServerContext, max_inflight: u16) -> Self {
         Self { cached: BTreeSet::default(), scx, max_inflight }
     }

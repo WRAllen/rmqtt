@@ -71,6 +71,7 @@ struct State {
     leader: i32,
     requests: Vec<(i32, Value)>,
     fail_prepare: usize,
+    client_drain_waits: usize,
     fail_leave: usize,
     slow_status: Option<i32>,
     persisted_batches: Vec<Value>,
@@ -179,6 +180,26 @@ impl State {
                     return (
                         200,
                         json!({"ok":true,"reliable_handoff":true,"allowedTargetNodeIds":body["allowedTargetNodeIds"]}),
+                    );
+                }
+                "prepare_client_drain" => {
+                    assert_eq!(body["coordinatorEpoch"], body["expectedPodUid"]);
+                    return (
+                        200,
+                        json!({"ok":true,"phase":"preparing","coordinatorEpoch":body["coordinatorEpoch"]}),
+                    );
+                }
+                "client_drain_status" => {
+                    if self.client_drain_waits > 0 {
+                        self.client_drain_waits -= 1;
+                        return (
+                            200,
+                            json!({"ok":true,"phase":"preparing","coordinatorEpoch":body["coordinatorEpoch"]}),
+                        );
+                    }
+                    return (
+                        200,
+                        json!({"ok":true,"phase":"ready","coordinatorEpoch":body["coordinatorEpoch"]}),
                     );
                 }
                 "transfer_leader" => self.leader = body["id"].as_i64().unwrap() as i32,
@@ -320,6 +341,7 @@ impl Fixture {
             leader: 2,
             requests: vec![],
             fail_prepare: 1,
+            client_drain_waits: 0,
             fail_leave: 1,
             slow_status: None,
             persisted_batches: Vec::new(),
@@ -446,6 +468,58 @@ impl Fixture {
         }
         panic!("batch did not finish: {}", self.state.lock().unwrap().status);
     }
+}
+
+#[tokio::test]
+async fn externally_deleted_pod_waits_for_client_ready_before_broker_drain() {
+    let fixture = Fixture::new();
+    {
+        let mut state = fixture.state.lock().unwrap();
+        state.fail_prepare = 0;
+        state.fail_leave = 0;
+        state.client_drain_waits = 2;
+    }
+    let mut started = false;
+    for _ in 0..12 {
+        {
+            let mut state = fixture.state.lock().unwrap();
+            if let Some(targets) = state
+                .status
+                .get_mut("externalTerminationBatch")
+                .and_then(|batch| batch.get_mut("targets"))
+                .and_then(Value::as_array_mut)
+            {
+                for target in targets {
+                    if target["phase"] == "WaitingEndpointRemoval" {
+                        target["endpointAbsentSince"] =
+                            json!((Utc::now() - chrono::Duration::seconds(60)).to_rfc3339());
+                    }
+                }
+            }
+        }
+        fixture.round().await;
+        let state = fixture.state.lock().unwrap();
+        if state.requests.iter().any(|(_, request)| request["action"] == "prepare_client_drain") {
+            started = true;
+            assert!(!state.requests.iter().any(|(_, request)| request["action"] == "drain"));
+            assert_eq!(state.status["externalTerminationBatch"]["targets"][0]["phase"], "WaitingClientDrain");
+            break;
+        }
+    }
+    assert!(started, "external deletion never started the client drain handshake");
+    for _ in 0..2 {
+        fixture.round().await;
+        let state = fixture.state.lock().unwrap();
+        assert!(!state.requests.iter().any(|(_, request)| request["action"] == "drain"));
+    }
+    fixture.round().await;
+    let state = fixture.state.lock().unwrap();
+    let started_at =
+        state.requests.iter().position(|(_, request)| request["action"] == "prepare_client_drain").unwrap();
+    let ready_at =
+        state.requests.iter().rposition(|(_, request)| request["action"] == "client_drain_status").unwrap();
+    let drained_at = state.requests.iter().position(|(_, request)| request["action"] == "drain").unwrap();
+    assert!(started_at < ready_at && ready_at < drained_at);
 }
 
 #[test]

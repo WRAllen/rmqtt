@@ -71,6 +71,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 #[allow(unused_imports)]
 use bitflags::Flags;
+use bytes::Bytes;
 use bytestring::ByteString;
 use futures::channel::mpsc::unbounded;
 use futures::StreamExt;
@@ -103,6 +104,9 @@ pub struct SessionState {
     pub server_topic_aliases: Option<Arc<ServerTopicAliases>>,
     pub client_topic_aliases: Option<Arc<ClientTopicAliases>>,
     in_inflight: InInflight,
+    drain_handshake: Option<(String, tokio::sync::oneshot::Sender<()>)>,
+    current_drain_id: Option<String>,
+    drain_ready: bool,
 }
 
 impl fmt::Debug for SessionState {
@@ -167,6 +171,9 @@ impl SessionState {
             server_topic_aliases,
             client_topic_aliases,
             in_inflight: InInflight::new(scx, max_inflight.get()),
+            drain_handshake: None,
+            current_drain_id: None,
+            drain_ready: false,
         }
     }
 
@@ -768,6 +775,44 @@ impl SessionState {
         Io: AsyncRead + AsyncWrite + Unpin,
     {
         match msg {
+            Message::PrepareDrain(sender, drain_id) => {
+                if !matches!(sink, Sink::V5(_)) || self.drain_ready {
+                    return Err(Reason::ProtocolError(
+                        "coordinated drain requires a live MQTT 5 session".into(),
+                    ));
+                }
+                // This is a direct session packet, deliberately bypassing shared
+                // subscription routing and the quiesced business delivery path.
+                let notice = CodecPublish {
+                    dup: false,
+                    retain: false,
+                    qos: QoS::AtMostOnce,
+                    topic: "$ams/drain/prepare".into(),
+                    packet_id: None,
+                    payload: Bytes::from(drain_id.clone()),
+                    properties: Some(Default::default()),
+                };
+                sink.publish(notice.into(), None, None).await?;
+                self.current_drain_id = Some(drain_id.clone());
+                self.drain_handshake = Some((drain_id, sender));
+            }
+            Message::CancelDrain => {
+                let is_v5 = matches!(sink, Sink::V5(_));
+                if let Some(drain_id) = self.current_drain_id.take().filter(|_| is_v5) {
+                    let resume = CodecPublish {
+                        dup: false,
+                        retain: false,
+                        qos: QoS::AtMostOnce,
+                        topic: "$ams/drain/resume".into(),
+                        packet_id: None,
+                        payload: Bytes::from(drain_id),
+                        properties: Some(Default::default()),
+                    };
+                    sink.publish(resume.into(), None, None).await?;
+                }
+                self.drain_handshake = None;
+                self.drain_ready = false;
+            }
             Message::Forward(from, p) => {
                 self.queue_owned_forward(from, p, deliver_queue_tx).await;
             }
@@ -1118,6 +1163,48 @@ impl SessionState {
     where
         Io: AsyncRead + AsyncWrite + Unpin,
     {
+        if publish.topic.as_bytes().as_ref() == b"$ams/drain/ready" {
+            let Some((drain_id, _)) = &self.drain_handshake else {
+                return Err(Reason::ProtocolError("unexpected drain acknowledgement".into()));
+            };
+            if publish.qos != QoS::AtLeastOnce
+                || publish.payload.as_ref() != drain_id.as_bytes()
+                || !self.in_inflight.is_empty()
+            {
+                return Err(Reason::ProtocolError("invalid or premature drain acknowledgement".into()));
+            }
+            let packet_id = Self::packet_id(publish.packet_id)?;
+            sink.send_publish_ack(packet_id, PublishResult::success()).await?;
+            self.drain_ready = true;
+            if let Some((_, sender)) = self.drain_handshake.take() {
+                let _ = sender.send(());
+            }
+            return Ok(());
+        }
+        if publish.topic.as_bytes().as_ref() == b"$ams/drain/fence" {
+            let Some((drain_id, _)) = &self.drain_handshake else {
+                return Err(Reason::ProtocolError("unexpected drain fence".into()));
+            };
+            if publish.qos != QoS::AtLeastOnce || publish.payload.as_ref() != drain_id.as_bytes() {
+                return Err(Reason::ProtocolError("invalid drain fence".into()));
+            }
+            let packet_id = Self::packet_id(publish.packet_id)?;
+            sink.send_publish_ack(packet_id, PublishResult::success()).await?;
+            let fence_ack = CodecPublish {
+                dup: false,
+                retain: false,
+                qos: QoS::AtMostOnce,
+                topic: "$ams/drain/fence_ack".into(),
+                packet_id: None,
+                payload: Bytes::from(drain_id.clone()),
+                properties: Some(Default::default()),
+            };
+            sink.publish(fence_ack.into(), None, None).await?;
+            return Ok(());
+        }
+        if self.drain_ready {
+            return Err(Reason::ProtocolError("business publish after drain acknowledgement".into()));
+        }
         let packet_id = publish.packet_id;
         let qos = publish.qos;
 

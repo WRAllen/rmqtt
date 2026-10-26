@@ -2109,6 +2109,11 @@ impl StoredMessage {
 pub enum Message {
     Forward(From, Publish),
     SendRerelease(OutInflightMessage),
+    /// Ask an opt-in MQTT 5 client to finish work on this physical connection.
+    /// The reply is sent only after the matching in-band ready PUBLISH arrives.
+    PrepareDrain(oneshot::Sender<()>, String),
+    /// Resume an opt-in connection after the operator rolls back a drain.
+    CancelDrain,
     Kick(oneshot::Sender<()>, Id, CleanStart, IsAdmin),
     /// Disconnect the network connection for a planned broker drain while
     /// keeping the MQTT session alive in its offline event loop. Unlike
