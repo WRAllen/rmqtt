@@ -183,10 +183,17 @@ impl State {
                     );
                 }
                 "prepare_client_drain" => {
-                    assert_eq!(body["coordinatorEpoch"], body["expectedPodUid"]);
+                    if body.get("coordinatorEpoch").is_some() {
+                        assert_eq!(body["coordinatorEpoch"], body["expectedPodUid"]);
+                        return (
+                            200,
+                            json!({"ok":true,"phase":"preparing","coordinatorEpoch":body["coordinatorEpoch"]}),
+                        );
+                    }
+                    self.events.push("client-prepared".into());
                     return (
                         200,
-                        json!({"ok":true,"phase":"preparing","coordinatorEpoch":body["coordinatorEpoch"]}),
+                        json!({"ok":true,"drainId":"planned-test","coordinatedClients":1,"legacyClients":0}),
                     );
                 }
                 "client_drain_status" => {
@@ -292,6 +299,9 @@ impl State {
                     pod["status"]["conditions"] = json!([]);
                 }
                 if method == "PATCH" {
+                    if body["metadata"]["labels"]["rmqtt.io/draining"] == "true" {
+                        self.events.push("client-endpoint-removed".into());
+                    }
                     if body["metadata"].get("finalizers").is_some() {
                         self.events.push(format!("pod-finalizer-{id}"));
                     }
@@ -468,6 +478,33 @@ impl Fixture {
         }
         panic!("batch did not finish: {}", self.state.lock().unwrap().status);
     }
+}
+
+#[tokio::test]
+async fn planned_rollout_prepares_connected_clients_before_endpoint_removal() {
+    let fixture = Fixture::new();
+    fixture.state.lock().unwrap().fail_prepare = 0;
+    let cluster = fixture.cluster(5);
+
+    TEST_BROKER_URL
+        .scope(
+            fixture.kube.base_url.clone(),
+            prepare_node_for_drain_with_operation(
+                &fixture.kube,
+                "test",
+                &cluster,
+                5,
+                5,
+                &DrainOperation::Rollout,
+            ),
+        )
+        .await
+        .unwrap();
+
+    let state = fixture.state.lock().unwrap();
+    let position = |event: &str| state.events.iter().position(|saved| saved == event).unwrap();
+    assert!(position("client-prepared") < position("client-endpoint-removed"));
+    assert!(state.requests.iter().any(|(_, request)| request["action"] == "drain"));
 }
 
 #[tokio::test]

@@ -88,9 +88,10 @@ non-Leader pods before the current Leader. For every pod it:
 
 ```text
 prepare reliable handoff on every broker (new forwards receive delivery IDs)
--> quiesce new sessions, exclude from client Service and wait for EndpointSlice removal
--> wait for plain forwards to finish -> activate target avoidance
+-> quiesce new sessions while keeping existing client connections available
 -> notify capable MQTT 5 clients, confirm their FIFO fences and ready replies
+-> exclude from client Service and wait for EndpointSlice removal
+-> wait for plain forwards to finish -> activate target avoidance
 -> drain local work and wait for handoff/routing barriers
 -> leave Raft and business membership -> delete only that Pod
 -> StatefulSet recreates it from the target template

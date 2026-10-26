@@ -9024,28 +9024,9 @@ async fn prepare_node_for_drain_with_operation(
         .await
         .map_err(|error| NodeDrainError::from_action(NodeDrainStage::StartQuiesce, error))?;
 
-    // Stop new Service traffic and wait for EndpointSlice convergence before
-    // disconnecting established clients. Existing TCP sessions remain usable
-    // during this short propagation window.
-    patch_pod_draining(kube, namespace, &pod)
-        .await
-        .map_err(|error| NodeDrainError::new(NodeDrainStage::RemoveClientEndpoint, error.to_string()))?;
-    wait_for_client_endpoint_removal(
-        kube,
-        namespace,
-        name,
-        &pod,
-        cluster.spec.raft.endpoint_removal_stable_seconds,
-    )
-    .await
-    .map_err(|error| NodeDrainError::new(NodeDrainStage::RemoveClientEndpoint, error.to_string()))?;
-
-    // Arm remote senders before the target is disconnected. From this point
-    // all traffic that still resolves to the old owner is held by the reliable
-    // handoff queue until the relocated session is installed on a peer.
-    activate_reliable_handoff(namespace, cluster, replicas, node_id)
-        .await
-        .map_err(|error| NodeDrainError::new(NodeDrainStage::ActivateHandoff, error.to_string()))?;
+    // Prepare connected clients while their original Service path is still
+    // available. Endpoint removal can close existing TCP connections in some
+    // networks, leaving nobody to receive the planned-drain notice.
     let prepared = try_rmqtt_action_value_with_payload(
         namespace,
         cluster,
@@ -9065,6 +9046,25 @@ async fn prepare_node_for_drain_with_operation(
         cluster.metadata.name,
         prepared["drainId"], prepared["coordinatedClients"], prepared["legacyClients"],
     );
+
+    // Once capable clients have stopped publishing and acknowledged their
+    // outbound QoS work, remove the broker from new Service traffic. Arm
+    // remote handoff before disconnecting those existing connections.
+    patch_pod_draining(kube, namespace, &pod)
+        .await
+        .map_err(|error| NodeDrainError::new(NodeDrainStage::RemoveClientEndpoint, error.to_string()))?;
+    wait_for_client_endpoint_removal(
+        kube,
+        namespace,
+        name,
+        &pod,
+        cluster.spec.raft.endpoint_removal_stable_seconds,
+    )
+    .await
+    .map_err(|error| NodeDrainError::new(NodeDrainStage::RemoveClientEndpoint, error.to_string()))?;
+    activate_reliable_handoff(namespace, cluster, replicas, node_id)
+        .await
+        .map_err(|error| NodeDrainError::new(NodeDrainStage::ActivateHandoff, error.to_string()))?;
     try_rmqtt_action_value_with_payload(namespace, cluster, node_id, json!({"action": "drain"}))
         .await
         .map_err(|error| NodeDrainError::from_action(NodeDrainStage::StartDrain, error))?;
