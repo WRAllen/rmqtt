@@ -9060,6 +9060,11 @@ async fn prepare_node_for_drain_with_operation(
             format!("client drain was not acknowledged: {prepared}"),
         ));
     }
+    log::info!(
+        "ams_mqtt_drain stage=operator_clients_ready namespace={namespace} cluster={} node_id={node_id} drain_id={} coordinated_clients={} legacy_clients={}",
+        cluster.metadata.name,
+        prepared["drainId"], prepared["coordinatedClients"], prepared["legacyClients"],
+    );
     try_rmqtt_action_value_with_payload(namespace, cluster, node_id, json!({"action": "drain"}))
         .await
         .map_err(|error| NodeDrainError::from_action(NodeDrainStage::StartDrain, error))?;

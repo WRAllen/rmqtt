@@ -1331,7 +1331,114 @@ pub struct SharedDeliveryContext {
     pub subscription_generation: u64,
 }
 
+/// Correlation fields supplied by AMS MQTT publishers. No payload is inspected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AmsDeliveryProbe {
+    pub request_id: String,
+    pub kind: &'static str,
+    pub fragment_index: Option<String>,
+    pub nonce_start: Option<String>,
+    pub nonce_end: Option<String>,
+    pub is_final: bool,
+}
+
+impl AmsDeliveryProbe {
+    /// Enable full per-request tracing only for a diagnostic rollout. Control
+    /// handshake records remain available without this high-volume switch.
+    pub fn trace_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("RMQTT_AMS_DELIVERY_TRACE")
+                .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE"))
+        })
+    }
+
+    pub fn should_trace(&self) -> bool {
+        Self::trace_enabled()
+    }
+}
+
+#[cfg(test)]
+mod ams_delivery_probe_tests {
+    use super::*;
+
+    fn publish(properties: &[(&str, &str)]) -> Publish {
+        CodecPublish {
+            dup: false,
+            retain: false,
+            qos: QoS::ExactlyOnce,
+            topic: ByteString::from_static("studio/ams/test"),
+            packet_id: NonZeroU16::new(7),
+            payload: Bytes::new(),
+            properties: Some(PublishProperties {
+                user_properties: properties
+                    .iter()
+                    .map(|(key, value)| (ByteString::from(*key), ByteString::from(*value)))
+                    .collect(),
+                ..Default::default()
+            }),
+        }
+        .into()
+    }
+
+    #[test]
+    fn request_and_response_metadata_are_correlated_without_payload() {
+        let request = publish(&[("ams_request_id", "request-1"), ("ams_fragment_index", "0")]);
+        let probe = request.ams_delivery_probe().unwrap();
+        assert_eq!(probe.request_id, "request-1");
+        assert_eq!(probe.fragment_index.as_deref(), Some("0"));
+
+        let response = publish(&[
+            ("ams_response_request_id", "request-1"),
+            ("ams_response_nonce_start", "25"),
+            ("ams_response_nonce_end", "26"),
+            ("ams_response_final", "true"),
+        ]);
+        let probe = response.ams_delivery_probe().unwrap();
+        assert_eq!(probe.nonce_start.as_deref(), Some("25"));
+        assert_eq!(probe.nonce_end.as_deref(), Some("26"));
+        assert!(probe.is_final);
+
+        let response = publish(&[
+            ("ams_response_request_id", "request-1"),
+            ("ams_response_nonce_start", "24"),
+            ("ams_response_nonce_end", "24"),
+            ("ams_response_final", "false"),
+        ]);
+        let probe = response.ams_delivery_probe().unwrap();
+        assert_eq!(probe.nonce_start.as_deref(), Some("24"));
+        assert!(!probe.is_final);
+    }
+}
+
 impl Publish {
+    pub fn ams_delivery_probe(&self) -> Option<AmsDeliveryProbe> {
+        let properties = &self.properties.as_ref()?.user_properties;
+        let get = |name: &str| {
+            properties.iter().find_map(|(key, value)| {
+                (<ByteString as AsRef<str>>::as_ref(key) == name).then(|| value.to_string())
+            })
+        };
+        if let Some(request_id) = get("ams_request_id") {
+            return Some(AmsDeliveryProbe {
+                request_id,
+                kind: "request",
+                fragment_index: get("ams_fragment_index"),
+                nonce_start: None,
+                nonce_end: None,
+                is_final: false,
+            });
+        }
+        Some(AmsDeliveryProbe {
+            request_id: get("ams_response_request_id")?,
+            kind: "response",
+            fragment_index: get("ams_response_fragment_index"),
+            nonce_start: get("ams_response_nonce_start"),
+            nonce_end: get("ams_response_nonce_end"),
+            is_final: get("ams_response_final").as_deref() == Some("true"),
+        })
+    }
+
     #[inline]
     pub fn target_clientid(mut self, target_clientid: ClientId) -> Self {
         self.target_clientid = Some(target_clientid);

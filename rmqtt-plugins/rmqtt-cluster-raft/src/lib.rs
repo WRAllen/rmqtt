@@ -1200,6 +1200,10 @@ impl ClusterPlugin {
         progress.result = None;
         let status = progress.status();
         drop(progress);
+        log::info!(
+            "ams_mqtt_drain stage=external_client_prepare_started node_id={} coordinator_epoch={epoch}",
+            self.scx.node.id(),
+        );
 
         let shared = self.shared.clone();
         let draining = self.draining.clone();
@@ -1210,6 +1214,15 @@ impl ClusterPlugin {
             let result = Self::run_client_drain(shared, draining, disconnecting, node_id)
                 .await
                 .map_err(|error| error.to_string());
+            match &result {
+                Ok(value) => log::info!(
+                    "ams_mqtt_drain stage=external_client_prepare_ready node_id={node_id} coordinator_epoch={epoch} drain_id={} coordinated_clients={} legacy_clients={}",
+                    value["drainId"], value["coordinatedClients"], value["legacyClients"],
+                ),
+                Err(error) => log::warn!(
+                    "ams_mqtt_drain stage=external_client_prepare_failed node_id={node_id} coordinator_epoch={epoch} error={error}",
+                ),
+            }
             let mut progress = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if progress.epoch.as_deref() == Some(epoch.as_str()) {
                 progress.result = Some(result);
@@ -1268,6 +1281,11 @@ impl ClusterPlugin {
             let (sender, receiver) = oneshot::channel();
             tx.unbounded_send(SessionMessage::PrepareDrain(sender, drain_id.clone()))
                 .map_err(|error| anyhow!("send drain notice to {}: {error}", entry.id().client_id))?;
+            log::info!(
+                "ams_mqtt_drain stage=notice_queued node_id={} client_id={} drain_id={drain_id}",
+                node_id,
+                entry.id().client_id,
+            );
             acknowledgements.push((entry.id().client_id.to_string(), receiver));
         }
         let coordinated = acknowledgements.len();
@@ -1280,6 +1298,10 @@ impl ClusterPlugin {
         for result in futures::future::join_all(waits).await {
             result?;
         }
+        log::info!(
+            "ams_mqtt_drain stage=clients_ready node_id={} drain_id={drain_id} coordinated_clients={coordinated} legacy_clients={legacy}",
+            node_id,
+        );
         Ok(
             json!({"ok": true, "drainId": drain_id, "coordinatedClients": coordinated, "legacyClients": legacy}),
         )

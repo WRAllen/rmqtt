@@ -793,6 +793,11 @@ impl SessionState {
                     properties: Some(Default::default()),
                 };
                 sink.publish(notice.into(), None, None).await?;
+                log::info!(
+                    "ams_mqtt_drain stage=notice_sent node_id={} client_id={} drain_id={drain_id}",
+                    self.id.node_id,
+                    self.id.client_id,
+                );
                 self.current_drain_id = Some(drain_id.clone());
                 self.drain_handshake = Some((drain_id, sender));
             }
@@ -805,10 +810,15 @@ impl SessionState {
                         qos: QoS::AtMostOnce,
                         topic: "$ams/drain/resume".into(),
                         packet_id: None,
-                        payload: Bytes::from(drain_id),
+                        payload: Bytes::from(drain_id.clone()),
                         properties: Some(Default::default()),
                     };
                     sink.publish(resume.into(), None, None).await?;
+                    log::info!(
+                        "ams_mqtt_drain stage=resume_sent node_id={} client_id={} drain_id={drain_id}",
+                        self.id.node_id,
+                        self.id.client_id,
+                    );
                 }
                 self.drain_handshake = None;
                 self.drain_ready = false;
@@ -1175,6 +1185,10 @@ impl SessionState {
             }
             let packet_id = Self::packet_id(publish.packet_id)?;
             sink.send_publish_ack(packet_id, PublishResult::success()).await?;
+            log::info!(
+                "ams_mqtt_drain stage=ready_received node_id={} client_id={} drain_id={drain_id} packet_id={packet_id}",
+                self.id.node_id, self.id.client_id,
+            );
             self.drain_ready = true;
             if let Some((_, sender)) = self.drain_handshake.take() {
                 let _ = sender.send(());
@@ -1200,6 +1214,10 @@ impl SessionState {
                 properties: Some(Default::default()),
             };
             sink.publish(fence_ack.into(), None, None).await?;
+            log::info!(
+                "ams_mqtt_drain stage=fence_received node_id={} client_id={} drain_id={drain_id} packet_id={packet_id}",
+                self.id.node_id, self.id.client_id,
+            );
             return Ok(());
         }
         if self.drain_ready {
@@ -1207,6 +1225,14 @@ impl SessionState {
         }
         let packet_id = publish.packet_id;
         let qos = publish.qos;
+        let probe = publish.ams_delivery_probe().filter(|probe| probe.should_trace());
+        if let Some(probe) = &probe {
+            log::info!(
+                "ams_mqtt_delivery stage=broker_ingress node_id={} client_id={} packet_id={packet_id:?} qos={qos:?} probe={probe:?}",
+                self.id.node_id,
+                self.id.client_id,
+            );
+        }
 
         match qos {
             QoS::AtLeastOnce => {
@@ -1238,10 +1264,29 @@ impl SessionState {
             }
             QoS::ExactlyOnce => {
                 let packet_id = Self::packet_id(packet_id)?;
-                let pub_res = self.publish(publish).await?;
+                let pub_res = self.publish(publish).await.inspect_err(|error| {
+                    if let Some(probe) = &probe {
+                        log::warn!(
+                            "ams_mqtt_delivery stage=broker_publish_error node_id={} client_id={} packet_id={} error={error:?} probe={probe:?}",
+                            self.id.node_id,
+                            self.id.client_id,
+                            packet_id,
+                        );
+                    }
+                })?;
+                let reason_code = probe.as_ref().map(|_| format!("{:?}", pub_res.reason_code));
                 let inflight_res =
                     if pub_res.is_success() { self.in_inflight.add(packet_id, qos)? } else { false };
                 let rec_res = sink.send_publish_received(packet_id, pub_res).await;
+                if let Some(probe) = &probe {
+                    log::info!(
+                        "ams_mqtt_delivery stage=broker_pubrec node_id={} client_id={} packet_id={} write_ok={} reason_code={reason_code:?} probe={probe:?}",
+                        self.id.node_id,
+                        self.id.client_id,
+                        packet_id,
+                        rec_res.is_ok(),
+                    );
+                }
                 if inflight_res && rec_res.is_err() {
                     self.in_inflight.remove(&packet_id);
                 }
@@ -1895,6 +1940,7 @@ impl SessionState {
 
         //hook, message_delivered
         let mut publish = self.hook.message_delivered(from.clone(), &publish).await.unwrap_or(publish);
+        let probe = publish.ams_delivery_probe().filter(|probe| probe.should_trace());
 
         //send message
         // Crossing this boundary makes the result potentially ambiguous. The
@@ -1906,6 +1952,14 @@ impl SessionState {
             self.server_topic_aliases.as_ref(),
         )
         .await?; //@TODO ... at exception, send hook and or store message
+        if let Some(probe) = &probe {
+            log::info!(
+                "ams_mqtt_delivery stage=broker_subscriber_socket_write node_id={} target_client_id={} packet_id={:?} probe={probe:?}",
+                self.id.node_id,
+                self.id.client_id,
+                publish.packet_id,
+            );
+        }
 
         //cache messages to inflight window
         let moment_status = match publish.qos {
@@ -2117,6 +2171,7 @@ impl SessionState {
     ) -> Result<()> {
         log::debug!("{from:?}");
         log::debug!("{publish:?}");
+        let probe = publish.ams_delivery_probe().filter(|probe| probe.should_trace());
         //make message id
         #[cfg(feature = "msgstore")]
         let msg_id = if message_storage_available {
@@ -2153,12 +2208,33 @@ impl SessionState {
 
         let _sub_cids = match scx.extends.shared().await.forwards(from.clone(), publish).await {
             Ok(None) => {
+                if let Some(probe) = &probe {
+                    log::info!(
+                        "ams_mqtt_delivery stage=broker_no_matching_subscriber node_id={} probe={probe:?}",
+                        scx.node.id()
+                    );
+                }
                 //hook, message_nonsubscribed
                 scx.extends.hook_mgr().message_nonsubscribed(from).await;
                 None
             }
-            Ok(Some(sub_cids)) => Some(sub_cids),
+            Ok(Some(sub_cids)) => {
+                if let Some(probe) = &probe {
+                    log::info!(
+                        "ams_mqtt_delivery stage=broker_routed node_id={} subscribers={sub_cids:?} probe={probe:?}",
+                        scx.node.id()
+                    );
+                }
+                Some(sub_cids)
+            }
             Err(errs) => {
+                if let Some(probe) = &probe {
+                    log::warn!(
+                        "ams_mqtt_delivery stage=broker_forward_error node_id={} dropped_count={} probe={probe:?}",
+                        scx.node.id(),
+                        errs.len(),
+                    );
+                }
                 for (to, from, p, reason) in errs {
                     //hook, Message dropped
                     scx.extends.hook_mgr().message_dropped(Some(to), from, p, reason).await;

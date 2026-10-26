@@ -879,6 +879,15 @@ impl HandoffManager {
             else {
                 continue;
             };
+            if let Some(probe) =
+                item.pending.publish.ams_delivery_probe().filter(|probe| probe.should_trace())
+            {
+                log::info!(
+                    "ams_mqtt_delivery stage=handoff_result target_node_id={target_node_id} target_client_id={client_id} delivery_id={:?} status={:?} probe={probe:?}",
+                    result.delivery_id,
+                    result.status,
+                );
+            }
             match &result.status {
                 ReliableForwardStatus::Delivered | ReliableForwardStatus::Duplicate => {
                     let newly_completed = !item.remotely_completed;

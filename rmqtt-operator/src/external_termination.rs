@@ -319,6 +319,10 @@ async fn data_step(
                                 let mut prepare = identity_payload(&target, "prepare_client_drain");
                                 prepare["coordinatorEpoch"] = json!(target.pod_uid);
                                 request(namespace, cluster, target.node_id, prepare).await?;
+                                log::info!(
+                                    "ams_mqtt_drain stage=external_prepare_requested namespace={namespace} cluster={} node_id={} pod_uid={}",
+                                    cluster.metadata.name, target.node_id, target.pod_uid,
+                                );
                                 target.phase = "WaitingClientDrain".into();
                             }
                         }
@@ -329,6 +333,11 @@ async fn data_step(
                         let status = request(namespace, cluster, target.node_id, payload).await?;
                         match status["phase"].as_str() {
                             Some("ready") => {
+                                log::info!(
+                                    "ams_mqtt_drain stage=external_clients_ready namespace={namespace} cluster={} node_id={} pod_uid={} drain_id={}",
+                                    cluster.metadata.name, target.node_id, target.pod_uid,
+                                    status["result"]["drainId"],
+                                );
                                 request(
                                     namespace,
                                     cluster,
