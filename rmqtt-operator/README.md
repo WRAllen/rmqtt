@@ -88,6 +88,8 @@ non-Leader pods before the current Leader. For every pod it:
 
 ```text
 prepare reliable handoff on every broker (new forwards receive delivery IDs)
+-> quiesce new sessions while keeping existing client connections available
+-> notify capable MQTT 5 clients, confirm their FIFO fences and ready replies
 -> exclude from client Service and wait for EndpointSlice removal
 -> wait for plain forwards to finish -> activate target avoidance
 -> drain local work and wait for handoff/routing barriers
@@ -96,6 +98,33 @@ prepare reliable handoff on every broker (new forwards receive delivery IDs)
 -> join as learner -> catch up -> promote -> restore business membership
 -> admit client traffic -> observe the stability window -> continue
 ```
+
+Clients opt in with MQTT 5 CONNECT user property
+`ams_coordinated_drain=1`. The broker sends `$ams/drain/prepare` directly on
+each opted-in session. After the client has paused new sends, it publishes
+`$ams/drain/fence`; the broker replies on `$ams/drain/fence_ack`. The client
+waits for its outbound QoS transactions to complete, then publishes
+`$ams/drain/ready` on the same physical connection. The operator proceeds to
+the existing session drain only after all capable clients respond. A missing
+reply rolls the operation back; `$ams/drain/resume` releases clients whose
+connection stays open. Older clients retain the previous drain behavior.
+
+For an externally deleted Pod, the Operator starts this preparation on the
+Broker and checks its identity-bound `client_drain_status` in later reconcile
+rounds. Each control request stays within the external deletion path's short
+request budget. It sends `drain` only after the status is `ready`. External
+deletion cannot be rolled back: if clients fail to respond before the Pod's
+termination budget runs out, the existing forced-finalization path records
+`CompletedWithLoss` rather than claiming a lossless handoff.
+
+Control records use `ams_mqtt_drain` with the `drain_id`, node, physical client
+and stage. For a diagnostic rollout, set `RMQTT_AMS_DELIVERY_TRACE=1` on every
+Broker process **before it starts**. This enables unsampled
+`ams_mqtt_delivery` records for every AMS request and response PUBLISH:
+Broker ingress, route match, local or remote queueing, reliable handoff result,
+and subscriber socket write. It does not log payloads. Capture stdout from all
+Broker Pods, including their final logs before deletion. Leave the switch off
+outside the diagnostic window because full request tracing is high volume.
 
 Image replacement composes the same node-drain executor used by scale-in and
 the same learner catch-up classifier used by scale-out/restart recovery.

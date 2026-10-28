@@ -2105,6 +2105,7 @@ impl ClusterShared {
         from: From,
         publish: Publish,
     ) -> std::result::Result<SubscriptionClientIds, Vec<(To, From, Publish, Reason)>> {
+        let probe = publish.ams_delivery_probe().filter(|probe| probe.should_trace());
         let topic = &publish.topic;
         let mut relations_map = match self.scx.extends.router().await.matches(from.id.clone(), topic).await {
             Ok(relations_map) => relations_map,
@@ -2115,14 +2116,34 @@ impl ClusterShared {
         };
 
         let sub_client_ids = self.inner()._collect_subscription_client_ids(&relations_map);
+        if let Some(probe) = &probe {
+            log::info!(
+                "ams_mqtt_delivery stage=cluster_route_match node_id={} target_nodes={:?} subscribers={sub_client_ids:?} probe={probe:?}",
+                self.scx.node.id(),
+                relations_map.keys().collect::<Vec<_>>(),
+            );
+        }
 
         let mut errs = Vec::new();
 
         let this_node_id = self.scx.node.id();
         if let Some(relations) = relations_map.remove(&this_node_id) {
             //forwards to local
-            if let Err(e) = self.forwards_to(from.clone(), &publish, relations).await {
-                errs.extend(e);
+            match self.forwards_to(from.clone(), &publish, relations).await {
+                Ok(()) => {
+                    if let Some(probe) = &probe {
+                        log::info!("ams_mqtt_delivery stage=cluster_local_queued node_id={this_node_id} probe={probe:?}");
+                    }
+                }
+                Err(e) => {
+                    if let Some(probe) = &probe {
+                        log::warn!(
+                            "ams_mqtt_delivery stage=cluster_local_error node_id={this_node_id} dropped_count={} probe={probe:?}",
+                            e.len()
+                        );
+                    }
+                    errs.extend(e);
+                }
             }
         }
         if !relations_map.is_empty() {
@@ -2134,11 +2155,21 @@ impl ClusterShared {
             for (node_id, relations) in relations_map {
                 match self.handoff.begin_forward(node_id, handoff_active) {
                     ForwardMode::Reliable => {
-                        if let Err(droppeds) = self
+                        match self
                             .enqueue_relations_handoff(node_id, from.clone(), publish.clone(), relations)
                             .await
                         {
-                            errs.extend(droppeds);
+                            Ok(()) => {
+                                if let Some(probe) = &probe {
+                                    log::info!("ams_mqtt_delivery stage=cluster_handoff_queued target_node_id={node_id} probe={probe:?}");
+                                }
+                            }
+                            Err(droppeds) => {
+                                if let Some(probe) = &probe {
+                                    log::warn!("ams_mqtt_delivery stage=cluster_handoff_error target_node_id={node_id} dropped_count={} probe={probe:?}", droppeds.len());
+                                }
+                                errs.extend(droppeds);
+                            }
                         }
                     }
                     ForwardMode::Plain(plain_forward) => {
@@ -2151,6 +2182,7 @@ impl ClusterShared {
                             let retry_publish = publish.clone();
                             let retry_relations = relations.clone();
                             let message_type = self.message_type;
+                            let probe = probe.clone();
                             let fut_sender = async move {
                                 let _plain_forward = plain_forward;
                                 let msg_sender = client.send_message(
@@ -2164,6 +2196,7 @@ impl ClusterShared {
                                     retry_from,
                                     retry_publish,
                                     retry_relations,
+                                    probe,
                                     msg_sender.await,
                                 )
                             };
@@ -2173,6 +2206,9 @@ impl ClusterShared {
                             log::warn!(
                                 "forwards error, grpc_client is not exist, node_id: {node_id}, relations: {relations:?}"
                             );
+                            if let Some(probe) = &probe {
+                                log::warn!("ams_mqtt_delivery stage=cluster_remote_no_grpc_client target_node_id={node_id} draining_target={} probe={probe:?}", self.handoff.is_draining_target(node_id));
+                            }
                             if self.handoff.is_draining_target(node_id) {
                                 if let Err(droppeds) = self
                                     .enqueue_relations_handoff(
@@ -2198,10 +2234,17 @@ impl ClusterShared {
                 let shared = self.clone();
                 let forwards_fut = async move {
                     let replys = futures::future::join_all(fut_senders).await;
-                    for (node_id, client_generation, from, publish, relations, reply) in replys {
+                    for (node_id, client_generation, from, publish, relations, probe, reply) in replys {
                         match reply {
-                            Ok(MessageReply::Success) => {}
+                            Ok(MessageReply::Success) => {
+                                if let Some(probe) = &probe {
+                                    log::info!("ams_mqtt_delivery stage=cluster_remote_accepted target_node_id={node_id} probe={probe:?}");
+                                }
+                            }
                             Ok(reply) => {
+                                if let Some(probe) = &probe {
+                                    log::warn!("ams_mqtt_delivery stage=cluster_remote_rejected target_node_id={node_id} reply={reply:?} probe={probe:?}");
+                                }
                                 log::warn!(
                                     "forwards Message::ForwardsTo to other node was rejected, from: {from:?}, to: {node_id:?}, reply: {reply:?}"
                                 );
@@ -2225,6 +2268,9 @@ impl ClusterShared {
                                 }
                             }
                             Err(e) => {
+                                if let Some(probe) = &probe {
+                                    log::warn!("ams_mqtt_delivery stage=cluster_remote_error target_node_id={node_id} error={e:?} probe={probe:?}");
+                                }
                                 log::warn!(
                                     "forwards Message::ForwardsTo to other node, from: {from:?}, to: {node_id:?}, error: {e:?}"
                                 );

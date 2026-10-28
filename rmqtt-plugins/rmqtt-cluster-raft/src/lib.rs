@@ -26,7 +26,7 @@ use rmqtt::{
     plugin::{PackageInfo, Plugin},
     register,
     shared::Shared as _,
-    types::{From, Id, Message as SessionMessage, NodeId, Publish, Reason, To},
+    types::{ConnectInfo, From, Id, Message as SessionMessage, NodeId, Publish, Reason, To},
     Result,
 };
 use rmqtt_raft::{Mailbox, Raft};
@@ -54,6 +54,34 @@ type HashMap<K, V> = std::collections::HashMap<K, V, ahash::RandomState>;
 struct OrphanedRouterReconcile {
     state_ids: Vec<Id>,
     routes: Vec<(String, Id)>,
+}
+
+#[derive(Default)]
+struct ClientDrainProgress {
+    epoch: Option<String>,
+    /// None means the background handshake is still running.
+    result: Option<std::result::Result<serde_json::Value, String>>,
+}
+
+impl ClientDrainProgress {
+    fn status(&self) -> serde_json::Value {
+        match (&self.epoch, &self.result) {
+            (None, _) => json!({"ok": true, "phase": "missing"}),
+            (Some(epoch), None) => json!({"ok": true, "phase": "preparing", "coordinatorEpoch": epoch}),
+            (Some(epoch), Some(Ok(result))) => json!({
+                "ok": true,
+                "phase": "ready",
+                "coordinatorEpoch": epoch,
+                "result": result,
+            }),
+            (Some(epoch), Some(Err(error))) => json!({
+                "ok": true,
+                "phase": "failed",
+                "coordinatorEpoch": epoch,
+                "error": error,
+            }),
+        }
+    }
 }
 
 impl OrphanedRouterReconcile {
@@ -125,6 +153,7 @@ struct ClusterPlugin {
     drain_handoff_completed_start: Arc<std::sync::atomic::AtomicUsize>,
     drain_sessions_relocated: Arc<std::sync::atomic::AtomicUsize>,
     drain_progress_log: Arc<StdMutex<DrainProgressLogState>>,
+    client_drain_progress: Arc<StdMutex<ClientDrainProgress>>,
     exec: TaskExecQueue,
     backoff_strategy: ExponentialBackoff,
 }
@@ -178,6 +207,7 @@ impl ClusterPlugin {
         let drain_handoff_completed_start = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drain_sessions_relocated = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let drain_progress_log = Arc::new(StdMutex::new(DrainProgressLogState::default()));
+        let client_drain_progress = Arc::new(StdMutex::new(ClientDrainProgress::default()));
         let cfg = Arc::new(cfg);
         Ok(Self {
             scx,
@@ -197,6 +227,7 @@ impl ClusterPlugin {
             drain_handoff_completed_start,
             drain_sessions_relocated,
             drain_progress_log,
+            client_drain_progress,
             exec,
             backoff_strategy,
         })
@@ -819,6 +850,13 @@ impl Plugin for ClusterPlugin {
                 Ok(json!({"ok": true, "id": id, "raft_membership_changed": false}))
             }
             "quiesce" | "quiesce_drain" => self.quiesce_node(&raft_mailbox).await,
+            "prepare_client_drain" => match msg.get("coordinatorEpoch").and_then(|value| value.as_str()) {
+                Some(epoch) => self.start_client_drain(epoch.to_owned()),
+                None => self.prepare_client_drain().await,
+            },
+            "client_drain_status" => {
+                self.client_drain_status(msg.get("coordinatorEpoch").and_then(|value| value.as_str()))
+            }
             "drain" | "node_drain" => self.drain_node(&raft_mailbox).await,
             "undrain" | "resume" | "node_up_local" => self.undrain_node(&raft_mailbox).await,
             "prepare_drain" => {
@@ -1134,6 +1172,141 @@ impl ClusterPlugin {
         }))
     }
 
+    async fn prepare_client_drain(&self) -> Result<serde_json::Value> {
+        Self::run_client_drain(
+            self.shared.clone(),
+            self.draining.clone(),
+            self.disconnecting.clone(),
+            self.scx.node.id(),
+        )
+        .await
+    }
+
+    fn start_client_drain(&self, epoch: String) -> Result<serde_json::Value> {
+        if epoch.is_empty() {
+            return Err(anyhow!("client drain coordinator epoch is empty"));
+        }
+        if !self.draining.load(Ordering::SeqCst) || self.disconnecting.load(Ordering::SeqCst) {
+            return Err(anyhow!("client drain preparation requires quiesce before disconnect"));
+        }
+        let mut progress = self.client_drain_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = &progress.epoch {
+            if existing != &epoch {
+                return Err(anyhow!("client drain already belongs to coordinator epoch {existing}"));
+            }
+            return Ok(progress.status());
+        }
+        progress.epoch = Some(epoch.clone());
+        progress.result = None;
+        let status = progress.status();
+        drop(progress);
+        log::info!(
+            "ams_mqtt_drain stage=external_client_prepare_started node_id={} coordinator_epoch={epoch}",
+            self.scx.node.id(),
+        );
+
+        let shared = self.shared.clone();
+        let draining = self.draining.clone();
+        let disconnecting = self.disconnecting.clone();
+        let node_id = self.scx.node.id();
+        let state = self.client_drain_progress.clone();
+        tokio::spawn(async move {
+            let result = Self::run_client_drain(shared, draining, disconnecting, node_id)
+                .await
+                .map_err(|error| error.to_string());
+            match &result {
+                Ok(value) => log::info!(
+                    "ams_mqtt_drain stage=external_client_prepare_ready node_id={node_id} coordinator_epoch={epoch} drain_id={} coordinated_clients={} legacy_clients={}",
+                    value["drainId"], value["coordinatedClients"], value["legacyClients"],
+                ),
+                Err(error) => log::warn!(
+                    "ams_mqtt_drain stage=external_client_prepare_failed node_id={node_id} coordinator_epoch={epoch} error={error}",
+                ),
+            }
+            let mut progress = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            if progress.epoch.as_deref() == Some(epoch.as_str()) {
+                progress.result = Some(result);
+            }
+        });
+        Ok(status)
+    }
+
+    fn client_drain_status(&self, epoch: Option<&str>) -> Result<serde_json::Value> {
+        let progress = self.client_drain_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let (Some(expected), Some(actual)) = (epoch, progress.epoch.as_deref()) {
+            if expected != actual {
+                return Err(anyhow!("client drain coordinator epoch changed from {expected} to {actual}"));
+            }
+        }
+        Ok(progress.status())
+    }
+
+    async fn run_client_drain(
+        shared: ClusterShared,
+        draining: Arc<AtomicBool>,
+        disconnecting: Arc<AtomicBool>,
+        node_id: NodeId,
+    ) -> Result<serde_json::Value> {
+        if !draining.load(Ordering::SeqCst) || disconnecting.load(Ordering::SeqCst) {
+            return Err(anyhow!("client drain preparation requires quiesce before disconnect"));
+        }
+        let drain_id = format!(
+            "{}-{}",
+            node_id,
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()
+        );
+        let mut acknowledgements = Vec::new();
+        let mut legacy = 0usize;
+        for entry in shared.inner().iter().collect::<Vec<_>>() {
+            let Some(session) = entry.session() else { continue };
+            if !session.connected().await.unwrap_or(false) {
+                continue;
+            }
+            let capable = match session.connect_info().await.as_deref() {
+                Ok(ConnectInfo::V5(_, connect)) => connect.user_properties.iter().any(|(key, value)| {
+                    key.as_bytes().as_ref() == b"ams_coordinated_drain" && value.as_bytes().as_ref() == b"1"
+                }),
+                _ => false,
+            };
+            if !capable {
+                legacy += 1;
+                continue;
+            }
+            let Some(tx) = entry.tx().filter(|tx| !tx.is_closed()) else {
+                return Err(anyhow!(
+                    "coordinated client {} has no live session mailbox",
+                    entry.id().client_id
+                ));
+            };
+            let (sender, receiver) = oneshot::channel();
+            tx.unbounded_send(SessionMessage::PrepareDrain(sender, drain_id.clone()))
+                .map_err(|error| anyhow!("send drain notice to {}: {error}", entry.id().client_id))?;
+            log::info!(
+                "ams_mqtt_drain stage=notice_queued node_id={} client_id={} drain_id={drain_id}",
+                node_id,
+                entry.id().client_id,
+            );
+            acknowledgements.push((entry.id().client_id.to_string(), receiver));
+        }
+        let coordinated = acknowledgements.len();
+        let waits = acknowledgements.into_iter().map(|(client_id, receiver)| async move {
+            timeout(Duration::from_secs(20), receiver)
+                .await
+                .map_err(|_| anyhow!("client {client_id} did not acknowledge coordinated drain"))?
+                .map_err(|_| anyhow!("client {client_id} disconnected before drain acknowledgement"))
+        });
+        for result in futures::future::join_all(waits).await {
+            result?;
+        }
+        log::info!(
+            "ams_mqtt_drain stage=clients_ready node_id={} drain_id={drain_id} coordinated_clients={coordinated} legacy_clients={legacy}",
+            node_id,
+        );
+        Ok(
+            json!({"ok": true, "drainId": drain_id, "coordinatedClients": coordinated, "legacyClients": legacy}),
+        )
+    }
+
     async fn drain_node(&self, raft_mailbox: &Mailbox) -> Result<serde_json::Value> {
         let id = self.scx.node.id();
         let quiesce = self.quiesce_node(raft_mailbox).await?;
@@ -1248,6 +1421,18 @@ impl ClusterPlugin {
         raft_mailbox.send_proposal(proposal).await.map_err(anyhow::Error::new)?;
         self.disconnecting.store(false, Ordering::SeqCst);
         self.draining.store(false, Ordering::SeqCst);
+        *self.client_drain_progress.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            ClientDrainProgress::default();
+        for entry in self.shared.inner().iter().collect::<Vec<_>>() {
+            if let Some(tx) = entry.tx().filter(|tx| !tx.is_closed()) {
+                if let Err(error) = tx.unbounded_send(SessionMessage::CancelDrain) {
+                    log::warn!(
+                        "could not resume client {} after drain rollback: {error}",
+                        entry.id().client_id
+                    );
+                }
+            }
+        }
         self.force_drain_finalized.store(false, Ordering::SeqCst);
         self.shared.clear_drain(id);
         Ok(json!({

@@ -8596,6 +8596,7 @@ async fn try_rmqtt_action_value_once(
     let request_timeout = match payload.get("action").and_then(Value::as_str) {
         Some("force_rebootstrap") => Duration::from_secs(60),
         Some("termination_status" | "termination_bind" | "termination_complete") => Duration::from_secs(2),
+        Some("prepare_client_drain") => Duration::from_secs(30),
         _ => Duration::from_secs(10),
     };
     let client = Client::builder().timeout(request_timeout).build().map_err(|error| {
@@ -9023,9 +9024,32 @@ async fn prepare_node_for_drain_with_operation(
         .await
         .map_err(|error| NodeDrainError::from_action(NodeDrainStage::StartQuiesce, error))?;
 
-    // Stop new Service traffic and wait for EndpointSlice convergence before
-    // disconnecting established clients. Existing TCP sessions remain usable
-    // during this short propagation window.
+    // Prepare connected clients while their original Service path is still
+    // available. Endpoint removal can close existing TCP connections in some
+    // networks, leaving nobody to receive the planned-drain notice.
+    let prepared = try_rmqtt_action_value_with_payload(
+        namespace,
+        cluster,
+        node_id,
+        json!({"action": "prepare_client_drain"}),
+    )
+    .await
+    .map_err(|error| NodeDrainError::from_action(NodeDrainStage::StartDrain, error))?;
+    if prepared.get("ok").and_then(Value::as_bool) != Some(true) {
+        return Err(NodeDrainError::new(
+            NodeDrainStage::StartDrain,
+            format!("client drain was not acknowledged: {prepared}"),
+        ));
+    }
+    log::info!(
+        "ams_mqtt_drain stage=operator_clients_ready namespace={namespace} cluster={} node_id={node_id} drain_id={} coordinated_clients={} legacy_clients={}",
+        cluster.metadata.name,
+        prepared["drainId"], prepared["coordinatedClients"], prepared["legacyClients"],
+    );
+
+    // Once capable clients have stopped publishing and acknowledged their
+    // outbound QoS work, remove the broker from new Service traffic. Arm
+    // remote handoff before disconnecting those existing connections.
     patch_pod_draining(kube, namespace, &pod)
         .await
         .map_err(|error| NodeDrainError::new(NodeDrainStage::RemoveClientEndpoint, error.to_string()))?;
@@ -9038,10 +9062,6 @@ async fn prepare_node_for_drain_with_operation(
     )
     .await
     .map_err(|error| NodeDrainError::new(NodeDrainStage::RemoveClientEndpoint, error.to_string()))?;
-
-    // Arm remote senders before the target is disconnected. From this point
-    // all traffic that still resolves to the old owner is held by the reliable
-    // handoff queue until the relocated session is installed on a peer.
     activate_reliable_handoff(namespace, cluster, replicas, node_id)
         .await
         .map_err(|error| NodeDrainError::new(NodeDrainStage::ActivateHandoff, error.to_string()))?;

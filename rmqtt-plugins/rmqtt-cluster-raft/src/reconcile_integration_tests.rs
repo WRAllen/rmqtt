@@ -110,6 +110,117 @@ async fn connect(addr: SocketAddr, client_id: &str, clean_start: bool) -> TcpStr
     stream
 }
 
+async fn connect_coordinated(addr: SocketAddr, client_id: &str) -> TcpStream {
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    let mut body = utf8("MQTT");
+    body.extend([5, 2, 0, 30]);
+    let mut properties = vec![0x11];
+    properties.extend(300u32.to_be_bytes());
+    properties.push(0x26);
+    properties.extend(utf8("ams_coordinated_drain"));
+    properties.extend(utf8("1"));
+    body.extend(varint(properties.len()));
+    body.extend(properties);
+    body.extend(utf8(client_id));
+    send(&mut stream, 0x10, &body).await;
+    assert_eq!(frame(&mut stream).await.0, 0x20);
+    stream
+}
+
+async fn receive_control(stream: &mut TcpStream, expected_topic: &str) -> Vec<u8> {
+    let (header, body) = frame(stream).await;
+    assert_eq!(header, 0x30);
+    let topic_len = u16::from_be_bytes([body[0], body[1]]) as usize;
+    assert_eq!(&body[2..2 + topic_len], expected_topic.as_bytes());
+    assert_eq!(body[2 + topic_len], 0); // no MQTT 5 properties
+    body[3 + topic_len..].to_vec()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts a real Raft/gRPC/MQTT node on loopback"]
+async fn coordinated_client_acknowledges_before_drain_and_resumes_on_rollback() {
+    let grpc = free_addr();
+    let raft = free_addr();
+    let mqtt = free_addr();
+    let config = format!(
+        "node_grpc_addrs = [\"1@{grpc}\"]\nraft_peer_addrs = [\"1@{raft}\"]\nleader_id = 1\nbootstrap = true\n"
+    );
+    let scx = ServerContext::new()
+        .node_id(1)
+        .busy_check_enable(false)
+        .plugins_config_map_add("rmqtt-cluster-raft", config)
+        .build()
+        .await;
+    scx.node.start_grpc_server(scx.clone(), grpc, false, false);
+    let mut plugin = ClusterPlugin::new(scx.clone(), "rmqtt-cluster-raft").await.unwrap();
+    plugin.init().await.unwrap();
+    plugin.start().await.unwrap();
+    let listener = Builder::new()
+        .name("integration/coordinated")
+        .laddr(mqtt)
+        .allow_anonymous(true)
+        .max_qos_allowed(rmqtt::types::QoS::ExactlyOnce)
+        .bind()
+        .unwrap()
+        .tcp()
+        .unwrap();
+    MqttServer::new(scx).listener_by_id(listener, 1883).build().start();
+    until("single Raft node ready", || plugin.nodes.snapshot_nodes().len() == 1).await;
+    let mut client = connect_coordinated(mqtt, "coordinated-test").await;
+    plugin.quiesce_node(&plugin.raft_mailbox().await).await.unwrap();
+
+    assert_eq!(plugin.start_client_drain("external-epoch".into()).unwrap()["phase"], "preparing");
+    assert_eq!(plugin.start_client_drain("external-epoch".into()).unwrap()["phase"], "preparing");
+    {
+        let drain_id = receive_control(&mut client, "$ams/drain/prepare").await;
+        let mut fence = utf8("$ams/drain/fence");
+        fence.extend([0, 1, 0]); // packet ID 1; no properties
+        fence.extend(&drain_id);
+        send(&mut client, 0x32, &fence).await;
+        assert_eq!(frame(&mut client).await.0, 0x40);
+        assert_eq!(receive_control(&mut client, "$ams/drain/fence_ack").await, drain_id);
+        let mut ready = utf8("$ams/drain/ready");
+        ready.extend([0, 2, 0]);
+        ready.extend(&drain_id);
+        send(&mut client, 0x32, &ready).await;
+        assert_eq!(frame(&mut client).await.0, 0x40);
+        assert!(
+            timeout(Duration::from_millis(100), client.read_u8()).await.is_err(),
+            "broker disconnected before the operator began drain"
+        );
+    }
+    until("external client drain ready", || {
+        plugin.client_drain_status(Some("external-epoch")).unwrap()["phase"] == "ready"
+    })
+    .await;
+    assert_eq!(
+        plugin.client_drain_status(Some("external-epoch")).unwrap()["result"]["coordinatedClients"],
+        1
+    );
+    plugin.undrain_node(&plugin.raft_mailbox().await).await.unwrap();
+    assert!(!receive_control(&mut client, "$ams/drain/resume").await.is_empty());
+    publish(&mut client, "test/after-resume", "alive", 3, 1).await;
+
+    plugin.quiesce_node(&plugin.raft_mailbox().await).await.unwrap();
+    let (prepared, ()) = tokio::join!(plugin.prepare_client_drain(), async {
+        let drain_id = receive_control(&mut client, "$ams/drain/prepare").await;
+        let mut fence = utf8("$ams/drain/fence");
+        fence.extend([0, 4, 0]);
+        fence.extend(&drain_id);
+        send(&mut client, 0x32, &fence).await;
+        assert_eq!(frame(&mut client).await.0, 0x40);
+        assert_eq!(receive_control(&mut client, "$ams/drain/fence_ack").await, drain_id);
+        let mut ready = utf8("$ams/drain/ready");
+        ready.extend([0, 5, 0]);
+        ready.extend(&drain_id);
+        send(&mut client, 0x32, &ready).await;
+        assert_eq!(frame(&mut client).await.0, 0x40);
+    });
+    assert_eq!(prepared.unwrap()["coordinatedClients"], 1);
+    plugin.drain_node(&plugin.raft_mailbox().await).await.unwrap();
+    assert_eq!(frame(&mut client).await.0, 0xe0, "broker should disconnect only after ready");
+}
+
 async fn subscribe(stream: &mut TcpStream, topic: &str) {
     let mut body = vec![0, 1, 0];
     body.extend(utf8(topic));

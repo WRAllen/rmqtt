@@ -175,7 +175,13 @@ fn observe_missing_pod(target: &mut ExternalTerminationTargetStatus, pods: &[Pod
 fn needs_forced_finalize(target: &ExternalTerminationTargetStatus, reserve: Duration) -> bool {
     matches!(
         target.phase.as_str(),
-        "WaitingForSignal" | "Binding" | "Bound" | "WaitingEndpointRemoval" | "Draining" | "ReadyToLeave"
+        "WaitingForSignal"
+            | "Binding"
+            | "Bound"
+            | "WaitingEndpointRemoval"
+            | "WaitingClientDrain"
+            | "Draining"
+            | "ReadyToLeave"
     ) && external_target_remaining(target) <= reserve
 }
 
@@ -203,7 +209,7 @@ async fn data_step(
         if planned_removed
             && matches!(
                 target.phase.as_str(),
-                "Bound" | "WaitingEndpointRemoval" | "Draining" | "ReadyToLeave"
+                "Bound" | "WaitingEndpointRemoval" | "WaitingClientDrain" | "Draining" | "ReadyToLeave"
             )
         {
             let status: DrainStatus = serde_json::from_value(
@@ -252,7 +258,7 @@ async fn data_step(
                     target.phase = "Bound".into();
                 }
             }
-            "Bound" | "WaitingEndpointRemoval" | "Draining" | "ReadyToLeave" => {
+            "Bound" | "WaitingEndpointRemoval" | "WaitingClientDrain" | "Draining" | "ReadyToLeave" => {
                 if target.prepared_topology != topology {
                     target.stable_observations = 0;
                     if target.phase == "ReadyToLeave" {
@@ -306,6 +312,32 @@ async fn data_step(
                                     destinations,
                                 )
                                 .await?;
+                                // The external-deletion controller has a short
+                                // per-request budget. Start the client handshake
+                                // on the broker and poll its identity-bound result
+                                // in later reconciliations rather than blocking.
+                                let mut prepare = identity_payload(&target, "prepare_client_drain");
+                                prepare["coordinatorEpoch"] = json!(target.pod_uid);
+                                request(namespace, cluster, target.node_id, prepare).await?;
+                                log::info!(
+                                    "ams_mqtt_drain stage=external_prepare_requested namespace={namespace} cluster={} node_id={} pod_uid={}",
+                                    cluster.metadata.name, target.node_id, target.pod_uid,
+                                );
+                                target.phase = "WaitingClientDrain".into();
+                            }
+                        }
+                    }
+                    "WaitingClientDrain" => {
+                        let mut payload = identity_payload(&target, "client_drain_status");
+                        payload["coordinatorEpoch"] = json!(target.pod_uid);
+                        let status = request(namespace, cluster, target.node_id, payload).await?;
+                        match status["phase"].as_str() {
+                            Some("ready") => {
+                                log::info!(
+                                    "ams_mqtt_drain stage=external_clients_ready namespace={namespace} cluster={} node_id={} pod_uid={} drain_id={}",
+                                    cluster.metadata.name, target.node_id, target.pod_uid,
+                                    status["result"]["drainId"],
+                                );
                                 request(
                                     namespace,
                                     cluster,
@@ -314,7 +346,19 @@ async fn data_step(
                                 )
                                 .await?;
                                 target.phase = "Draining".into();
+                                target.stable_observations = 0;
                             }
+                            Some("preparing") => {
+                                bail!("waiting for MQTT clients to hand off their outbound work")
+                            }
+                            Some("failed") => bail!("MQTT client drain failed: {}", status["error"]),
+                            Some("missing") => {
+                                let mut prepare = identity_payload(&target, "prepare_client_drain");
+                                prepare["coordinatorEpoch"] = json!(target.pod_uid);
+                                request(namespace, cluster, target.node_id, prepare).await?;
+                                bail!("restarted missing MQTT client drain preparation")
+                            }
+                            _ => bail!("invalid MQTT client drain status: {status}"),
                         }
                     }
                     "Draining" => {
